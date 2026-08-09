@@ -7,11 +7,11 @@
 
 ## 2. Key Architecture & Design Decisions
 
-- **Backend Framework**: Python (FastAPI) async web service ([backend/PLAN.md](file:///home/chesd/dev/tunedin/backend/PLAN.md)).
-- **Database Abstraction**: SQLAlchemy 2.0 Async ORM defaulting to **SQLite** (`sqlite+aiosqlite`) for dev/testing, swappable to PostgreSQL/Cloud SQL ([backend/persistence/PLAN.md](file:///home/chesd/dev/tunedin/backend/persistence/PLAN.md)).
-- **Task Queue Service**: Managed **Google Cloud Tasks** queue abstraction (`GCPCloudTasksDriver` with `LocalInMemoryDriver` fallback) ([backend/ingestion/PLAN.md](file:///home/chesd/dev/tunedin/backend/ingestion/PLAN.md)).
-- **AI Agentic Insights**: Google Gemini API (`GeminiAgentProvider` with fallback `MockAgentProvider`) ([backend/insights/PLAN.md](file:///home/chesd/dev/tunedin/backend/insights/PLAN.md)).
-- **Cross-Platform Frontend**: React (Vite + Vanilla CSS) built with decoupled custom hooks and platform-agnostic state for seamless expansion to **React Native / Expo** ([frontend/PLAN.md](file:///home/chesd/dev/tunedin/frontend/PLAN.md)).
+- **Backend Framework**: Python (FastAPI) async web service ([backend/PLAN.md](file:///home/xing808/dev/tunedin/backend/PLAN.md)).
+- **Database Abstraction**: SQLAlchemy 2.0 Async ORM defaulting to **SQLite** (`sqlite+aiosqlite`) for dev/testing, swappable to PostgreSQL/Cloud SQL ([backend/persistence/PLAN.md](file:///home/xing808/dev/tunedin/backend/persistence/PLAN.md)).
+- **Task Queue Service**: Managed **Google Cloud Tasks** queue abstraction (`GCPCloudTasksDriver` with `LocalInMemoryDriver` fallback) ([backend/ingestion/PLAN.md](file:///home/xing808/dev/tunedin/backend/ingestion/PLAN.md)).
+- **AI Agentic Insights**: Google Gemini API (`GeminiAgentProvider` with fallback `MockAgentProvider`) ([backend/insights/PLAN.md](file:///home/xing808/dev/tunedin/backend/insights/PLAN.md)).
+- **Cross-Platform Frontend**: React (Vite + Vanilla CSS) built with decoupled custom hooks and platform-agnostic state for seamless expansion to **React Native / Expo** ([frontend/PLAN.md](file:///home/xing808/dev/tunedin/frontend/PLAN.md)).
 
 ---
 
@@ -19,12 +19,12 @@
 
 The technical implementation plan is organized into a modular directory hierarchy:
 
-1. ⚙️ **Backend Master Plan**: [backend/PLAN.md](file:///home/chesd/dev/tunedin/backend/PLAN.md)
-   - 🗄️ **Persistence Layer Sub-Plan**: [backend/persistence/PLAN.md](file:///home/chesd/dev/tunedin/backend/persistence/PLAN.md)
-   - 📥 **Feed Ingestion & Task Queue Sub-Plan**: [backend/ingestion/PLAN.md](file:///home/chesd/dev/tunedin/backend/ingestion/PLAN.md)
-   - 🤖 **Agentic Insights & AI Curation Sub-Plan**: [backend/insights/PLAN.md](file:///home/chesd/dev/tunedin/backend/insights/PLAN.md)
+1. ⚙️ **Backend Master Plan**: [backend/PLAN.md](file:///home/xing808/dev/tunedin/backend/PLAN.md)
+   - 🗄️ **Persistence Layer Sub-Plan**: [backend/persistence/PLAN.md](file:///home/xing808/dev/tunedin/backend/persistence/PLAN.md)
+   - 📥 **Feed Ingestion & Task Queue Sub-Plan**: [backend/ingestion/PLAN.md](file:///home/xing808/dev/tunedin/backend/ingestion/PLAN.md)
+   - 🤖 **Agentic Insights & AI Curation Sub-Plan**: [backend/insights/PLAN.md](file:///home/xing808/dev/tunedin/backend/insights/PLAN.md)
 
-2. 🎨 **Frontend Technical Plan**: [frontend/PLAN.md](file:///home/chesd/dev/tunedin/frontend/PLAN.md)
+2. 🎨 **Frontend Technical Plan**: [frontend/PLAN.md](file:///home/xing808/dev/tunedin/frontend/PLAN.md)
 
 ---
 

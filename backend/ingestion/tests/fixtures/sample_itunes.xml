@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" 
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Silicon Pulse Daily</title>
+    <link>https://siliconpulse.example.com</link>
+    <description>Daily technology analysis and developer deep dives.</description>
+    <itunes:author>Tech Pulse Media</itunes:author>
+    <itunes:summary>The premier daily podcast covering software architecture and AI systems.</itunes:summary>
+    <itunes:category text="Technology"/>
+    <itunes:image href="https://siliconpulse.example.com/artwork.png"/>
+    
+    <item>
+      <title>SP #101: GPU Cluster Architecture at Scale</title>
+      <itunes:author>Alex Mercer</itunes:author>
+      <itunes:summary>Designing multi-node InfiniBand fabrics for deep learning clusters.</itunes:summary>
+      <guid>sp-ep-101</guid>
+      <pubDate>Wed, 04 Feb 2026 15:30:00 GMT</pubDate>
+      <itunes:duration>01:14:22</itunes:duration>
+      <enclosure url="https://siliconpulse.example.com/ep101.m4a" length="62914560" type="audio/x-m4a"/>
+    </item>
+
+    <item>
+      <title>SP #102: Vector Search &amp; Graph Embeddings</title>
+      <itunes:author>Sarah Lin</itunes:author>
+      <itunes:summary>How HNSW and graph indexes work in modern search engines.</itunes:summary>
+      <guid>sp-ep-102</guid>
+      <pubDate>Thu, 05 Feb 2026 15:30:00 GMT</pubDate>
+      <itunes:duration>45:30</itunes:duration>
+      <enclosure url="https://siliconpulse.example.com/ep102.mp3" length="38400000" type="audio/mpeg"/>
+    </item>
+
+    <item>
+      <title>SP #103: Quantum Algorithms 101</title>
+      <itunes:author>Alex Mercer</itunes:author>
+      <itunes:summary>Shor's and Grover's algorithm explained simply.</itunes:summary>
+      <guid>sp-ep-103</guid>
+      <pubDate>Fri, 06 Feb 2026 15:30:00 GMT</pubDate>
+      <itunes:duration>2400</itunes:duration>
+      <enclosure url="https://siliconpulse.example.com/ep103.mp3" length="25000000" type="audio/mpeg"/>
+    </item>
+  </channel>
+</rss>

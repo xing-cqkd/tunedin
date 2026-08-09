@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>AI Frontier Podcast</title>
+    <link>https://aifrontier.example.com</link>
+    <description>Exploring artificial intelligence breakthroughs and engineering.</description>
+    <language>en-us</language>
+    <category>Technology</category>
+    <image>
+      <url>https://aifrontier.example.com/cover.jpg</url>
+      <title>AI Frontier Podcast</title>
+      <link>https://aifrontier.example.com</link>
+    </image>
+    <item>
+      <title>Episode 1: The Dawn of LLMs</title>
+      <guid isPermaLink="false">ai-frontier-ep-001</guid>
+      <pubDate>Mon, 10 Jan 2026 10:00:00 GMT</pubDate>
+      <description>Introduction to large language model architecture.</description>
+      <enclosure url="https://aifrontier.example.com/audio/ep001.mp3" length="35000000" type="audio/mpeg"/>
+    </item>
+    <item>
+      <title>Episode 2: Reasoning Models &amp; Chain-of-Thought</title>
+      <guid isPermaLink="false">ai-frontier-ep-002</guid>
+      <pubDate>Mon, 17 Jan 2026 10:00:00 GMT</pubDate>
+      <description>Deep dive into reinforcement learning and test-time compute.</description>
+      <enclosure url="https://aifrontier.example.com/audio/ep002.mp3" length="42000000" type="audio/mpeg"/>
+    </item>
+    <item>
+      <title>Episode 3: Autonomous AI Agents</title>
+      <guid isPermaLink="false">ai-frontier-ep-003</guid>
+      <pubDate>Mon, 24 Jan 2026 10:00:00 GMT</pubDate>
+      <description>Architectures for tool-calling, memory, and multi-agent coordination.</description>
+      <enclosure url="https://aifrontier.example.com/audio/ep003.mp3" length="48000000" type="audio/mpeg"/>
+    </item>
+  </channel>
+</rss>
