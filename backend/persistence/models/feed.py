@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import String, Text, DateTime, Integer, Uuid
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.persistence.models.base import Base
 
@@ -22,6 +22,11 @@ class Feed(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    language: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    website_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    feed_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # episodic vs serial
+    podcast_guid: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    explicit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     
     # Ingestion sync metadata
     etag: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)

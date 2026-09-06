@@ -14,10 +14,16 @@ venv/
 ENV/
 env/
 
+# Agent and tracking directories
+.agent/
+**/.agent/
+
 # Database files
 *.db
 *.sqlite
 *.sqlite3
+backend/ingestion/*.db
+backend/ingestion/simple.db
 
 # Node / Frontend build artifacts (when created)
 node_modules/

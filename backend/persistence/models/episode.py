@@ -35,7 +35,15 @@ class Episode(Base):
     duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    content_html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     transcript: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    transcript_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    chapters_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    episode_type: Mapped[Optional[str]] = mapped_column(String(50), default="full", nullable=True)  # full, trailer, bonus
+    episode_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    season_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    explicit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(

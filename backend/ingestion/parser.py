@@ -133,6 +133,112 @@ class PodcastFeedParser:
         return None, None
 
     @classmethod
+    def extract_transcript_url(cls, entry: dict) -> Optional[str]:
+        """
+        Extract Podcasting 2.0 transcript URL (<podcast:transcript url="..." />)
+        or transcript link from entry.
+        """
+        # 1. podcast_transcript tag (parsed by feedparser)
+        pt = entry.get("podcast_transcript")
+        if isinstance(pt, dict):
+            url = pt.get("url")
+            if url:
+                return url
+        elif isinstance(pt, list) and pt:
+            first = pt[0]
+            if isinstance(first, dict) and first.get("url"):
+                return first.get("url")
+            elif isinstance(first, str):
+                return first
+
+        # 2. transcripts list
+        transcripts = entry.get("transcripts", [])
+        if isinstance(transcripts, list) and transcripts:
+            first = transcripts[0]
+            if isinstance(first, dict) and first.get("url"):
+                return first.get("url")
+
+        # 3. rel="transcript" links
+        links = entry.get("links", [])
+        if isinstance(links, list):
+            for link in links:
+                if link.get("rel") == "transcript" or link.get("type", "").startswith("text/vtt"):
+                    href = link.get("href")
+                    if href:
+                        return href
+
+        return None
+
+    @classmethod
+    def extract_chapters_url(cls, entry: dict) -> Optional[str]:
+        """
+        Extract Podcasting 2.0 chapters URL (<podcast:chapters url="..." />).
+        """
+        pc = entry.get("podcast_chapters")
+        if isinstance(pc, dict):
+            return pc.get("url")
+        elif isinstance(pc, str):
+            return pc
+        return None
+
+    @classmethod
+    def extract_episode_image(cls, entry: dict) -> Optional[str]:
+        """
+        Extract episode-specific artwork image URL.
+        """
+        # itunes_image
+        it_img = entry.get("itunes_image")
+        if isinstance(it_img, dict):
+            return it_img.get("href")
+        elif isinstance(it_img, str):
+            return it_img
+
+        # image
+        img = entry.get("image")
+        if isinstance(img, dict):
+            return img.get("href")
+        elif isinstance(img, str):
+            return img
+
+        # media_thumbnail
+        thumbs = entry.get("media_thumbnail", [])
+        if isinstance(thumbs, list) and thumbs:
+            first = thumbs[0]
+            if isinstance(first, dict):
+                return first.get("url")
+
+        return None
+
+    @classmethod
+    def extract_content_html(cls, entry: dict) -> Optional[str]:
+        """
+        Extract full HTML content / shownotes (<content:encoded> or content array).
+        """
+        contents = entry.get("content", [])
+        if isinstance(contents, list) and contents:
+            for c in contents:
+                if isinstance(c, dict) and c.get("value"):
+                    return c.get("value")
+
+        return entry.get("content_encoded")
+
+    @classmethod
+    def parse_explicit(cls, raw_val: Any) -> Optional[bool]:
+        """
+        Normalize iTunes explicit tags ('yes', 'no', 'clean', 'explicit', True, False).
+        """
+        if raw_val is None:
+            return None
+        if isinstance(raw_val, bool):
+            return raw_val
+        val_str = str(raw_val).strip().lower()
+        if val_str in ("yes", "explicit", "true", "1"):
+            return True
+        elif val_str in ("no", "clean", "false", "0"):
+            return False
+        return None
+
+    @classmethod
     def extract_feed_image(cls, feed_dict: dict) -> Optional[str]:
         """
         Extract feed-level artwork image URL.
@@ -207,6 +313,10 @@ class PodcastFeedParser:
         author = feed_dict.get("author") or feed_dict.get("itunes_author") or feed_dict.get("publisher")
         description = feed_dict.get("subtitle") or feed_dict.get("description") or feed_dict.get("summary")
         link = feed_dict.get("link")
+        language = feed_dict.get("language")
+        feed_type = feed_dict.get("itunes_type")
+        podcast_guid = feed_dict.get("podcast_guid")
+        explicit = cls.parse_explicit(feed_dict.get("itunes_explicit"))
         image_url = cls.extract_feed_image(feed_dict)
         category = cls.extract_feed_category(feed_dict)
 
@@ -218,6 +328,11 @@ class PodcastFeedParser:
             image_url=image_url,
             category=category,
             link=link,
+            language=language,
+            website_url=link,
+            feed_type=feed_type,
+            podcast_guid=podcast_guid,
+            explicit=explicit,
             etag=etag,
             last_modified=last_modified,
         )
@@ -226,6 +341,7 @@ class PodcastFeedParser:
         raw_entries = parsed.get("entries", [])
         total_episodes = len(raw_entries)
         new_episodes: List[ParsedEpisode] = []
+        seen_in_batch: Set[str] = set()
 
         for entry in raw_entries:
             audio_url, enclosure_type = cls.extract_audio_enclosure(entry)
@@ -234,6 +350,11 @@ class PodcastFeedParser:
             guid = entry.get("id") or entry.get("guid") or audio_url or entry.get("link")
             if not guid:
                 continue
+
+            # In-batch duplicate deduplication
+            if guid in seen_in_batch:
+                continue
+            seen_in_batch.add(guid)
 
             # Check known GUIDs filter
             if known_guids and guid in known_guids:
@@ -256,8 +377,32 @@ class PodcastFeedParser:
 
             # Extract Summary
             summary = entry.get("summary") or entry.get("description") or entry.get("subtitle")
+            content_html = cls.extract_content_html(entry)
 
             ep_link = entry.get("link")
+            transcript_url = cls.extract_transcript_url(entry)
+            chapters_url = cls.extract_chapters_url(entry)
+            ep_image_url = cls.extract_episode_image(entry)
+            ep_type = entry.get("itunes_episodetype") or "full"
+
+            # Parse episode and season numbers
+            ep_num = None
+            raw_ep_num = entry.get("itunes_episode")
+            if raw_ep_num:
+                try:
+                    ep_num = int(raw_ep_num)
+                except (ValueError, TypeError):
+                    pass
+
+            season_num = None
+            raw_season = entry.get("itunes_season")
+            if raw_season:
+                try:
+                    season_num = int(raw_season)
+                except (ValueError, TypeError):
+                    pass
+
+            ep_explicit = cls.parse_explicit(entry.get("itunes_explicit"))
 
             parsed_episode = ParsedEpisode(
                 guid=guid,
@@ -266,8 +411,16 @@ class PodcastFeedParser:
                 duration=duration_secs,
                 published_at=published_at,
                 summary=summary,
+                content_html=content_html,
                 enclosure_type=enclosure_type,
                 link=ep_link,
+                transcript_url=transcript_url,
+                chapters_url=chapters_url,
+                image_url=ep_image_url,
+                episode_type=ep_type,
+                episode_number=ep_num,
+                season_number=season_num,
+                explicit=ep_explicit,
             )
             new_episodes.append(parsed_episode)
 
@@ -340,11 +493,13 @@ class PodcastFeedParser:
         items = data.get("items", [])
         total_episodes = len(items)
         new_episodes: List[ParsedEpisode] = []
+        seen_in_batch: Set[str] = set()
 
         for item in items:
             audio_url = item.get("audio_url")
             enclosure_type = item.get("enclosure_type", "audio/mpeg")
             raw_duration = item.get("duration")
+            transcript_url = item.get("transcript_url")
 
             # Check JSON Feed attachments
             attachments = item.get("attachments", [])
@@ -357,11 +512,16 @@ class PodcastFeedParser:
                         enclosure_type = m_type or "audio/mpeg"
                         if "duration_in_seconds" in att:
                             raw_duration = att["duration_in_seconds"]
-                        break
+                    elif u and (m_type.startswith("text/vtt") or "transcript" in m_type):
+                        transcript_url = u
 
             guid = item.get("id") or item.get("guid") or audio_url or item.get("url")
             if not guid:
                 continue
+
+            if guid in seen_in_batch:
+                continue
+            seen_in_batch.add(guid)
 
             if known_guids and guid in known_guids:
                 continue
@@ -397,6 +557,7 @@ class PodcastFeedParser:
                 summary=summary,
                 enclosure_type=enclosure_type,
                 link=ep_link,
+                transcript_url=transcript_url,
             )
             new_episodes.append(parsed_episode)
 
