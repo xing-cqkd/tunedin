@@ -389,9 +389,13 @@ class _ProgressRepository(ProgressRepository):
         return res.scalar_one_or_none()
 
     async def save(self, progress: UserEpisodeProgress) -> UserEpisodeProgress:
-        self._session.add(progress)
+        # Genuine upsert by the composite primary key: add()+flush() would
+        # raise IntegrityError when a second instance with the same
+        # (user_id, episode_id) is saved in one unit of work, but the ABC
+        # contract for save() is "upsert by primary key".
+        merged = await self._session.merge(progress)
         await self._session.flush()
-        return progress
+        return merged
 
 
 class _TaskLogRepository(TaskLogRepository):
