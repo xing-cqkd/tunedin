@@ -238,18 +238,153 @@ class TestFeedIngestionModes:
             assert len(remaining) == 2
 
     @pytest.mark.asyncio
-    async def test_simple_db_module_integration(self):
-        """Verify simple_db initialization, paths, and session_scope."""
-        from backend.ingestion.simple_db import (
-            INGESTION_DB_PATH,
-            init_db,
-            session_scope,
-        )
-        assert INGESTION_DB_PATH.name == "simple.db"
-        await init_db()
-        assert INGESTION_DB_PATH.exists()
+    async def test_settings_database_selection(self):
+        """Verify the settings dispatcher selects SimpleDB by default and sessions work."""
+        import settings
 
-        async with session_scope() as session:
+        assert settings.get_database_backend() == "simple"
+        assert "simple.db" in settings.describe_database()
+
+        await settings.init_db()
+        async with settings.session_scope() as session:
             res = await session.execute(select(Feed))
             assert isinstance(res.scalars().all(), list)
 
+    def test_settings_env_override(self, monkeypatch):
+        """DATABASE_BACKEND env var overrides the settings.yaml value."""
+        import settings
+
+        monkeypatch.setenv("DATABASE_BACKEND", "app")
+        assert settings.get_database_backend() == "app"
+        assert "App database" in settings.describe_database()
+
+        monkeypatch.setenv("DATABASE_BACKEND", "bogus")
+        with pytest.raises(ValueError, match="Unknown database backend"):
+            settings.get_database_backend()
+
+
+
+class TestSettingsYamlLoading:
+    """Settings loaded from a real settings.yaml on disk (tmp_path)."""
+
+    @staticmethod
+    def _use_yaml(monkeypatch, tmp_path, text):
+        """Point settings at a tmp settings.yaml and clear its cache."""
+        import settings
+
+        yaml_file = tmp_path / "settings.yaml"
+        yaml_file.write_text(text, encoding="utf-8")
+        monkeypatch.setattr(settings, "SETTINGS_PATH", yaml_file)
+        monkeypatch.setattr(settings, "_yaml_cache", None)
+        return settings
+
+    def test_loads_real_settings_yaml(self, tmp_path, monkeypatch):
+        settings = self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "database:\n"
+            "  backend: simple\n"
+            "  simple:\n"
+            "    path: backend/ingestion/custom.db\n"
+            "ingestion:\n"
+            "  crawler_countries:\n"
+            "    - us\n"
+            "    - jp\n"
+            "  auto_queue_episodes: 7\n",
+        )
+        assert settings.get_database_backend() == "simple"
+        assert settings.get_settings()["database"]["simple"]["path"] == (
+            "backend/ingestion/custom.db"
+        )
+        assert settings.get_crawler_countries() == ["us", "jp"]
+        assert settings.get_auto_queue_episodes() == 7
+
+    def test_null_section_keeps_defaults(self, tmp_path, monkeypatch):
+        """`database:` with nothing under it must not crash; defaults survive."""
+        settings = self._use_yaml(
+            monkeypatch, tmp_path, "database:\ningestion:\n  auto_queue_episodes: 2\n"
+        )
+        assert settings.get_database_backend() == "simple"
+        assert settings.get_settings()["database"]["simple"]["path"] == (
+            "backend/ingestion/simple.db"
+        )
+        assert settings.get_auto_queue_episodes() == 2
+        # Built-in default countries still apply when the key is absent.
+        assert settings.get_crawler_countries() == ["us", "gb", "ca", "au", "de", "fr"]
+
+    @pytest.mark.parametrize("bad", [-1, "many", 2.5, True, None, "", "--5", "5.5"])
+    def test_auto_queue_episodes_rejects_bad_values(self, tmp_path, monkeypatch, bad):
+        import yaml as pyyaml
+
+        settings = self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "ingestion:\n  auto_queue_episodes: " + pyyaml.safe_dump(bad, default_flow_style=True).strip() + "\n",
+        )
+        with pytest.raises(ValueError, match="auto_queue_episodes"):
+            settings.get_auto_queue_episodes()
+
+    @pytest.mark.parametrize("bad", [[], "us", [""], ["us", 42], None])
+    def test_crawler_countries_rejects_bad_values(self, tmp_path, monkeypatch, bad):
+        import yaml as pyyaml
+
+        settings = self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "ingestion:\n  crawler_countries: " + pyyaml.safe_dump(bad, default_flow_style=True).strip() + "\n",
+        )
+        with pytest.raises(ValueError, match="crawler_countries"):
+            settings.get_crawler_countries()
+
+    def test_describe_database_prefers_legacy_env_override(self, monkeypatch):
+        """INGESTION_DATABASE_URL is what simple_db actually uses; name it."""
+        import settings
+
+        monkeypatch.setenv(
+            "INGESTION_DATABASE_URL", "sqlite+aiosqlite:////tmp/legacy.db"
+        )
+        assert "legacy.db" in settings.describe_database()
+
+    def test_describe_database_displays_url_path_as_is(self, tmp_path, monkeypatch):
+        """A simple.path that is already a URL must not be path-resolved."""
+        import settings
+
+        self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "database:\n"
+            "  backend: simple\n"
+            "  simple:\n"
+            "    path: sqlite+aiosqlite:////tmp/remote.db\n",
+        )
+        monkeypatch.delenv("INGESTION_DATABASE_URL", raising=False)
+        assert settings.describe_database() == (
+            "SimpleDB (SQLite): sqlite+aiosqlite:////tmp/remote.db"
+        )
+
+    def test_invalid_backend_error_names_env_source(self, monkeypatch):
+        import settings
+
+        monkeypatch.setenv("DATABASE_BACKEND", "bogus")
+        with pytest.raises(ValueError, match="DATABASE_BACKEND environment variable"):
+            settings.get_database_backend()
+
+    def test_apply_to_env_mirrors_yaml_path(self, tmp_path, monkeypatch):
+        """The yaml simple.path is mirrored into INGESTION_DATABASE_URL (setdefault)."""
+        import os
+
+        import settings
+
+        self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "database:\n  backend: simple\n  simple:\n    path: backend/ingestion/custom.db\n",
+        )
+        monkeypatch.delenv("INGESTION_DATABASE_URL", raising=False)
+        settings._apply_to_env()
+        assert os.environ["INGESTION_DATABASE_URL"].endswith("custom.db")
+
+        # An explicitly-set variable is never clobbered.
+        monkeypatch.setenv("INGESTION_DATABASE_URL", "sqlite+aiosqlite:////tmp/keep.db")
+        settings._apply_to_env()
+        assert os.environ["INGESTION_DATABASE_URL"].endswith("keep.db")

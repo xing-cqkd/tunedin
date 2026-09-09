@@ -1,4 +1,4 @@
-from backend.ingestion.crawler import DEFAULT_COUNTRIES, DEFAULT_TOPICS, PodcastCrawler
+from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import (
     FeedParseResult,
@@ -16,8 +16,8 @@ from backend.ingestion.task_queue import (
     get_queue_driver,
 )
 from backend.ingestion.service import FeedIngestionService, IngestionMode
-from backend.ingestion.simple_db import (
-    INGESTION_DB_PATH,
+from settings import (
+    describe_database,
     get_db,
     init_db,
     session_scope,
@@ -30,7 +30,6 @@ __all__ = [
     "ITunesSearchClient",
     "PodcastCrawler",
     "DEFAULT_TOPICS",
-    "DEFAULT_COUNTRIES",
     "ParsedFeedMetadata",
     "ParsedEpisode",
     "FeedParseResult",
@@ -41,7 +40,7 @@ __all__ = [
     "LocalInMemoryDriver",
     "GCPCloudTasksDriver",
     "get_queue_driver",
-    "INGESTION_DB_PATH",
+    "describe_database",
     "init_db",
     "get_db",
     "session_scope",

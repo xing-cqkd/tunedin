@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
-from backend.ingestion.simple_db import session_scope
+from backend.ingestion.task_queue import get_queue_driver
+from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -30,10 +31,6 @@ DEFAULT_TOPICS = [
     "News & Current Events", "Culture", "Education", "Books & Literature",
 ]
 
-# Major Apple Podcasts storefront countries
-DEFAULT_COUNTRIES = ["us", "gb", "ca", "au", "de", "fr"]
-
-
 class PodcastCrawler:
     """
     Automated crawler for discovering, batching, and ingesting massive catalogs
@@ -47,7 +44,7 @@ class PodcastCrawler:
         request_delay: float = 0.5,
         batch_size: int = 200,
     ):
-        self.service = service or FeedIngestionService()
+        self.service = service or FeedIngestionService(queue_driver=get_queue_driver())
         self.itunes_client = itunes_client or self.service.itunes_client
         self.request_delay = request_delay
         self.batch_size = min(max(1, batch_size), 200)
@@ -59,7 +56,7 @@ class PodcastCrawler:
     async def crawl_top_charts(
         self,
         db: AsyncSession,
-        countries: Sequence[str] = DEFAULT_COUNTRIES,
+        countries: Optional[Sequence[str]] = None,
         limit_per_chart: int = 100,
         client: Optional[httpx.AsyncClient] = None,
         on_progress: Optional[Callable[[str, int], None]] = None,
@@ -67,7 +64,10 @@ class PodcastCrawler:
         """
         Crawls top charts across multiple Apple storefront countries,
         resolves publisher RSS URLs via batched lookups, and immediately saves shows.
+
+        `countries` defaults to ingestion.crawler_countries from settings.yaml.
         """
+        country_list = list(countries) if countries else get_crawler_countries()
         total_discovered = 0
         total_saved = 0
         visited_urls: Set[str] = set()
@@ -78,7 +78,7 @@ class PodcastCrawler:
             close_client = True
 
         try:
-            for country in countries:
+            for country in country_list:
                 try:
                     logger.info("Crawling top charts for country: %s...", country.upper())
                     podcasts = await self.itunes_client.get_top_podcasts(
@@ -109,7 +109,7 @@ class PodcastCrawler:
         return {
             "total_discovered": total_discovered,
             "unique_saved": total_saved,
-            "countries_crawled": list(countries),
+            "countries_crawled": country_list,
         }
 
     async def crawl_topics(
@@ -247,7 +247,7 @@ class PodcastCrawler:
     ) -> Dict[str, Any]:
         """
         Spawns worker pool to download episodes for all discovered/pending feeds
-        in simple.db with bounded async concurrency.
+        in the configured database with bounded async concurrency.
         """
         # 1. Fetch pending feed records
         async with session_scope() as session:
@@ -273,6 +273,7 @@ class PodcastCrawler:
                         feed, episodes = await self.service.sync_podcast_episodes(
                             db=worker_session,
                             feed_or_id_or_url=feed_id,
+                            auto_queue_episodes=get_auto_queue_episodes(),
                         )
                         successful_feeds += 1
                         total_episodes_saved += len(episodes)
