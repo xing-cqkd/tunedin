@@ -251,7 +251,32 @@ def test_cli_same_backend_exits_nonzero(tmp_path):
 
 def test_get_backend_rejects_unknown():
     with pytest.raises(ValueError):
-        get_backend("dynamodb")
+        get_backend("nope")
+
+
+def test_get_backend_dynamodb_uses_env_config(monkeypatch):
+    monkeypatch.setenv("DATABASE_DYNAMODB_TABLE_NAME", "mytable")
+    monkeypatch.setenv("DATABASE_DYNAMODB_REGION", "eu-west-1")
+    monkeypatch.setenv("DATABASE_DYNAMODB_ENDPOINT_URL", "http://localhost:8000")
+    backend = get_backend("dynamodb")
+    assert backend.name == "dynamodb"
+    assert backend._table_name == "mytable"
+    assert backend._region_name == "eu-west-1"
+    assert backend._endpoint_url == "http://localhost:8000"
+    assert backend.identity == "dynamodb:eu-west-1:mytable"
+
+
+def test_get_backend_dynamodb_defaults(monkeypatch):
+    for var in (
+        "DATABASE_DYNAMODB_TABLE_NAME",
+        "DATABASE_DYNAMODB_REGION",
+        "DATABASE_DYNAMODB_ENDPOINT_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    backend = get_backend("dynamodb")
+    assert backend._table_name == "tunedin"
+    assert backend._region_name == "us-east-1"
+    assert backend._endpoint_url is None
 
 
 class _SubsetBackend(SqlAlchemyBackend):
