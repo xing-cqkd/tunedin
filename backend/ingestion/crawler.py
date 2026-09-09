@@ -31,10 +31,6 @@ DEFAULT_TOPICS = [
     "News & Current Events", "Culture", "Education", "Books & Literature",
 ]
 
-# Major Apple Podcasts storefront countries
-DEFAULT_COUNTRIES = ["us", "gb", "ca", "au", "de", "fr"]
-
-
 class PodcastCrawler:
     """
     Automated crawler for discovering, batching, and ingesting massive catalogs
