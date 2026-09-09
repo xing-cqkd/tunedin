@@ -81,6 +81,12 @@ class DynamoDBStore(Store):
         else:
             self._client_ctx = None
             self._owns_client = False
+        # Tracks whether the owned client context has been entered.
+        # Guards both double-``__aenter__`` (entering twice would create a
+        # second aioboto3 client and orphan the first) and ``close()``
+        # before entering (exiting a never-entered context raises
+        # ``AttributeError`` inside aioboto3).
+        self._entered = False
         self._client = client
         self._table_name = table_name
         if client is not None:
@@ -145,11 +151,25 @@ class DynamoDBStore(Store):
         this is a no-op beyond returning ``self``. Always use ``async with``
         — repository access before entering raises ``AttributeError``
         because the client does not exist yet.
+
+        Re-entering an already-entered store is a no-op returning ``self``
+        (documented, not an error): entering the aioboto3 client context a
+        second time would create a second client and orphan the first, so
+        the ``_entered`` flag makes the second ``__aenter__`` return early
+        with the client and repositories untouched.
         """
+        if self._entered:
+            return self
         if self._owns_client:
             assert self._client_ctx is not None
             self._client = await self._client_ctx.__aenter__()
+            # Mark entered BEFORE _init_repositories so that if repository
+            # construction fails midway, close() still exits the context
+            # instead of leaking the client.
+            self._entered = True
             self._init_repositories(self._client)
+        else:
+            self._entered = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -172,10 +192,14 @@ class DynamoDBStore(Store):
     async def close(self) -> None:
         """Release the store's resources.
 
-        Exits the owned aioboto3 client context (idempotent); an injected
-        client belongs to the caller (e.g. a test fixture sharing one
-        client across stores) and is left open.
+        Exits the owned aioboto3 client context (idempotent — safe to call
+        any number of times, and safe to call on a store that was never
+        entered, in which case it is a no-op); an injected client belongs
+        to the caller (e.g. a test fixture sharing one client across
+        stores) and is left open.
         """
-        if self._owns_client and self._client_ctx is not None:
+        if self._owns_client and self._entered:
+            self._entered = False
             ctx, self._client_ctx = self._client_ctx, None
+            assert ctx is not None
             await ctx.__aexit__(None, None, None)
