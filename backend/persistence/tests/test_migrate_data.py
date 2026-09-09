@@ -10,6 +10,7 @@ import pytest
 from backend.migrate_data import (
     SameBackendError,
     SqlAlchemyBackend,
+    _normalize_url,
     get_backend,
     main,
     migrate,
@@ -251,3 +252,64 @@ def test_cli_same_backend_exits_nonzero(tmp_path):
 def test_get_backend_rejects_unknown():
     with pytest.raises(ValueError):
         get_backend("dynamodb")
+
+
+class _SubsetBackend(SqlAlchemyBackend):
+    """Target backend exposing only a subset of tables."""
+
+    @property
+    def table_names(self):
+        return ["feeds", "episodes"]
+
+
+@pytest.mark.asyncio
+async def test_skipped_tables_warned_and_reported(tmp_path, capsys):
+    src = _url(tmp_path / "src.db")
+    dst = _url(tmp_path / "dst.db")
+    await _seed_source(src)
+
+    report = await migrate(
+        SqlAlchemyBackend.from_url("s", src),
+        _SubsetBackend.from_url("t", dst),
+    )
+    by_table = {r.table: r for r in report}
+
+    assert by_table["feeds"].skipped is False
+    assert by_table["feeds"].copied_rows == 1
+    assert by_table["tags"].skipped is True
+    assert by_table["tags"].copied_rows == 0
+    assert by_table["insights"].skipped is True
+
+    err = capsys.readouterr().err
+    assert "skipping table 'tags'" in err
+    assert "skipping table 'insights'" in err
+    assert "skipping table 'episodes'" not in err
+    assert "skipping table 'feeds'" not in err
+
+
+def test_normalize_url_unifies_sqlite_spellings(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    relative = _normalize_url("sqlite+aiosqlite:///./same.db")
+    absolute = _normalize_url(f"sqlite+aiosqlite:///{tmp_path}/same.db")
+    assert relative == absolute
+    assert relative.endswith("/same.db")
+    # Non-sqlite URLs pass through untouched.
+    assert _normalize_url("postgresql://u@h/db") == "postgresql://u@h/db"
+    assert _normalize_url("sqlite+aiosqlite:///:memory:") == (
+        "sqlite+aiosqlite:///:memory:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_database_relative_vs_absolute_spelling_refused(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    relative_url = "sqlite+aiosqlite:///./same.db"
+    absolute_url = f"sqlite+aiosqlite:///{tmp_path / 'same.db'}"
+    assert relative_url != absolute_url  # different spellings, same file
+    with pytest.raises(SameBackendError):
+        await migrate(
+            SqlAlchemyBackend.from_url("s", relative_url),
+            SqlAlchemyBackend.from_url("t", absolute_url),
+        )

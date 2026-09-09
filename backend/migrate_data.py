@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List
 
-from sqlalchemy import Table, event, select
+from sqlalchemy import Table, event, make_url, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -69,6 +69,28 @@ def resolve_url(name: str) -> str:
     return os.environ.get(env_var) or _default_url(name)
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize a database URL for stable identity comparison.
+
+    SQLite file paths are resolved to absolute form (relative to the
+    current working directory, exactly as the sqlite driver interprets
+    them) so equivalent spellings -- ``./tunedin.db`` vs
+    ``/abs/cwd/tunedin.db`` -- produce the same identity and the
+    same-database guard cannot be slipped with a different spelling.
+    Non-sqlite URLs are returned unchanged.
+    """
+    scheme = url.split("://", 1)[0]
+    if "sqlite" not in scheme:
+        return url
+    try:
+        database = make_url(url).database
+    except Exception:
+        return url
+    if not database or database == ":memory:":
+        return url
+    return f"{scheme}:///{Path(database).resolve()}"
+
+
 class SameBackendError(RuntimeError):
     """Raised when source and target resolve to the same underlying store."""
 
@@ -91,7 +113,12 @@ class Backend(abc.ABC):
     @property
     @abc.abstractmethod
     def table_names(self) -> List[str]:
-        """All table names in dependency (parents-first) order."""
+        """All table names in dependency (parents-first) order.
+
+        Source and target backends are expected to cover the same table
+        set; any source table missing from the target is skipped with a
+        warning (see :func:`migrate`).
+        """
 
     @abc.abstractmethod
     async def init(self) -> None:
@@ -99,7 +126,15 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
-        """Return every row of a table as plain ``{column: value}`` dicts."""
+        """Return every row of a table as plain ``{column: value}`` dicts.
+
+        Value-type contract: values must be SQLAlchemy-hydrated native
+        Python values keyed by column name -- UUID objects (not strings),
+        tz-aware datetimes (not ISO-8601 strings), JSON columns as
+        dicts/lists -- because :meth:`write_rows` feeds each dict straight
+        into ``model_cls(**row)``. A backend that stores values in another
+        representation must convert them back to these native types here.
+        """
 
     @abc.abstractmethod
     async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
@@ -169,7 +204,9 @@ class SqlAlchemyBackend(Backend):
 
     @property
     def identity(self) -> str:
-        return f"sqlalchemy:{self._url}"
+        # Normalized so equivalent URL spellings (./x.db vs /abs/x.db)
+        # compare equal for the same-database guard.
+        return f"sqlalchemy:{_normalize_url(self._url)}"
 
     @property
     def table_names(self) -> List[str]:
@@ -233,12 +270,18 @@ class TableReport:
     table: str
     source_rows: int
     copied_rows: int
+    skipped: bool = False
 
 
 async def migrate(
     source: Backend, target: Backend, dry_run: bool = False
 ) -> List[TableReport]:
-    """Copy every table from source to target. Returns a per-table report."""
+    """Copy every table from source to target. Returns a per-table report.
+
+    Source tables missing from the target backend are skipped: a warning
+    is printed to stderr for each and the table is flagged ``skipped`` in
+    the returned report.
+    """
     if source.identity == target.identity:
         raise SameBackendError(
             f"source and target resolve to the same database "
@@ -252,11 +295,21 @@ async def migrate(
         for table_name in source.table_names:
             rows = await source.read_table(table_name)
             copied = 0
-            if not dry_run and table_name in target.table_names:
+            skipped = table_name not in target.table_names
+            if skipped:
+                print(
+                    f"warning: skipping table {table_name!r}: not present in "
+                    f"target backend {target.name!r}",
+                    file=sys.stderr,
+                )
+            elif not dry_run:
                 copied = await target.write_rows(table_name, rows)
             report.append(
                 TableReport(
-                    table=table_name, source_rows=len(rows), copied_rows=copied
+                    table=table_name,
+                    source_rows=len(rows),
+                    copied_rows=copied,
+                    skipped=skipped,
                 )
             )
     finally:
@@ -268,14 +321,15 @@ async def migrate(
 def print_report(report: List[TableReport], dry_run: bool) -> None:
     mode = "DRY RUN -- nothing written" if dry_run else "MIGRATED"
     print(f"{mode}")
-    print(f"{'table':<28}{'source rows':>12}{'copied':>10}")
-    print("-" * 52)
+    print(f"{'table':<28}{'source rows':>12}{'copied':>10}{'status':>10}")
+    print("-" * 62)
     total_source = total_copied = 0
     for r in report:
-        print(f"{r.table:<28}{r.source_rows:>12}{r.copied_rows:>10}")
+        status = "skipped" if r.skipped else ""
+        print(f"{r.table:<28}{r.source_rows:>12}{r.copied_rows:>10}{status:>10}")
         total_source += r.source_rows
         total_copied += r.copied_rows
-    print("-" * 52)
+    print("-" * 62)
     print(f"{'TOTAL':<28}{total_source:>12}{total_copied:>10}")
 
 
@@ -295,6 +349,10 @@ def main(argv: List[str] | None = None) -> int:
     try:
         source = get_backend(args.source)
         target = get_backend(args.target)
+        # Show exactly what will be touched before any writes happen.
+        # The operation stays upsert-only; this is visibility, not a prompt
+        # (the CLI runs non-interactively).
+        print(f"{source.identity} -> {target.identity}")
         report = asyncio.run(migrate(source, target, dry_run=args.dry_run))
     except (ValueError, SameBackendError) as e:
         print(f"error: {e}", file=sys.stderr)
