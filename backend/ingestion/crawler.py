@@ -8,7 +8,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
-from backend.settings import session_scope
+from backend.ingestion.task_queue import get_queue_driver
+from backend.settings import get_settings, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -47,7 +48,7 @@ class PodcastCrawler:
         request_delay: float = 0.5,
         batch_size: int = 200,
     ):
-        self.service = service or FeedIngestionService()
+        self.service = service or FeedIngestionService(queue_driver=get_queue_driver())
         self.itunes_client = itunes_client or self.service.itunes_client
         self.request_delay = request_delay
         self.batch_size = min(max(1, batch_size), 200)
@@ -273,6 +274,9 @@ class PodcastCrawler:
                         feed, episodes = await self.service.sync_podcast_episodes(
                             db=worker_session,
                             feed_or_id_or_url=feed_id,
+                            auto_queue_episodes=int(
+                                get_settings()["ingestion"]["auto_queue_episodes"]
+                            ),
                         )
                         successful_feeds += 1
                         total_episodes_saved += len(episodes)
