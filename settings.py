@@ -5,21 +5,28 @@ overrides, and exposes the configured database backend's session helpers.
 
 Resolution order (highest precedence first):
   1. Environment variables:
-       DATABASE_BACKEND      -> database.backend ("simple" | "app")
-       DATABASE_SIMPLE_PATH  -> database.simple.path
-       DATABASE_APP_URL      -> database.app.url
+       DATABASE_BACKEND              -> database.backend ("simple" | "app" | "dynamodb")
+       DATABASE_SIMPLE_PATH          -> database.simple.path
+       DATABASE_APP_URL              -> database.app.url
+       DATABASE_DYNAMODB_TABLE_NAME  -> database.dynamodb.table_name
+       DATABASE_DYNAMODB_REGION      -> database.dynamodb.region
+       DATABASE_DYNAMODB_ENDPOINT_URL -> database.dynamodb.endpoint_url
      (The legacy INGESTION_DATABASE_URL / DATABASE_URL variables keep working:
      the database modules read them directly at import time and they take
      precedence over the values mirrored from settings.yaml.)
+     AWS credentials are NEVER read from settings — they come from the
+     standard AWS chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars,
+     ~/.aws/credentials, or an IAM role).
   2. `settings.yaml` at the repo root.
   3. Built-in defaults (SimpleDB at backend/ingestion/simple.db).
 
-The database modules (`backend.ingestion.simple_db` and
+The SQL database modules (`backend.ingestion.simple_db` and
 `backend.persistence.database`) read their configuration from the environment
 at import time, so this module mirrors the resolved settings into the
-environment *before* those modules are imported. Always go through
-`settings` (`session_scope`, `init_db`, `get_db`) instead of
-importing the backend modules directly.
+environment *before* those modules are imported. Application code works
+through the Store protocol: ``open_store()`` (``session_scope()`` remains
+only as a thin alias for external compatibility) — never ad-hoc SQL and
+never the backend modules directly.
 """
 
 import copy
@@ -28,8 +35,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List
 from urllib.parse import urlsplit, urlunsplit
-
-from sqlalchemy.ext.asyncio import AsyncSession
 
 try:
     import yaml
@@ -44,6 +49,12 @@ DEFAULTS: Dict[str, Any] = {
         "backend": "simple",
         "simple": {"path": "backend/ingestion/simple.db"},
         "app": {"url": "sqlite+aiosqlite:///./tunedin.db"},
+        "dynamodb": {
+            "table_name": "tunedin",
+            "region": "us-east-1",
+            # Set to e.g. "http://localhost:8000" for DynamoDB Local testing.
+            "endpoint_url": None,
+        },
     },
     "ingestion": {
         "crawler_countries": ["us", "gb", "ca", "au", "de", "fr"],
@@ -56,9 +67,12 @@ _ENV_OVERRIDES = {
     "DATABASE_BACKEND": "database.backend",
     "DATABASE_SIMPLE_PATH": "database.simple.path",
     "DATABASE_APP_URL": "database.app.url",
+    "DATABASE_DYNAMODB_TABLE_NAME": "database.dynamodb.table_name",
+    "DATABASE_DYNAMODB_REGION": "database.dynamodb.region",
+    "DATABASE_DYNAMODB_ENDPOINT_URL": "database.dynamodb.endpoint_url",
 }
 
-_VALID_BACKENDS = ("simple", "app")
+_VALID_BACKENDS = ("simple", "app", "dynamodb")
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,7 +124,7 @@ def get_settings() -> Dict[str, Any]:
 
 
 def get_database_backend() -> str:
-    """Return the configured database backend: "simple" or "app"."""
+    """Return the configured database backend: "simple" | "app" | "dynamodb"."""
     backend = str(get_settings()["database"]["backend"]).lower()
     if backend not in _VALID_BACKENDS:
         source = (
@@ -123,6 +137,20 @@ def get_database_backend() -> str:
             f"(expected one of {_VALID_BACKENDS})"
         )
     return backend
+
+
+def get_dynamodb_config() -> Dict[str, Any]:
+    """Return the resolved DynamoDB settings: table_name, region, endpoint_url.
+
+    Credentials are deliberately NOT part of this — they always come from
+    the standard AWS chain (env vars, ~/.aws/credentials, IAM role).
+    """
+    cfg = get_settings()["database"].get("dynamodb") or {}
+    return {
+        "table_name": str(cfg.get("table_name") or "tunedin"),
+        "region": str(cfg.get("region") or "us-east-1"),
+        "endpoint_url": cfg.get("endpoint_url") or None,
+    }
 
 
 def get_crawler_countries() -> List[str]:
@@ -185,8 +213,18 @@ def _apply_to_env() -> None:
 
 
 def describe_database() -> str:
-    """Human-readable label for the configured database, for CLI/status output."""
+    """Human-readable label for the configured database, for CLI/status output.
+
+    Never includes credentials.
+    """
     backend = get_database_backend()
+    if backend == "dynamodb":
+        cfg = get_dynamodb_config()
+        endpoint = cfg["endpoint_url"] or f"aws:{cfg['region']}"
+        return (
+            f"DynamoDB: table={cfg['table_name']} "
+            f"region={cfg['region']} endpoint={endpoint}"
+        )
     if backend == "simple":
         path = str(get_settings()["database"]["simple"]["path"])
         mirrored = _path_to_sqlite_url(path)
@@ -215,25 +253,83 @@ def describe_database() -> str:
 
 
 @asynccontextmanager
-async def session_scope() -> AsyncGenerator[AsyncSession, None]:
-    """Yield an async session from the configured database backend."""
-    backend = get_database_backend()
-    if backend == "simple":
+async def session_scope() -> AsyncGenerator["Store", None]:
+    """Yield a Store for the configured database backend.
+
+    Thin alias of :func:`open_store` kept for external compatibility —
+    ``open_store()`` is the canonical way to obtain a Store. The store is
+    entered on the way in (this is what connects the DynamoDB client's
+    async context) and closed when the context exits. Commits are the
+    caller's responsibility via ``await store.commit()``; exiting the
+    ``async with`` block also commits on clean exit per the Store ABC.
+    """
+    store = open_store()
+    try:
+        async with store:
+            yield store
+    finally:
+        await store.close()
+
+
+def open_store(backend: str | None = None) -> "Store":
+    """Return a Store for the given (or the configured) database backend.
+
+    The canonical way for application code to obtain a Store. The caller
+    owns the returned store: prefer ``async with open_store() as store:``
+    (``async with`` is REQUIRED for the dynamodb backend — it is what
+    connects the aioboto3 client; the Store ABC commits on clean exit and
+    rolls back on exception), or call ``await store.close()`` explicitly
+    when done.
+    """
+    name = (backend or get_database_backend()).lower()
+    if name not in _VALID_BACKENDS:
+        raise ValueError(
+            f"Unknown database backend {name!r} (expected one of {_VALID_BACKENDS})"
+        )
+    if name == "dynamodb":
+        from backend.persistence.dynamodb.store import DynamoDBStore
+
+        cfg = get_dynamodb_config()
+        return DynamoDBStore(
+            table_name=cfg["table_name"],
+            region_name=cfg["region"],
+            endpoint_url=cfg["endpoint_url"],
+        )
+    from backend.persistence.sqlalchemy_store import SQLAlchemyStore
+
+    if name == "simple":
         from backend.ingestion import simple_db
 
-        async with simple_db.session_scope() as session:
-            yield session
-    else:
-        from backend.persistence import database
+        return SQLAlchemyStore(simple_db.AsyncSessionLocal)
+    from backend.persistence import database
 
-        async with database.session_scope() as session:
-            yield session
+    return SQLAlchemyStore(database.AsyncSessionLocal)
 
 
 async def init_db() -> None:
-    """Create all tables in the configured database backend."""
+    """Create all tables in the configured database backend.
+
+    For the ``dynamodb`` backend this provisions the single table (plus its
+    GSIs) and enables point-in-time recovery via ``ensure_table()`` — the
+    DynamoDB equivalent of running migrations.
+    """
     backend = get_database_backend()
-    if backend == "simple":
+    if backend == "dynamodb":
+        from backend.persistence.dynamodb.client import create_client
+        from backend.persistence.dynamodb.table import ensure_table
+
+        cfg = get_dynamodb_config()
+        # create_client() returns aioboto3's async client context — it must
+        # be entered before the client is usable.
+        client_ctx = create_client(
+            region_name=cfg["region"], endpoint_url=cfg["endpoint_url"]
+        )
+        client = await client_ctx.__aenter__()
+        try:
+            await ensure_table(client, table_name=cfg["table_name"])
+        finally:
+            await client_ctx.__aexit__(None, None, None)
+    elif backend == "simple":
         from backend.ingestion import simple_db
 
         await simple_db.init_db()
@@ -243,10 +339,10 @@ async def init_db() -> None:
         await database.init_db()
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Session dependency for the configured backend (e.g. FastAPI Depends)."""
-    async with session_scope() as session:
-        yield session
+async def get_db() -> AsyncGenerator["Store", None]:
+    """Store dependency for the configured backend (e.g. FastAPI Depends)."""
+    async with session_scope() as store:
+        yield store
 
 
 # Mirror settings into the environment before any backend module is imported.

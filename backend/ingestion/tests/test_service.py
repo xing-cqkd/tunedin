@@ -235,17 +235,73 @@ class TestFeedIngestionModes:
 
     @pytest.mark.asyncio
     async def test_settings_database_selection(self):
-        """Verify the settings dispatcher selects SimpleDB by default and sessions work."""
+        """Verify the settings dispatcher selects SimpleDB by default and stores work."""
         import settings
-        from sqlalchemy import select
 
         assert settings.get_database_backend() == "simple"
         assert "simple.db" in settings.describe_database()
 
         await settings.init_db()
-        async with settings.session_scope() as session:
-            res = await session.execute(select(Feed))
-            assert isinstance(res.scalars().all(), list)
+        async with settings.session_scope() as store:
+            # session_scope() yields a Store (no ad-hoc SQL in application code).
+            assert await store.feeds.count_all() == 0
+
+    @pytest.mark.asyncio
+    async def test_settings_open_store_dynamodb(self, monkeypatch):
+        """open_store() builds a DynamoDBStore from settings + env overrides."""
+        import settings
+
+        monkeypatch.setenv("DATABASE_BACKEND", "dynamodb")
+        monkeypatch.setenv("DATABASE_DYNAMODB_TABLE_NAME", "test-table")
+        monkeypatch.setenv("DATABASE_DYNAMODB_REGION", "eu-west-1")
+        monkeypatch.setenv(
+            "DATABASE_DYNAMODB_ENDPOINT_URL", "http://localhost:8000"
+        )
+
+        assert settings.get_database_backend() == "dynamodb"
+        cfg = settings.get_dynamodb_config()
+        assert cfg == {
+            "table_name": "test-table",
+            "region": "eu-west-1",
+            "endpoint_url": "http://localhost:8000",
+        }
+        assert "test-table" in settings.describe_database()
+        assert "localhost:8000" in settings.describe_database()
+
+        from backend.persistence.dynamodb.store import DynamoDBStore
+
+        # The dynamodb backend requires `async with`: entering the store
+        # connects the aioboto3 client context.
+        async with settings.open_store() as store:
+            assert isinstance(store, DynamoDBStore)
+            assert store.table_name == "test-table"
+            # The entered client is a real (usable) client object.
+            assert hasattr(store._client, "get_item")
+
+        # Explicit backend argument overrides the configured one.
+        sql_store = settings.open_store("simple")
+        try:
+            from backend.persistence.sqlalchemy_store import SQLAlchemyStore
+
+            assert isinstance(sql_store, SQLAlchemyStore)
+        finally:
+            await sql_store.close()
+
+    def test_settings_dynamodb_defaults(self, monkeypatch):
+        """DynamoDB settings fall back to built-in defaults."""
+        import settings
+
+        monkeypatch.setenv("DATABASE_BACKEND", "dynamodb")
+        for var in (
+            "DATABASE_DYNAMODB_TABLE_NAME",
+            "DATABASE_DYNAMODB_REGION",
+            "DATABASE_DYNAMODB_ENDPOINT_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        cfg = settings.get_dynamodb_config()
+        assert cfg["table_name"] == "tunedin"
+        assert cfg["region"] == "us-east-1"
+        assert cfg["endpoint_url"] is None
 
     def test_settings_env_override(self, monkeypatch):
         """DATABASE_BACKEND env var overrides the settings.yaml value."""

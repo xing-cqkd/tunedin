@@ -13,6 +13,7 @@ from backend.ingestion.service import FeedIngestionService
 from backend.persistence.models.base import Base
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -54,7 +55,7 @@ class TestPodcastCrawler:
         async with httpx.AsyncClient(transport=transport) as client:
             crawler = PodcastCrawler(request_delay=0.0)
             stats = await crawler.crawl_topics(
-                db=in_memory_session,
+                store=SQLAlchemyStore(lambda: in_memory_session),
                 topics=["AI", "Neuroscience"],
                 country="us",
                 client=client,
@@ -83,7 +84,7 @@ class TestPodcastCrawler:
             collection_ids = [1545953110, 1600000001, 1700000002, 1800000003]
 
             saved_feeds = await crawler.resolve_and_save_ids(
-                db=in_memory_session,
+                store=SQLAlchemyStore(lambda: in_memory_session),
                 collection_ids=collection_ids,
                 client=client,
             )
@@ -115,7 +116,7 @@ class TestPodcastCrawler:
         async with httpx.AsyncClient(transport=transport) as client:
             crawler = PodcastCrawler(request_delay=0.0)
             stats = await crawler.crawl_top_charts(
-                db=in_memory_session,
+                store=SQLAlchemyStore(lambda: in_memory_session),
                 countries=["us", "gb"],
                 limit_per_chart=25,
                 client=client,
@@ -153,7 +154,7 @@ class TestPodcastCrawler:
 
         @asynccontextmanager
         async def fake_session_scope():
-            yield in_memory_session
+            yield SQLAlchemyStore(lambda: in_memory_session)
 
         monkeypatch.setattr(crawler_module, "session_scope", fake_session_scope)
 

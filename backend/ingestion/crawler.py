@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
 import httpx
-from sqlalchemy.ext.asyncio import AsyncSession
+from backend.persistence.repositories import Store
 
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
@@ -11,7 +11,6 @@ from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +54,7 @@ class PodcastCrawler:
 
     async def crawl_top_charts(
         self,
-        db: AsyncSession,
+        store: Store,
         countries: Optional[Sequence[str]] = None,
         limit_per_chart: int = 100,
         client: Optional[httpx.AsyncClient] = None,
@@ -94,7 +93,7 @@ class PodcastCrawler:
                         visited_urls.add(p.feed_url)
 
                     saved_feeds = await self.service.save_podcasts(
-                        SQLAlchemyStore(lambda: db), new_podcasts
+                        store, new_podcasts
                     )
                     total_saved += len(saved_feeds)
 
@@ -116,7 +115,7 @@ class PodcastCrawler:
 
     async def crawl_topics(
         self,
-        db: AsyncSession,
+        store: Store,
         topics: Sequence[str] = DEFAULT_TOPICS,
         limit_per_topic: int = 200,
         country: str = "us",
@@ -155,7 +154,7 @@ class PodcastCrawler:
                         visited_urls.add(p.feed_url)
 
                     saved_feeds = await self.service.save_podcasts(
-                        SQLAlchemyStore(lambda: db), new_podcasts
+                        store, new_podcasts
                     )
                     total_saved += len(saved_feeds)
 
@@ -177,7 +176,7 @@ class PodcastCrawler:
 
     async def crawl_alphabetical_prefixes(
         self,
-        db: AsyncSession,
+        store: Store,
         prefixes: Optional[Sequence[str]] = None,
         limit_per_prefix: int = 200,
         country: str = "us",
@@ -192,7 +191,7 @@ class PodcastCrawler:
             prefixes = [f"{a}{b}" for a in string.ascii_lowercase for b in string.ascii_lowercase]
 
         return await self.crawl_topics(
-            db=db,
+            store=store,
             topics=prefixes,
             limit_per_topic=limit_per_prefix,
             country=country,
@@ -202,7 +201,7 @@ class PodcastCrawler:
 
     async def resolve_and_save_ids(
         self,
-        db: AsyncSession,
+        store: Store,
         collection_ids: Sequence[Union[int, str]],
         country: str = "us",
         client: Optional[httpx.AsyncClient] = None,
@@ -228,7 +227,7 @@ class PodcastCrawler:
                     client=client,
                 )
                 saved_feeds = await self.service.save_podcasts(
-                    SQLAlchemyStore(lambda: db), podcasts
+                    store, podcasts
                 )
                 for f in saved_feeds:
                     if f.feed_id not in seen_feed_ids:
@@ -256,8 +255,7 @@ class PodcastCrawler:
         in the configured database with bounded async concurrency.
         """
         # 1. Fetch pending feed records
-        async with session_scope() as session:
-            store = SQLAlchemyStore(lambda: session)
+        async with session_scope() as store:
             pending_feeds = await store.feeds.list_by_statuses(
                 ["discovered", "pending"], limit=max_feeds
             )
@@ -275,8 +273,7 @@ class PodcastCrawler:
             nonlocal total_episodes_saved, successful_feeds, failed_feeds
             async with semaphore:
                 try:
-                    async with session_scope() as worker_session:
-                        store = SQLAlchemyStore(lambda: worker_session)
+                    async with session_scope() as store:
                         feed, episodes = await self.service.sync_podcast_episodes(
                             store=store,
                             feed_or_id_or_url=feed_id,
