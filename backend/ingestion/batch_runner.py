@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
-from backend.settings import describe_database, get_settings, init_db, session_scope
+from backend.settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -116,7 +116,7 @@ async def run_batch_ingest(
     committing to the configured database after each show and recording progress in .local_agents/podcast_ingest.md.
     """
     await init_db()
-    auto_queue = int(get_settings()["ingestion"]["auto_queue_episodes"])
+    auto_queue = get_auto_queue_episodes()
     service = FeedIngestionService(queue_driver=get_queue_driver())
     logs: List[str] = load_existing_logs()
     last_error_msg: Optional[str] = None

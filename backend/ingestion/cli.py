@@ -5,9 +5,9 @@ import sys
 from typing import List, Optional
 from sqlalchemy import func, select
 
-from backend.ingestion.crawler import DEFAULT_COUNTRIES, DEFAULT_TOPICS, PodcastCrawler
+from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
-from backend.settings import describe_database, init_db, session_scope
+from backend.settings import describe_database, get_crawler_countries, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -70,7 +70,7 @@ async def run_crawl(
 
     async with session_scope() as db:
         if mode in ("charts", "all"):
-            c_list = countries or ["us", "gb", "ca"]
+            c_list = countries or get_crawler_countries()
             print(f"\n🚀 Harvesting Top Charts across {c_list} (limit {limit} per country)...")
             chart_stats = await crawler.crawl_top_charts(
                 db=db,
@@ -149,7 +149,7 @@ def main() -> None:
     crawl_parser.add_argument(
         "--countries",
         type=str,
-        help="Comma-separated storefront country codes (e.g. us,gb,ca)",
+        help="Comma-separated storefront country codes (e.g. us,gb,ca; default: ingestion.crawler_countries from settings.yaml)",
     )
     crawl_parser.add_argument(
         "--limit",

@@ -26,7 +26,7 @@ import copy
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict, List
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +64,10 @@ _VALID_BACKENDS = ("simple", "app")
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     merged = copy.deepcopy(base)
     for key, value in override.items():
+        if value is None and isinstance(merged.get(key), dict):
+            # Empty section (e.g. `database:` with nothing under it):
+            # treat as {} so the defaults for that section survive.
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = _deep_merge(merged[key], value)
         else:
@@ -109,11 +113,47 @@ def get_database_backend() -> str:
     """Return the configured database backend: "simple" or "app"."""
     backend = str(get_settings()["database"]["backend"]).lower()
     if backend not in _VALID_BACKENDS:
+        source = (
+            "the DATABASE_BACKEND environment variable"
+            if "DATABASE_BACKEND" in os.environ
+            else "settings.yaml"
+        )
         raise ValueError(
-            f"Unknown database backend {backend!r} in settings.yaml "
+            f"Unknown database backend {backend!r} in {source} "
             f"(expected one of {_VALID_BACKENDS})"
         )
     return backend
+
+
+def get_crawler_countries() -> List[str]:
+    """Configured iTunes storefront countries (ingestion.crawler_countries)."""
+    countries = get_settings()["ingestion"]["crawler_countries"]
+    if (
+        not isinstance(countries, list)
+        or not countries
+        or not all(isinstance(c, str) and c.strip() for c in countries)
+    ):
+        raise ValueError(
+            "Invalid ingestion.crawler_countries in settings.yaml: "
+            f"expected a non-empty list of country codes, got {countries!r}"
+        )
+    return [c.strip() for c in countries]
+
+
+def get_auto_queue_episodes() -> int:
+    """Validated ingestion.auto_queue_episodes (a non-negative integer)."""
+    raw = get_settings()["ingestion"]["auto_queue_episodes"]
+    value: int | None = None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().lstrip("+-").isdigit():
+        value = int(raw.strip())
+    if value is None or value < 0:
+        raise ValueError(
+            "Invalid ingestion.auto_queue_episodes in settings.yaml: "
+            f"expected a non-negative integer, got {raw!r}"
+        )
+    return value
 
 
 def _path_to_sqlite_url(path: str) -> str:
@@ -146,6 +186,13 @@ def describe_database() -> str:
     backend = get_database_backend()
     if backend == "simple":
         path = str(get_settings()["database"]["simple"]["path"])
+        mirrored = _path_to_sqlite_url(path)
+        # Honor an explicit legacy env override: it is what simple_db actually
+        # uses (_apply_to_env only mirrors the yaml value when the var is unset,
+        # in which case the env value equals `mirrored`).
+        env_url = os.environ.get("INGESTION_DATABASE_URL")
+        if env_url and env_url != mirrored:
+            return f"SimpleDB (SQLite): {env_url}"
         return f"SimpleDB (SQLite): {(REPO_ROOT / path).resolve()}"
     url = os.environ.get("DATABASE_URL", str(get_settings()["database"]["app"]["url"]))
     # Mask any password embedded in the URL.

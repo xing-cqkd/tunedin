@@ -44,6 +44,7 @@ database:
 # --- Ingestion ---------------------------------------------------------------
 ingestion:
   # iTunes storefront countries used by the top-charts crawler.
+  # (The `crawl --countries` CLI flag overrides this per run.)
   crawler_countries:
     - us
     - gb
