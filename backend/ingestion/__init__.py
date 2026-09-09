@@ -20,6 +20,7 @@ from settings import (
     describe_database,
     get_db,
     init_db,
+    open_store,
     session_scope,
 )
 
@@ -43,5 +44,6 @@ __all__ = [
     "describe_database",
     "init_db",
     "get_db",
+    "open_store",
     "session_scope",
 ]

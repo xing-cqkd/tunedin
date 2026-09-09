@@ -24,9 +24,18 @@
 #            must all share one database.
 #            Implemented in: backend/persistence/database.py
 #
+#   dynamodb — DynamoDB: the single-table serverless backend configured via
+#            `database.dynamodb` below. Best for production scale without
+#            managing a database server; also works against DynamoDB Local
+#            for offline testing.
+#            Implemented in: backend/persistence/dynamodb/
+#            (overridable per-environment with the DATABASE_DYNAMODB_*
+#            environment variables; AWS credentials always come from the
+#            standard AWS chain, never from settings)
+#
 database:
-  # Which database backend the ingestion tooling uses: "simple" or "app".
-  # See the header comment above for what each option means.
+  # Which database backend the ingestion tooling uses: "simple", "app", or
+  # "dynamodb". See the header comment above for what each option means.
   backend: simple
 
   # SimpleDB settings — used when backend is "simple".
@@ -40,6 +49,20 @@ database:
   #   Postgres: "postgresql+asyncpg://user:password@localhost:5432/tunedin"
   app:
     url: "sqlite+aiosqlite:///./tunedin.db"
+
+  # DynamoDB settings — used when backend is "dynamodb".
+  # The table is provisioned on demand by `init_db()` (ensure_table).
+  dynamodb:
+    # Single-table name for all entities.
+    table_name: "tunedin"
+    # AWS region for the table.
+    region: "us-east-1"
+    # Optional endpoint override for DynamoDB Local testing,
+    # e.g. "http://localhost:8000". Leave unset for real AWS.
+    # AWS credentials are NEVER stored here — they come from the standard
+    # AWS chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars,
+    # ~/.aws/credentials, or an IAM role).
+    endpoint_url: null
 
 # --- Ingestion ---------------------------------------------------------------
 ingestion:

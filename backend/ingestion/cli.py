@@ -7,7 +7,6 @@ from typing import List, Optional
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
 from settings import describe_database, get_crawler_countries, init_db, session_scope
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,11 +15,15 @@ logging.basicConfig(
 logger = logging.getLogger("ingestion_cli")
 
 
+async def run_init_db() -> None:
+    """Provisions the configured database (creates tables / the DynamoDB table)."""
+    await init_db()
+    print(f"✅ Database ready: {describe_database()}")
+
+
 async def show_status() -> None:
     """Displays current catalog counts in the configured database."""
-    await init_db()
-    async with session_scope() as session:
-        store = SQLAlchemyStore(lambda: session)
+    async with session_scope() as store:
         feed_total = await store.feeds.count_all()
         feed_discovered = await store.feeds.count_by_status("discovered")
         feed_active = await store.feeds.count_by_status("active")
@@ -55,12 +58,12 @@ async def run_crawl(
     def _progress(item_name: str, count: int) -> None:
         print(f"  [+] Discovered & saved {count:3d} shows for: {item_name}")
 
-    async with session_scope() as db:
+    async with session_scope() as store:
         if mode in ("charts", "all"):
             c_list = countries or get_crawler_countries()
             print(f"\n🚀 Harvesting Top Charts across {c_list} (limit {limit} per country)...")
             chart_stats = await crawler.crawl_top_charts(
-                db=db,
+                store=store,
                 countries=c_list,
                 limit_per_chart=limit,
                 on_progress=_progress,
@@ -74,7 +77,7 @@ async def run_crawl(
             ]
             print(f"\n🚀 Harvesting Topic Taxonomy ({len(t_list)} topics, limit {limit} per topic, min_episodes={min_episodes})...")
             topic_stats = await crawler.crawl_topics(
-                db=db,
+                store=store,
                 topics=t_list,
                 limit_per_topic=limit,
                 min_episodes=min_episodes,
@@ -116,6 +119,9 @@ async def run_sync_only(concurrency: int = 5, max_feeds: Optional[int] = None) -
 def main() -> None:
     parser = argparse.ArgumentParser(description="TunedIn Podcast Ingestion & Crawling CLI")
     subparsers = parser.add_subparsers(dest="command", help="CLI command")
+
+    # Command: init-db
+    subparsers.add_parser("init-db", help="Provision the configured database (create tables)")
 
     # Command: status
     subparsers.add_parser("status", help="Show current catalog statistics")
@@ -179,7 +185,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "status":
+    if args.command == "init-db":
+        asyncio.run(run_init_db())
+    elif args.command == "status":
         asyncio.run(show_status())
     elif args.command == "crawl":
         topics_list = [t.strip() for t in args.topics.split(",")] if args.topics else None

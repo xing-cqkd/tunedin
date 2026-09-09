@@ -8,7 +8,6 @@ import httpx
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,8 +44,7 @@ async def write_progress_file(
     """Updates the podcast_ingest.md progress tracker in the .local_agents folder."""
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    async with session_scope() as session:
-        store = SQLAlchemyStore(lambda: session)
+    async with session_scope() as store:
         total_feeds = await store.feeds.count_all()
         active_feeds = await store.feeds.count_by_status("active")
         pending_feeds = await store.feeds.count_by_statuses(["discovered", "pending"])
@@ -127,8 +125,7 @@ async def run_batch_ingest(
                 break
 
             # 1. Fetch next batch of pending feed IDs
-            async with session_scope() as session:
-                store = SQLAlchemyStore(lambda: session)
+            async with session_scope() as store:
                 pending_batch = await store.feeds.list_by_statuses(
                     ["discovered", "pending"], limit=batch_size
                 )
@@ -148,8 +145,7 @@ async def run_batch_ingest(
                 feed_id, title, rss_url = feed.feed_id, feed.title, feed.rss_url
                 show_label = f"{title[:40]} ({rss_url[:35]}...)"
                 try:
-                    async with session_scope() as session:
-                        store = SQLAlchemyStore(lambda: session)
+                    async with session_scope() as store:
                         feed, new_eps = await service.sync_podcast_episodes(
                             store=store,
                             feed_or_id_or_url=feed_id,
