@@ -12,6 +12,7 @@ from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,9 @@ class PodcastCrawler:
                     for p in new_podcasts:
                         visited_urls.add(p.feed_url)
 
-                    saved_feeds = await self.service.save_podcasts(db, new_podcasts)
+                    saved_feeds = await self.service.save_podcasts(
+                        SQLAlchemyStore(lambda: db), new_podcasts
+                    )
                     total_saved += len(saved_feeds)
 
                     if on_progress:
@@ -152,7 +155,9 @@ class PodcastCrawler:
                     for p in new_podcasts:
                         visited_urls.add(p.feed_url)
 
-                    saved_feeds = await self.service.save_podcasts(db, new_podcasts)
+                    saved_feeds = await self.service.save_podcasts(
+                        SQLAlchemyStore(lambda: db), new_podcasts
+                    )
                     total_saved += len(saved_feeds)
 
                     if on_progress:
@@ -223,7 +228,9 @@ class PodcastCrawler:
                     country=country,
                     client=client,
                 )
-                saved_feeds = await self.service.save_podcasts(db, podcasts)
+                saved_feeds = await self.service.save_podcasts(
+                    SQLAlchemyStore(lambda: db), podcasts
+                )
                 for f in saved_feeds:
                     if f.feed_id not in seen_feed_ids:
                         seen_feed_ids.add(f.feed_id)
@@ -270,8 +277,9 @@ class PodcastCrawler:
             async with semaphore:
                 try:
                     async with session_scope() as worker_session:
+                        store = SQLAlchemyStore(lambda: worker_session)
                         feed, episodes = await self.service.sync_podcast_episodes(
-                            db=worker_session,
+                            store=store,
                             feed_or_id_or_url=feed_id,
                             auto_queue_episodes=get_auto_queue_episodes(),
                         )

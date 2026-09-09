@@ -4,8 +4,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import httpx
-from sqlalchemy import and_, or_, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, Podcast
@@ -13,6 +11,7 @@ from backend.ingestion.parser import PodcastFeedParser
 from backend.ingestion.task_queue.base import TaskQueueDriver
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.repositories import Store
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ class FeedIngestionService:
     # Mode 1: Show Discovery & Registration ("Find All Podcasts & Save Immediately")
     # -------------------------------------------------------------------------
 
-    async def save_podcast(self, db: AsyncSession, podcast: Podcast) -> Feed:
+    async def save_podcast(self, store: Store, podcast: Podcast) -> Feed:
         """
         Immediately saves/upserts a discovered Podcast show into the `feeds` database table.
         Marks sync_status as 'discovered' if new, ready for downstream episode syncing.
@@ -76,9 +75,7 @@ class FeedIngestionService:
         if not podcast.feed_url:
             raise ValueError("Cannot save podcast without a valid canonical feed_url")
 
-        stmt = select(Feed).where(Feed.rss_url == podcast.feed_url)
-        res = await db.execute(stmt)
-        feed = res.scalar_one_or_none()
+        feed = await store.feeds.get_by_rss_url(podcast.feed_url)
 
         if feed is None:
             feed = Feed(
@@ -93,7 +90,6 @@ class FeedIngestionService:
                 sync_status="discovered",
                 error_count=0,
             )
-            db.add(feed)
         else:
             # Update show metadata if available
             if podcast.title:
@@ -111,24 +107,24 @@ class FeedIngestionService:
             if podcast.website_url:
                 feed.website_url = podcast.website_url
 
-        await db.commit()
-        await db.refresh(feed)
+        feed = await store.feeds.save(feed)
+        await store.commit()
         return feed
 
-    async def save_podcasts(self, db: AsyncSession, podcasts: List[Podcast]) -> List[Feed]:
+    async def save_podcasts(self, store: Store, podcasts: List[Podcast]) -> List[Feed]:
         """
         Immediately persists a batch of discovered podcasts into the `feeds` table.
         """
         saved_feeds: List[Feed] = []
         for p in podcasts:
             if p.feed_url:
-                feed = await self.save_podcast(db, p)
+                feed = await self.save_podcast(store, p)
                 saved_feeds.append(feed)
         return saved_feeds
 
     async def discover_and_save_podcasts(
         self,
-        db: AsyncSession,
+        store: Store,
         query: str,
         limit: int = 20,
         country: str = "US",
@@ -143,11 +139,11 @@ class FeedIngestionService:
             country=country,
             client=client,
         )
-        return await self.save_podcasts(db, podcasts)
+        return await self.save_podcasts(store, podcasts)
 
     async def discover_top_and_save_podcasts(
         self,
-        db: AsyncSession,
+        store: Store,
         limit: int = 25,
         country: str = "US",
         client: Optional[httpx.AsyncClient] = None,
@@ -160,7 +156,7 @@ class FeedIngestionService:
             country=country,
             client=client,
         )
-        return await self.save_podcasts(db, podcasts)
+        return await self.save_podcasts(store, podcasts)
 
     # -------------------------------------------------------------------------
     # Mode 2: Episode Synchronization ("Given a Podcast, Download Episodes")
@@ -168,7 +164,7 @@ class FeedIngestionService:
 
     async def sync_podcast_episodes(
         self,
-        db: AsyncSession,
+        store: Store,
         feed_or_id_or_url: Union[Feed, uuid.UUID, str],
         client: Optional[httpx.AsyncClient] = None,
         auto_queue_episodes: int = 0,
@@ -182,20 +178,16 @@ class FeedIngestionService:
         if isinstance(feed_or_id_or_url, Feed):
             feed = feed_or_id_or_url
         elif isinstance(feed_or_id_or_url, uuid.UUID):
-            stmt = select(Feed).where(Feed.feed_id == feed_or_id_or_url)
-            res = await db.execute(stmt)
-            feed = res.scalar_one_or_none()
+            feed = await store.feeds.get_by_id(feed_or_id_or_url)
             if not feed:
                 raise ValueError(f"Feed with ID {feed_or_id_or_url} not found.")
         elif isinstance(feed_or_id_or_url, str):
             # Check if UUID string or URL
             try:
                 feed_uuid = uuid.UUID(feed_or_id_or_url)
-                stmt = select(Feed).where(Feed.feed_id == feed_uuid)
+                feed = await store.feeds.get_by_id(feed_uuid)
             except ValueError:
-                stmt = select(Feed).where(Feed.rss_url == feed_or_id_or_url)
-            res = await db.execute(stmt)
-            feed = res.scalar_one_or_none()
+                feed = await store.feeds.get_by_rss_url(feed_or_id_or_url)
             if not feed:
                 # If it's a URL and doesn't exist yet, create initial feed
                 feed = Feed(
@@ -203,16 +195,13 @@ class FeedIngestionService:
                     title="Fetching Podcast...",
                     sync_status="pending",
                 )
-                db.add(feed)
-                await db.commit()
-                await db.refresh(feed)
+                feed = await store.feeds.save(feed)
+                await store.commit()
         else:
             raise TypeError(f"Invalid feed identifier type: {type(feed_or_id_or_url)}")
 
         # 2. Query known GUIDs for this feed to perform incremental deduplication
-        ep_stmt = select(Episode.guid).where(Episode.feed_id == feed.feed_id)
-        ep_res = await db.execute(ep_stmt)
-        known_guids: Set[str] = {g for g in ep_res.scalars().all() if g}
+        known_guids: Set[str] = await store.episodes.list_guids_by_feed(feed.feed_id)
 
         # 3. Fetch and parse feed with error recovery
         now_utc = datetime.now(timezone.utc)
@@ -229,8 +218,8 @@ class FeedIngestionService:
             feed.error_count += 1
             feed.sync_status = "error"
             feed.last_fetched_at = now_utc
-            await db.commit()
-            await db.refresh(feed)
+            feed = await store.feeds.save(feed)
+            await store.commit()
             raise
 
         # 4. Update Feed metadata
@@ -262,8 +251,8 @@ class FeedIngestionService:
         feed.error_count = 0
 
         if parse_result.is_not_modified:
-            await db.commit()
-            await db.refresh(feed)
+            feed = await store.feeds.save(feed)
+            await store.commit()
             return feed, []
 
         # 5. Sort candidate episodes chronologically from earliest to latest
@@ -305,13 +294,11 @@ class FeedIngestionService:
                 explicit=ep_data.explicit,
                 processed=False,
             )
-            db.add(ep)
             new_episodes.append(ep)
 
-        await db.commit()
-        await db.refresh(feed)
-        for ep in new_episodes:
-            await db.refresh(ep)
+        new_episodes = await store.episodes.save_many(new_episodes)
+        feed = await store.feeds.save(feed)
+        await store.commit()
 
         # 6. Optionally enqueue background tasks for downstream AI insight extraction
         if self.queue_driver and auto_queue_episodes > 0 and new_episodes:
@@ -333,7 +320,7 @@ class FeedIngestionService:
 
     async def ingest_feed(
         self,
-        db: AsyncSession,
+        store: Store,
         rss_url: str,
         client: Optional[httpx.AsyncClient] = None,
         auto_queue_episodes: int = 0,
@@ -342,7 +329,7 @@ class FeedIngestionService:
         Convenience / backward compatible method to sync feed & episodes by RSS URL.
         """
         return await self.sync_podcast_episodes(
-            db,
+            store,
             feed_or_id_or_url=rss_url,
             client=client,
             auto_queue_episodes=auto_queue_episodes,
@@ -354,7 +341,7 @@ class FeedIngestionService:
 
     async def ingest_podcast(
         self,
-        db: AsyncSession,
+        store: Store,
         podcast: Podcast,
         client: Optional[httpx.AsyncClient] = None,
         auto_sync_episodes: bool = True,
@@ -362,21 +349,21 @@ class FeedIngestionService:
         """
         Immediately saves a discovered Podcast entity, then downloads and saves its episodes.
         """
-        feed = await self.save_podcast(db, podcast)
+        feed = await self.save_podcast(store, podcast)
         if auto_sync_episodes:
-            return await self.sync_podcast_episodes(db, feed, client=client)
+            return await self.sync_podcast_episodes(store, feed, client=client)
         return feed, []
 
     async def ingest_from_itunes(
         self,
-        db: AsyncSession,
+        store: Store,
         itunes_podcast: Podcast,
         client: Optional[httpx.AsyncClient] = None,
     ) -> Tuple[Feed, List[Episode]]:
         """
         Alias for ingest_podcast for backwards compatibility.
         """
-        return await self.ingest_podcast(db, podcast=itunes_podcast, client=client, auto_sync_episodes=True)
+        return await self.ingest_podcast(store, podcast=itunes_podcast, client=client, auto_sync_episodes=True)
 
     # -------------------------------------------------------------------------
     # Mode 4: Batch Synchronization ("Batch Sync All Discovered/Pending Feeds")
@@ -384,7 +371,7 @@ class FeedIngestionService:
 
     async def sync_all_pending_feeds(
         self,
-        db: AsyncSession,
+        store: Store,
         max_feeds: Optional[int] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
@@ -395,26 +382,17 @@ class FeedIngestionService:
         """
         now = datetime.now(timezone.utc)
         min_backoff_cutoff = now - timedelta(seconds=ERROR_RETRY_BASE_BACKOFF_SECONDS)
-        stmt = (
-            select(Feed)
-            .where(
-                or_(
-                    Feed.sync_status.in_(["discovered", "pending"]),
-                    and_(
-                        Feed.sync_status == "error",
-                        Feed.error_count < ERROR_RETRY_MAX_ATTEMPTS,
-                        Feed.last_fetched_at.is_not(None),
-                        Feed.last_fetched_at <= min_backoff_cutoff,
-                    ),
-                )
-            )
-            .order_by(Feed.created_at.asc())
+        pending = await store.feeds.list_by_statuses(["discovered", "pending"])
+        due_retry = await store.feeds.list_error_due_retry(
+            min_backoff_cutoff, ERROR_RETRY_MAX_ATTEMPTS
         )
+        # Reproduce the original single-query OR semantics: merge the two
+        # created_at-ordered result sets (the stable sort keeps
+        # discovered/pending feeds first on created_at ties), then apply the
+        # max_feeds cap to the merged list.
+        pending_feeds = sorted(pending + due_retry, key=lambda f: f.created_at)
         if max_feeds:
-            stmt = stmt.limit(max_feeds)
-
-        res = await db.execute(stmt)
-        pending_feeds = res.scalars().all()
+            pending_feeds = pending_feeds[:max_feeds]
 
         total_synced = 0
         total_episodes_saved = 0
@@ -426,7 +404,7 @@ class FeedIngestionService:
             if feed.sync_status == "error" and not _error_retry_due(feed, now):
                 continue
             try:
-                _, new_eps = await self.sync_podcast_episodes(db, feed, client=client)
+                _, new_eps = await self.sync_podcast_episodes(store, feed, client=client)
                 total_synced += 1
                 total_episodes_saved += len(new_eps)
             except Exception as e:
@@ -447,7 +425,7 @@ class FeedIngestionService:
 
     async def get_unprocessed_episodes(
         self,
-        db: AsyncSession,
+        store: Store,
         feed_id: Optional[uuid.UUID] = None,
         limit: int = 50,
     ) -> List[Episode]:
@@ -455,28 +433,17 @@ class FeedIngestionService:
         Retrieves episodes waiting to be read, analyzed, and tagged by the LLM (processed=False).
         Ordered chronologically descending.
         """
-        stmt = select(Episode).where(Episode.processed == False)
-        if feed_id is not None:
-            stmt = stmt.where(Episode.feed_id == feed_id)
-        stmt = stmt.order_by(Episode.published_at.desc().nullslast()).limit(limit)
-
-        res = await db.execute(stmt)
-        return list(res.scalars().all())
+        return await store.episodes.list_unprocessed(feed_id=feed_id, limit=limit)
 
     async def mark_episode_processed(
         self,
-        db: AsyncSession,
+        store: Store,
         episode_id: uuid.UUID,
         processed: bool = True,
     ) -> Optional[Episode]:
         """
         Updates the LLM processing status for an episode once insights and tags have been saved.
         """
-        stmt = select(Episode).where(Episode.episode_id == episode_id)
-        res = await db.execute(stmt)
-        episode = res.scalar_one_or_none()
-        if episode:
-            episode.processed = processed
-            await db.commit()
-            await db.refresh(episode)
+        episode = await store.episodes.mark_processed(episode_id, processed)
+        await store.commit()
         return episode

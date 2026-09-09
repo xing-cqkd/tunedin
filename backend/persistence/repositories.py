@@ -129,6 +129,15 @@ class EpisodeRepository(ABC):
         """
 
     @abstractmethod
+    async def list_episodes_by_feed(self, feed_id: UUID) -> list[Episode]:
+        """Return all episodes for a feed.
+
+        Ordered by ``published_at`` descending, nulls last (same ordering
+        contract as :meth:`list_unprocessed` on a single feed). No limit is
+        applied.
+        """
+
+    @abstractmethod
     async def list_unprocessed(
         self,
         *,

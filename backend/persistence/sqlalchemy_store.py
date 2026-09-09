@@ -148,6 +148,14 @@ class _EpisodeRepository(EpisodeRepository):
         )
         return {g for g in res.scalars().all() if g}
 
+    async def list_episodes_by_feed(self, feed_id: UUID) -> list[Episode]:
+        res = await self._session.execute(
+            select(Episode)
+            .where(Episode.feed_id == feed_id)
+            .order_by(Episode.published_at.desc().nullslast())
+        )
+        return list(res.scalars().all())
+
     async def list_unprocessed(
         self,
         *,

@@ -50,6 +50,7 @@ EXPECTED = {
     "EpisodeRepository": {
         "get_by_id": _sig(("episode_id",)),
         "list_guids_by_feed": _sig(("feed_id",)),
+        "list_episodes_by_feed": _sig(("feed_id",)),
         "list_unprocessed": _sig(
             ("feed_id", _KWONLY, None), ("limit", _KWONLY, 50)
         ),

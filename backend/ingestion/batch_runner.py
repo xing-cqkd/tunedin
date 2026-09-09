@@ -11,6 +11,7 @@ from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,8 +166,9 @@ async def run_batch_ingest(
                 show_label = f"{title[:40]} ({rss_url[:35]}...)"
                 try:
                     async with session_scope() as session:
+                        store = SQLAlchemyStore(lambda: session)
                         feed, new_eps = await service.sync_podcast_episodes(
-                            db=session,
+                            store=store,
                             feed_or_id_or_url=feed_id,
                             client=client,
                             auto_queue_episodes=auto_queue,
