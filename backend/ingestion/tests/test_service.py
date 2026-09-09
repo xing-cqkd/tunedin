@@ -238,18 +238,27 @@ class TestFeedIngestionModes:
             assert len(remaining) == 2
 
     @pytest.mark.asyncio
-    async def test_simple_db_module_integration(self):
-        """Verify simple_db initialization, paths, and session_scope."""
-        from backend.ingestion.simple_db import (
-            INGESTION_DB_PATH,
-            init_db,
-            session_scope,
-        )
-        assert INGESTION_DB_PATH.name == "simple.db"
-        await init_db()
-        assert INGESTION_DB_PATH.exists()
+    async def test_settings_database_selection(self):
+        """Verify the settings dispatcher selects SimpleDB by default and sessions work."""
+        from backend import settings
 
-        async with session_scope() as session:
+        assert settings.get_database_backend() == "simple"
+        assert "simple.db" in settings.describe_database()
+
+        await settings.init_db()
+        async with settings.session_scope() as session:
             res = await session.execute(select(Feed))
             assert isinstance(res.scalars().all(), list)
+
+    def test_settings_env_override(self, monkeypatch):
+        """DATABASE_BACKEND env var overrides the settings.yaml value."""
+        from backend import settings
+
+        monkeypatch.setenv("DATABASE_BACKEND", "app")
+        assert settings.get_database_backend() == "app"
+        assert "App database" in settings.describe_database()
+
+        monkeypatch.setenv("DATABASE_BACKEND", "bogus")
+        with pytest.raises(ValueError, match="Unknown database backend"):
+            settings.get_database_backend()
 

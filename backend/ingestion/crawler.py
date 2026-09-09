@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
-from backend.ingestion.simple_db import session_scope
+from backend.settings import session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -247,7 +247,7 @@ class PodcastCrawler:
     ) -> Dict[str, Any]:
         """
         Spawns worker pool to download episodes for all discovered/pending feeds
-        in simple.db with bounded async concurrency.
+        in the configured database with bounded async concurrency.
         """
         # 1. Fetch pending feed records
         async with session_scope() as session:

@@ -1,0 +1,199 @@
+"""Central settings for the TuneIn backend.
+
+Reads `settings.yaml` from the repo root, applies environment-variable
+overrides, and exposes the configured database backend's session helpers.
+
+Resolution order (highest precedence first):
+  1. Environment variables:
+       DATABASE_BACKEND      -> database.backend ("simple" | "app")
+       DATABASE_SIMPLE_PATH  -> database.simple.path
+       DATABASE_APP_URL      -> database.app.url
+     (The legacy INGESTION_DATABASE_URL / DATABASE_URL variables keep working:
+     the database modules read them directly at import time and they take
+     precedence over the values mirrored from settings.yaml.)
+  2. `settings.yaml` at the repo root.
+  3. Built-in defaults (SimpleDB at backend/ingestion/simple.db).
+
+The database modules (`backend.ingestion.simple_db` and
+`backend.persistence.database`) read their configuration from the environment
+at import time, so this module mirrors the resolved settings into the
+environment *before* those modules are imported. Always go through
+`backend.settings` (`session_scope`, `init_db`, `get_db`) instead of
+importing the backend modules directly.
+"""
+
+import copy
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict
+from urllib.parse import urlsplit, urlunsplit
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+try:
+    import yaml
+except ImportError:  # pragma: no cover - PyYAML is a required dependency
+    yaml = None  # type: ignore[assignment]
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SETTINGS_PATH = REPO_ROOT / "settings.yaml"
+
+DEFAULTS: Dict[str, Any] = {
+    "database": {
+        "backend": "simple",
+        "simple": {"path": "backend/ingestion/simple.db"},
+        "app": {"url": "sqlite+aiosqlite:///./tunedin.db"},
+    },
+    "ingestion": {
+        "crawler_countries": ["us", "gb", "ca", "au", "de", "fr"],
+        "auto_queue_episodes": 3,
+    },
+}
+
+# Environment variable -> dotted path into the settings dict.
+_ENV_OVERRIDES = {
+    "DATABASE_BACKEND": "database.backend",
+    "DATABASE_SIMPLE_PATH": "database.simple.path",
+    "DATABASE_APP_URL": "database.app.url",
+}
+
+_VALID_BACKENDS = ("simple", "app")
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _set_dotted(settings: Dict[str, Any], dotted: str, value: Any) -> None:
+    node = settings
+    *parts, leaf = dotted.split(".")
+    for part in parts:
+        node = node.setdefault(part, {})
+    node[leaf] = value
+
+
+_yaml_cache: Dict[str, Any] | None = None
+
+
+def _load_yaml() -> Dict[str, Any]:
+    """Load settings.yaml once; return {} when the file is missing."""
+    global _yaml_cache
+    if _yaml_cache is None:
+        if yaml is None:
+            raise RuntimeError("PyYAML is required: pip install pyyaml")
+        if SETTINGS_PATH.exists():
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                _yaml_cache = yaml.safe_load(f) or {}
+        else:
+            _yaml_cache = {}
+    return _yaml_cache
+
+
+def get_settings() -> Dict[str, Any]:
+    """Return the fully resolved settings (defaults < settings.yaml < env)."""
+    settings = _deep_merge(DEFAULTS, _load_yaml())
+    for env_var, dotted in _ENV_OVERRIDES.items():
+        if env_var in os.environ:
+            _set_dotted(settings, dotted, os.environ[env_var])
+    return settings
+
+
+def get_database_backend() -> str:
+    """Return the configured database backend: "simple" or "app"."""
+    backend = str(get_settings()["database"]["backend"]).lower()
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(
+            f"Unknown database backend {backend!r} in settings.yaml "
+            f"(expected one of {_VALID_BACKENDS})"
+        )
+    return backend
+
+
+def _path_to_sqlite_url(path: str) -> str:
+    """Turn a filesystem path (or an already-formed URL) into a SQLAlchemy URL."""
+    if "://" in path:
+        return path
+    absolute = (REPO_ROOT / path).resolve()
+    return f"sqlite+aiosqlite:///{absolute}"
+
+
+def _apply_to_env() -> None:
+    """Mirror the resolved database settings into the environment.
+
+    The backend modules read INGESTION_DATABASE_URL / DATABASE_URL at import
+    time, so this runs at import of backend.settings — before those modules
+    are imported anywhere. Explicitly-set environment variables win
+    (setdefault), preserving the legacy override behavior.
+    """
+    settings = get_settings()
+    backend = str(settings["database"]["backend"]).lower()
+    if backend == "simple":
+        simple_path = str(settings["database"]["simple"]["path"])
+        os.environ.setdefault("INGESTION_DATABASE_URL", _path_to_sqlite_url(simple_path))
+    elif backend == "app":
+        os.environ.setdefault("DATABASE_URL", str(settings["database"]["app"]["url"]))
+
+
+def describe_database() -> str:
+    """Human-readable label for the configured database, for CLI/status output."""
+    backend = get_database_backend()
+    if backend == "simple":
+        path = str(get_settings()["database"]["simple"]["path"])
+        return f"SimpleDB (SQLite): {(REPO_ROOT / path).resolve()}"
+    url = os.environ.get("DATABASE_URL", str(get_settings()["database"]["app"]["url"]))
+    # Mask any password embedded in the URL.
+    parts = urlsplit(url)
+    if parts.password:
+        netloc = parts.hostname or ""
+        if parts.username:
+            netloc = f"{parts.username}:***@{netloc}"
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return f"App database: {url}"
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncGenerator[AsyncSession, None]:
+    """Yield an async session from the configured database backend."""
+    backend = get_database_backend()
+    if backend == "simple":
+        from backend.ingestion import simple_db
+
+        async with simple_db.session_scope() as session:
+            yield session
+    else:
+        from backend.persistence import database
+
+        async with database.session_scope() as session:
+            yield session
+
+
+async def init_db() -> None:
+    """Create all tables in the configured database backend."""
+    backend = get_database_backend()
+    if backend == "simple":
+        from backend.ingestion import simple_db
+
+        await simple_db.init_db()
+    else:
+        from backend.persistence import database
+
+        await database.init_db()
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """Session dependency for the configured backend (e.g. FastAPI Depends)."""
+    async with session_scope() as session:
+        yield session
+
+
+# Mirror settings into the environment before any backend module is imported.
+_apply_to_env()

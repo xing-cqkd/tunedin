@@ -1,0 +1,57 @@
+# ============================================================================
+# TuneIn settings
+#
+# Database, ingestion, and environment configuration for the TuneIn backend.
+# Edit the values below to suit your environment.
+# ============================================================================
+
+# --- Database ---------------------------------------------------------------
+# Which database backend the ingestion tooling (crawler, batch runner, CLI)
+# should use.
+#
+# Options:
+#
+#   simple — SimpleDB: a local SQLite file at `backend/ingestion/simple.db`.
+#            Zero setup, zero dependencies. Best for local development and
+#            batch crawling.
+#            Implemented in: backend/ingestion/simple_db.py
+#            (overridable per-environment with the INGESTION_DATABASE_URL
+#            environment variable)
+#
+#   app    — App database: the shared application database configured via
+#            `database.app.url` below (SQLite file by default, Postgres in
+#            production). Best when the API, worker, and ingestion tooling
+#            must all share one database.
+#            Implemented in: backend/persistence/database.py
+#
+database:
+  # Which database backend the ingestion tooling uses: "simple" or "app".
+  # See the header comment above for what each option means.
+  backend: simple
+
+  # SimpleDB settings — used when backend is "simple".
+  # Path to the SimpleDB SQLite file (relative to the repo root).
+  simple:
+    path: "backend/ingestion/simple.db"
+
+  # App database settings — used when backend is "app".
+  # Examples:
+  #   SQLite:   "sqlite+aiosqlite:///./tunedin.db"
+  #   Postgres: "postgresql+asyncpg://user:password@localhost:5432/tunedin"
+  app:
+    url: "sqlite+aiosqlite:///./tunedin.db"
+
+# --- Ingestion ---------------------------------------------------------------
+ingestion:
+  # iTunes storefront countries used by the top-charts crawler.
+  crawler_countries:
+    - us
+    - gb
+    - ca
+    - au
+    - de
+    - fr
+
+  # How many of the newest episodes get queued for AI processing on a feed's
+  # first sync (avoids flooding the LLM API on large backlogs).
+  auto_queue_episodes: 3

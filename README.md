@@ -1,0 +1,60 @@
+# TuneIn
+
+A podcast discovery and insights platform: crawl and ingest podcast catalogs,
+then generate AI-powered insights (tags, summaries, chat) over episodes.
+
+## Layout
+
+- `backend/ingestion/` — RSS parsing, iTunes discovery client, catalog crawler,
+  batch runner, and CLI
+- `backend/persistence/` — SQLAlchemy models and the app database layer
+- `backend/insights/` — LLM insight generation (plans and prompt specs)
+- `backend/api/` — FastAPI backend *(planned)*
+- `frontend/` — React frontend *(planned)*
+
+See `PLAN.md`, `backend/PLAN.md`, and `frontend/PLAN.md` for the full roadmap.
+Work is tracked in Linear (project **TuneIn**).
+
+## Configuration
+
+Edit `settings.yaml` at the repo root to suit your environment. It documents
+every setting inline.
+
+### Database (`database.backend`)
+
+The ingestion tooling can use one of two database backends:
+
+| Setting | Backend | When to use it |
+|---|---|---|
+| `"simple"` | **SimpleDB** — local SQLite file at `backend/ingestion/simple.db` (`backend/ingestion/simple_db.py`) | Local dev and batch crawling. Zero setup. |
+| `"app"` | **App database** — shared DB via `database.app.url` (`backend/persistence/database.py`, `./tunedin.db` by default, Postgres in production) | When the API, worker, and ingestion tooling must share one database. |
+
+The default is `"simple"` (SimpleDB), and `database.simple.path` points at the
+existing `backend/ingestion/simple.db` file. `INGESTION_DATABASE_URL` can still
+override the SimpleDB file location per environment; `database.app.url`
+configures the app database.
+
+> **Note:** the two backends are separate databases holding the same tables.
+> Switching `database.backend` starts from an empty catalog — to carry data
+> over, copy the SQLite file first, e.g.
+> `cp backend/ingestion/simple.db ./tunedin.db` when moving from SimpleDB to
+> the app database.
+
+### Other settings
+
+See `settings.yaml` — it documents every setting, including the
+crawler's iTunes storefront countries and how many new episodes get queued for
+AI processing on first sync.
+
+## Development
+
+```bash
+python -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
+.venv/bin/pytest backend/ -q
+```
+
+Ingestion CLI:
+
+```bash
+python -m backend.ingestion.cli status
+```

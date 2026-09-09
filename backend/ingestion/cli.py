@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from backend.ingestion.crawler import DEFAULT_COUNTRIES, DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
-from backend.ingestion.simple_db import INGESTION_DB_PATH, init_db, session_scope
+from backend.settings import describe_database, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -19,7 +19,7 @@ logger = logging.getLogger("ingestion_cli")
 
 
 async def show_status() -> None:
-    """Displays current catalog counts in the simple.db database."""
+    """Displays current catalog counts in the configured database."""
     await init_db()
     async with session_scope() as session:
         feed_total = (await session.execute(select(func.count(Feed.feed_id)))).scalar_one()
@@ -43,7 +43,7 @@ async def show_status() -> None:
     print("\n" + "=" * 55)
     print(" 📊 TunedIn Podcast Ingestion Database Status")
     print("=" * 55)
-    print(f" Database Path           : {INGESTION_DB_PATH}")
+    print(f" Database                : {describe_database()}")
     print(f" Total Shows / Feeds     : {feed_total}")
     print(f"   - Discovered (Pending): {feed_discovered}")
     print(f"   - Active (Synced)     : {feed_active}")
@@ -131,7 +131,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", help="CLI command")
 
     # Command: status
-    subparsers.add_parser("status", help="Show current catalog statistics in simple.db")
+    subparsers.add_parser("status", help="Show current catalog statistics")
 
     # Command: crawl
     crawl_parser = subparsers.add_parser("crawl", help="Discover podcasts and save to database")

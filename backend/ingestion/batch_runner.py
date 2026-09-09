@@ -7,7 +7,7 @@ import httpx
 from sqlalchemy import func, select
 
 from backend.ingestion.service import FeedIngestionService
-from backend.ingestion.simple_db import INGESTION_DB_PATH, init_db, session_scope
+from backend.settings import describe_database, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -72,7 +72,7 @@ async def write_progress_file(
     content = f"""# Podcast Ingestion Progress Tracker
 
 **Last Updated:** {now_str}  
-**Database:** `{INGESTION_DB_PATH}`
+**Database:** `{describe_database()}`
 
 ---
 
@@ -99,7 +99,7 @@ async def write_progress_file(
 
 ## ⚠️ Throttle & Error Monitoring
 - **Status**: {"⚠️ Recent Error / Throttle detected: " + last_error if last_error else "🟢 Healthy - Running smoothly"}
-- **Checkpointing**: Every podcast commits immediately to `simple.db`. Resumption resumes automatically from pending shows.
+- **Checkpointing**: Every podcast commits immediately to the configured database. Resumption resumes automatically from pending shows.
 """
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         f.write(content)
@@ -112,7 +112,7 @@ async def run_batch_ingest(
 ) -> Dict[str, Any]:
     """
     Ingests episodes sequentially one podcast at a time in batches,
-    committing to simple.db after each show and recording progress in .local_agents/podcast_ingest.md.
+    committing to the configured database after each show and recording progress in .local_agents/podcast_ingest.md.
     """
     await init_db()
     service = FeedIngestionService()
