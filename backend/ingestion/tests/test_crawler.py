@@ -1,10 +1,13 @@
 import json
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 import pytest
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.ingestion import crawler as crawler_module
 from backend.ingestion.crawler import PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
 from backend.persistence.models.base import Base
@@ -121,3 +124,49 @@ class TestPodcastCrawler:
             assert stats["total_discovered"] == 4
             assert stats["unique_saved"] == 2
             assert stats["countries_crawled"] == ["us", "gb"]
+
+    @pytest.mark.asyncio
+    async def test_sync_episodes_concurrently_fetches_via_repositories(
+        self, in_memory_session: AsyncSession, monkeypatch
+    ):
+        """sync_episodes_concurrently must fetch pending feeds through the
+        repository layer (no raw select) and pass feed ids to the service."""
+        async def _add_feed(rss_url: str, sync_status: str) -> Feed:
+            feed = Feed(rss_url=rss_url, title=rss_url, sync_status=sync_status)
+            in_memory_session.add(feed)
+            await in_memory_session.flush()
+            return feed
+
+        pending1 = await _add_feed("https://example.com/a.xml", "pending")
+        pending2 = await _add_feed("https://example.com/b.xml", "discovered")
+        await _add_feed("https://example.com/c.xml", "active")
+        await in_memory_session.commit()
+
+        seen_ids = []
+
+        class FakeService:
+            itunes_client = None
+
+            async def sync_podcast_episodes(self, *, store, feed_or_id_or_url, **kwargs):
+                seen_ids.append(feed_or_id_or_url)
+                return Feed(rss_url="x", title="Synced"), ["ep1", "ep2"]
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield in_memory_session
+
+        monkeypatch.setattr(crawler_module, "session_scope", fake_session_scope)
+
+        crawler = PodcastCrawler(service=FakeService(), request_delay=0.0)
+        stats = await crawler.sync_episodes_concurrently(concurrency=2)
+
+        assert {str(i) for i in seen_ids} == {
+            str(pending1.feed_id),
+            str(pending2.feed_id),
+        }
+        assert stats == {
+            "total_feeds": 2,
+            "synced": 2,
+            "episodes_saved": 4,
+            "failed": 0,
+        }

@@ -2,7 +2,6 @@ import asyncio
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
 import httpx
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.ingestion.itunes import ITunesSearchClient
@@ -258,11 +257,11 @@ class PodcastCrawler:
         """
         # 1. Fetch pending feed records
         async with session_scope() as session:
-            stmt = select(Feed.feed_id).where(Feed.sync_status.in_(["discovered", "pending"]))
-            if max_feeds:
-                stmt = stmt.limit(max_feeds)
-            res = await session.execute(stmt)
-            pending_ids = list(res.scalars().all())
+            store = SQLAlchemyStore(lambda: session)
+            pending_feeds = await store.feeds.list_by_statuses(
+                ["discovered", "pending"], limit=max_feeds
+            )
+            pending_ids = [f.feed_id for f in pending_feeds]
 
         if not pending_ids:
             return {"total_feeds": 0, "synced": 0, "episodes_saved": 0, "failed": 0}

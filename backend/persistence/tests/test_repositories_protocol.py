@@ -44,6 +44,7 @@ EXPECTED = {
         "list_error_due_retry": _sig(("cutoff",), ("max_attempts",)),
         "save": _sig(("feed",)),
         "count_by_status": _sig(("status",)),
+        "count_by_statuses": _sig(("statuses",)),
         "count_all": _sig(),
         "list_all": _sig(("limit", _KWONLY, None)),
     },

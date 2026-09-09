@@ -4,13 +4,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import httpx
-from sqlalchemy import func, select
 
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
-from backend.persistence.models.episode import Episode
-from backend.persistence.models.feed import Feed
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logging.basicConfig(
@@ -49,23 +46,12 @@ async def write_progress_file(
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     async with session_scope() as session:
-        total_feeds = (await session.execute(select(func.count(Feed.feed_id)))).scalar_one()
-        active_feeds = (
-            await session.execute(
-                select(func.count(Feed.feed_id)).where(Feed.sync_status == "active")
-            )
-        ).scalar_one()
-        pending_feeds = (
-            await session.execute(
-                select(func.count(Feed.feed_id)).where(Feed.sync_status.in_(["discovered", "pending"]))
-            )
-        ).scalar_one()
-        error_feeds = (
-            await session.execute(
-                select(func.count(Feed.feed_id)).where(Feed.sync_status == "error")
-            )
-        ).scalar_one()
-        total_episodes = (await session.execute(select(func.count(Episode.episode_id)))).scalar_one()
+        store = SQLAlchemyStore(lambda: session)
+        total_feeds = await store.feeds.count_all()
+        active_feeds = await store.feeds.count_by_status("active")
+        pending_feeds = await store.feeds.count_by_statuses(["discovered", "pending"])
+        error_feeds = await store.feeds.count_by_status("error")
+        total_episodes = await store.episodes.count_all()
 
     pct = (active_feeds / total_feeds * 100) if total_feeds > 0 else 0.0
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -142,14 +128,10 @@ async def run_batch_ingest(
 
             # 1. Fetch next batch of pending feed IDs
             async with session_scope() as session:
-                stmt = (
-                    select(Feed.feed_id, Feed.title, Feed.rss_url)
-                    .where(Feed.sync_status.in_(["discovered", "pending"]))
-                    .order_by(Feed.created_at.asc())
-                    .limit(batch_size)
+                store = SQLAlchemyStore(lambda: session)
+                pending_batch = await store.feeds.list_by_statuses(
+                    ["discovered", "pending"], limit=batch_size
                 )
-                res = await session.execute(stmt)
-                pending_batch = res.all()
 
             if not pending_batch:
                 logger.info("No more pending feeds to ingest. All shows synced!")
@@ -162,7 +144,8 @@ async def run_batch_ingest(
             batch_episodes = 0
 
             # 2. Process ONE podcast at a time
-            for feed_id, title, rss_url in pending_batch:
+            for feed in pending_batch:
+                feed_id, title, rss_url = feed.feed_id, feed.title, feed.rss_url
                 show_label = f"{title[:40]} ({rss_url[:35]}...)"
                 try:
                     async with session_scope() as session:
