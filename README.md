@@ -82,6 +82,20 @@ python -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
 .venv/bin/pytest backend/ -q
 ```
 
+### DynamoDB Local integration tests
+
+The DynamoDB conformance tests run against moto by default. The
+transaction-critical paths (episode guid-dedup transactions,
+`ensure_table()`) are additionally proven against a real DynamoDB engine in
+`backend/persistence/dynamodb/tests/test_dynamodb_local.py`. These are
+marked `slow` and skip automatically when the emulator isn't running:
+
+```bash
+docker run -d -p 8000:8000 amazon/dynamodb-local
+.venv/bin/pytest backend/ -q -m slow
+docker stop <container>   # when done
+```
+
 ### Database migrations
 
 The app database (`database.backend: "app"`) is migrated with Alembic — never

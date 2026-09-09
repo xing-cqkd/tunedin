@@ -179,6 +179,7 @@ async def ensure_table(
     *,
     table_name: str = DEFAULT_TABLE_NAME,
     gsi_wait_timeout: float = 300.0,
+    enable_pitr: bool = True,
 ) -> str:
     """Ensure the tunedin table exists with the desired GSIs and PITR.
 
@@ -187,7 +188,11 @@ async def ensure_table(
       time via ``UpdateTable``, waiting for each to become ACTIVE before
       adding the next (the table-evolution mechanism).  ``ensure_table``
       does not return until every newly added GSI is ACTIVE.
-    * PITR is enabled on every run (idempotent).
+    * PITR is enabled on every run (idempotent) unless ``enable_pitr``
+      is False.  DynamoDB Local rejects ``update_continuous_backups``
+      with ``UnsupportedOperationException``
+      (awslabs/amazon-dynamodb-local-samples#17), so integration tests
+      against the emulator pass ``enable_pitr=False``.
 
     Returns ``"created"``, ``"updated"`` (GSIs were added), or ``"exists"``.
     """
@@ -195,7 +200,8 @@ async def ensure_table(
     if desc is None:
         log.info("DynamoDB table %s missing; creating", table_name)
         await _create_table(client, table_name)
-        await _enable_pitr(client, table_name)
+        if enable_pitr:
+            await _enable_pitr(client, table_name)
         return "created"
 
     existing_gsis = {
@@ -210,8 +216,10 @@ async def ensure_table(
         await _add_missing_gsis(
             client, table_name, missing, gsi_wait_timeout=gsi_wait_timeout
         )
-        await _enable_pitr(client, table_name)
+        if enable_pitr:
+            await _enable_pitr(client, table_name)
         return "updated"
 
-    await _enable_pitr(client, table_name)
+    if enable_pitr:
+        await _enable_pitr(client, table_name)
     return "exists"
