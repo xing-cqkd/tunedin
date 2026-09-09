@@ -14,5 +14,5 @@ alembic>=1.13.0
 aioboto3==15.5.0
 boto3==1.40.61
 botocore==1.40.61
-moto[dynamodb]==5.2.3
+moto[dynamodb]==5.2.3  # test-only: DynamoDB mock for unit tests; do not ship in production installs
 

@@ -16,7 +16,9 @@ may be a thin async wrapper around sync boto3 under moto.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
@@ -110,22 +112,81 @@ async def _create_table(client: Any, table_name: str) -> None:
 
 
 async def _add_missing_gsis(
-    client: Any, table_name: str, missing: List[Dict[str, Any]]
+    client: Any,
+    table_name: str,
+    missing: List[Dict[str, Any]],
+    *,
+    gsi_wait_timeout: float,
 ) -> None:
-    """Add GSIs that exist in the spec but not on the table (UpdateTable)."""
-    await client.update_table(
-        TableName=table_name,
-        AttributeDefinitions=_ATTRIBUTE_DEFINITIONS,
-        GlobalSecondaryIndexUpdates=[{"Create": gsi} for gsi in missing],
-    )
+    """Add GSIs that exist in the spec but not on the table (UpdateTable).
+
+    AWS allows only ONE GSI create per ``UpdateTable`` call, and forbids
+    starting another index update while one is CREATING — so each missing
+    GSI is added in its own ``UpdateTable`` call, and this does not return
+    until that index's ``IndexStatus`` is ``ACTIVE`` before adding the next.
+    """
+    for gsi in missing:
+        index_name = gsi["IndexName"]
+        log.info("Creating GSI %s on DynamoDB table %s", index_name, table_name)
+        await client.update_table(
+            TableName=table_name,
+            AttributeDefinitions=_attr_defs_for(gsi),
+            GlobalSecondaryIndexUpdates=[{"Create": gsi}],
+        )
+        await _wait_for_gsi_active(
+            client, table_name, index_name, timeout=gsi_wait_timeout
+        )
 
 
-async def ensure_table(client: Any, *, table_name: str = DEFAULT_TABLE_NAME) -> str:
+def _attr_defs_for(gsi: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Attribute definitions for exactly the key attributes a GSI uses."""
+    names = {k["AttributeName"] for k in gsi["KeySchema"]}
+    return [d for d in _ATTRIBUTE_DEFINITIONS if d["AttributeName"] in names]
+
+
+_GSI_POLL_INTERVAL = 2.0  # seconds between describe_table polls
+
+
+async def _wait_for_gsi_active(
+    client: Any, table_name: str, index_name: str, *, timeout: float
+) -> None:
+    """Poll ``describe_table`` until the GSI's ``IndexStatus`` is ACTIVE.
+
+    There is no built-in waiter for GSI creation, so we poll.  Raises
+    :class:`TimeoutError` if the index is not ACTIVE within ``timeout``
+    seconds.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        desc = await _table_description(client, table_name)
+        gsis = {
+            g["IndexName"]: g
+            for g in (desc or {}).get("GlobalSecondaryIndexes", [])
+        }
+        if gsis.get(index_name, {}).get("IndexStatus") == "ACTIVE":
+            log.info("GSI %s on DynamoDB table %s is ACTIVE", index_name, table_name)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"GSI {index_name} on DynamoDB table {table_name} did not "
+                f"become ACTIVE within {timeout} seconds"
+            )
+        await asyncio.sleep(_GSI_POLL_INTERVAL)
+
+
+async def ensure_table(
+    client: Any,
+    *,
+    table_name: str = DEFAULT_TABLE_NAME,
+    gsi_wait_timeout: float = 300.0,
+) -> str:
     """Ensure the tunedin table exists with the desired GSIs and PITR.
 
     * Table missing → create it (on-demand, 3 GSIs, wait for ACTIVE).
-    * Table present but GSI set differs → ``UpdateTable`` to add the
-      missing GSIs (the table-evolution mechanism).
+    * Table present but GSI set differs → add the missing GSIs one at a
+      time via ``UpdateTable``, waiting for each to become ACTIVE before
+      adding the next (the table-evolution mechanism).  ``ensure_table``
+      does not return until every newly added GSI is ACTIVE.
     * PITR is enabled on every run (idempotent).
 
     Returns ``"created"``, ``"updated"`` (GSIs were added), or ``"exists"``.
@@ -146,7 +207,9 @@ async def ensure_table(client: Any, *, table_name: str = DEFAULT_TABLE_NAME) -> 
     if missing:
         names = [g["IndexName"] for g in missing]
         log.info("DynamoDB table %s missing GSIs %s; updating", table_name, names)
-        await _add_missing_gsis(client, table_name, missing)
+        await _add_missing_gsis(
+            client, table_name, missing, gsi_wait_timeout=gsi_wait_timeout
+        )
         await _enable_pitr(client, table_name)
         return "updated"
 

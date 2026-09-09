@@ -1,7 +1,7 @@
 """Unit tests for the DynamoDB key builders (Linear: XIN-89)."""
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from backend.persistence.dynamodb import keys
@@ -51,10 +51,13 @@ class TestIsoTimestamp:
         assert iso_timestamp(None, missing=MISSING_TS_MAX) == MISSING_TS_MAX
         assert MISSING_TS_MAX > "2030-01-01T00:00:00+00:00"
 
-    def test_non_utc_offset_preserved(self):
-        tz_plus2 = timezone.utc  # placeholder to keep the math obvious
+    def test_non_utc_offset_normalized_to_utc(self):
+        # A +02:00 aware datetime must encode as the same instant in UTC so
+        # the same timestamp always sorts the same way regardless of the
+        # offset it was constructed with.
+        tz_plus2 = timezone(timedelta(hours=2))
         dt = datetime(2026, 9, 9, 16, 41, 0, tzinfo=tz_plus2)
-        assert iso_timestamp(dt) == "2026-09-09T16:41:00+00:00"
+        assert iso_timestamp(dt) == "2026-09-09T14:41:00+00:00"
 
 
 class TestSanitizeStr:

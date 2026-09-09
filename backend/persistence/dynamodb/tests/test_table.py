@@ -59,6 +59,34 @@ def _gsi_names(desc):
     return {g["IndexName"] for g in desc["Table"]["GlobalSecondaryIndexes"]}
 
 
+def _gsi_statuses(desc):
+    return {
+        g["IndexName"]: g.get("IndexStatus")
+        for g in desc["Table"]["GlobalSecondaryIndexes"]
+    }
+
+
+def _create_table_with_gsis(sync, *index_names):
+    """Create the tunedin table with only the named GSIs (an older schema)."""
+    defs = {g["IndexName"]: g for g in table.GSI_DEFS}
+    attr_names = {"pk", "sk"}
+    for name in index_names:
+        for k in defs[name]["KeySchema"]:
+            attr_names.add(k["AttributeName"])
+    sync.create_table(
+        TableName=DEFAULT_TABLE_NAME,
+        KeySchema=[
+            {"AttributeName": "pk", "KeyType": "HASH"},
+            {"AttributeName": "sk", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": n, "AttributeType": "S"} for n in sorted(attr_names)
+        ],
+        GlobalSecondaryIndexes=[defs[name] for name in index_names],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+
 class TestEnsureTable:
     async def test_creates_missing_table(self, ddb):
         client, sync = ddb
@@ -84,29 +112,39 @@ class TestEnsureTable:
     async def test_adds_missing_gsi_via_update_table(self, ddb):
         client, sync = ddb
         # Simulate an older table that only has gsi1.
-        gsi1 = next(g for g in table.GSI_DEFS if g["IndexName"] == "gsi1")
-        sync.create_table(
-            TableName=DEFAULT_TABLE_NAME,
-            KeySchema=[
-                {"AttributeName": "pk", "KeyType": "HASH"},
-                {"AttributeName": "sk", "KeyType": "RANGE"},
-            ],
-            AttributeDefinitions=[
-                {"AttributeName": "pk", "AttributeType": "S"},
-                {"AttributeName": "sk", "AttributeType": "S"},
-                {"AttributeName": "gsi1pk", "AttributeType": "S"},
-                {"AttributeName": "gsi1sk", "AttributeType": "S"},
-            ],
-            GlobalSecondaryIndexes=[gsi1],
-            BillingMode="PAY_PER_REQUEST",
-        )
+        _create_table_with_gsis(sync, "gsi1")
 
         result = await ensure_table(client)
         assert result == "updated"
 
         desc = sync.describe_table(TableName=DEFAULT_TABLE_NAME)
         assert _gsi_names(desc) == {"gsi1", "gsi2", "gsi3"}
+        # ensure_table must not return until the added GSIs are ACTIVE.
+        assert _gsi_statuses(desc) == {
+            "gsi1": "ACTIVE",
+            "gsi2": "ACTIVE",
+            "gsi3": "ACTIVE",
+        }
         # A further run is a no-op once the GSI set matches.
+        assert await ensure_table(client) == "exists"
+
+    async def test_adds_two_missing_gsis_sequentially(self, ddb):
+        client, sync = ddb
+        # Simulate an older table that only has gsi1; gsi2 and gsi3 must be
+        # added one UpdateTable call at a time (AWS rejects batching), each
+        # reaching ACTIVE before the next is added.
+        _create_table_with_gsis(sync, "gsi1")
+
+        result = await ensure_table(client, gsi_wait_timeout=60)
+        assert result == "updated"
+
+        desc = sync.describe_table(TableName=DEFAULT_TABLE_NAME)
+        assert _gsi_names(desc) == {"gsi1", "gsi2", "gsi3"}
+        assert _gsi_statuses(desc) == {
+            "gsi1": "ACTIVE",
+            "gsi2": "ACTIVE",
+            "gsi3": "ACTIVE",
+        }
         assert await ensure_table(client) == "exists"
 
     async def test_enables_pitr(self, ddb):

@@ -24,7 +24,8 @@ Task log                  ``TASK#<task_log_id>``    ``META``
 ========================  ========================  =====================================
 
 Every item also carries a ``type`` attribute (entity type string) used by
-scans/filters.
+scans/filters.  The ``type`` attribute is added by the store layer (XIN-90)
+at write time — the key builders here emit only key attributes.
 
 GSIs:
 
@@ -69,9 +70,12 @@ def iso_timestamp(dt: Optional[datetime], *, missing: str = MISSING_TS_MIN) -> s
 
     Naive datetimes are normalized to UTC *first*: a naive
     ``2026-09-09T14:41:00`` becomes ``2026-09-09T14:41:00+00:00`` and can
-    never sort after its aware equivalent.  This is the single choke point
-    for all timestamp keys — every key builder in this module routes through
-    here.
+    never sort after its aware equivalent.  Aware datetimes with a non-UTC
+    offset are converted to UTC (e.g. ``16:41:00+02:00`` →
+    ``14:41:00+00:00``) so the same instant always encodes to the same
+    string — this is the single choke point for all timestamp keys, and
+    lexicographic ordering of keys is only correct if every timestamp
+    shares one offset.
 
     ``None`` encodes as ``missing`` (default :data:`MISSING_TS_MIN`).
     """
@@ -79,6 +83,8 @@ def iso_timestamp(dt: Optional[datetime], *, missing: str = MISSING_TS_MIN) -> s
         return missing
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
     return dt.isoformat()
 
 
