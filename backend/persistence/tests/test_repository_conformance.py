@@ -27,7 +27,9 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
+import boto3
 import pytest
+from moto import mock_aws
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -47,6 +49,7 @@ from backend.persistence.models import (
 )
 from backend.persistence.repositories import Store
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
+from backend.persistence.dynamodb.store import DynamoDBStore
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +75,40 @@ class _SqliteBackend:
         await self._engine.dispose()
 
 
-_BACKENDS = {"sqlalchemy": _SqliteBackend}
+class _DynamoDBBackend:
+    """Moto-backed DynamoDB backend context for ``DynamoDBStore``.
+
+    moto 5.2.3 cannot intercept aioboto3's async HTTP layer, so the store
+    is given the test-only async adapter over a sync boto3 client
+    (``backend.persistence.dynamodb.testing``) — production code stays on
+    aioboto3. Each test gets a freshly provisioned table for isolation.
+    """
+
+    async def setup(self) -> None:
+        from backend.persistence.dynamodb.table import ensure_table
+        from backend.persistence.dynamodb.testing import AsyncBoto3Client
+
+        self._mock = mock_aws()
+        self._mock.start()
+        sync = boto3.client(
+            "dynamodb",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+        )
+        self._client = AsyncBoto3Client(sync)
+        self._table_name = f"conformance-{uuid4().hex}"
+        await ensure_table(self._client, table_name=self._table_name)
+
+    def new_store(self) -> Store:
+        return DynamoDBStore(client=self._client, table_name=self._table_name)
+
+    async def teardown(self) -> None:
+        await self._client.close()
+        self._mock.stop()
+
+
+_BACKENDS = {"sqlalchemy": _SqliteBackend, "dynamodb": _DynamoDBBackend}
 
 
 @pytest.fixture(params=sorted(_BACKENDS))
