@@ -149,7 +149,7 @@ It checks, per table:
 
 Exit code 0 and `PARITY OK` means the backfill is faithful. Any
 `MISMATCH` lines name the table, the kind (`missing-row`, `extra-row`,
-`payload-diff`, `missing-table`) and the differing columns — investigate
+`payload-diff`, `missing-table`, `target-only-table`) and the differing columns — investigate
 before cutting over. Re-running the migration is always safe (idempotent
 upserts) and is the first remediation for a mismatch.
 
@@ -195,9 +195,17 @@ operation you will ever run against it.
 
 Rollback is a reverse migration to the SQLite file. The SQLite file was
 never modified by the cutover (DynamoDB was a copy), but re-migrating
-picks up any writes that landed in DynamoDB while it was primary:
+picks up any writes that landed in DynamoDB while it was primary.
+
+`--source dynamodb` needs the DynamoDB target variables and AWS
+credentials again — re-export them exactly as in step 0 (a fresh shell
+won't have them):
 
 ```bash
+export DATABASE_DYNAMODB_TABLE_NAME=tunedin
+export DATABASE_DYNAMODB_REGION=us-east-1
+# AWS credentials via the standard chain (env / ~/.aws / IAM role)
+
 # DynamoDB -> SQLite (uses the same CLI, reversed)
 python -m backend.migrate_data --source dynamodb --target simple
 python -m backend.parity_check --source dynamodb --target simple

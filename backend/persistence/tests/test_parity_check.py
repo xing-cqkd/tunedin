@@ -17,7 +17,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from backend.migrate_data import SqlAlchemyBackend, migrate
+from backend.migrate_data import Backend, SqlAlchemyBackend, migrate
 from backend.parity_check import compare
 from backend.persistence.dynamodb.migrate_adapter import DynamoDBBackend
 from backend.persistence.dynamodb.table import DEFAULT_TABLE_NAME, ensure_table
@@ -203,3 +203,56 @@ async def test_compare_detects_status_count_mismatch(backends):
     assert not report.ok
     feeds = _table(report, "feeds")
     assert feeds.source_by_status != feeds.target_by_status
+
+
+class _ExtraTableBackend:
+    """Wraps a Backend, pretending it holds one extra (target-only) table."""
+
+    def __init__(
+        self, inner: Backend, extra_table: str, extra_rows: List[Dict[str, Any]]
+    ):
+        self._inner = inner
+        self.name = inner.name
+        self._extra_table = extra_table
+        self._extra_rows = extra_rows
+
+    @property
+    def identity(self) -> str:
+        return self._inner.identity
+
+    @property
+    def table_names(self) -> List[str]:
+        return [*self._inner.table_names, self._extra_table]
+
+    async def init(self) -> None:
+        await self._inner.init()
+
+    async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+        if table_name == self._extra_table:
+            return [dict(r) for r in self._extra_rows]
+        return await self._inner.read_table(table_name)
+
+    async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
+        return await self._inner.write_rows(table_name, rows)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+async def test_compare_flags_target_only_tables(backends):
+    sql, ddb, seed = backends
+    await migrate(sql, ddb)
+    # Simulate a stale table left in the target by an earlier partial backfill.
+    target = _ExtraTableBackend(ddb, "leftover_table", [{"id": 1}, {"id": 2}])
+
+    report = await compare(sql, target)
+    assert not report.ok
+    leftover = _table(report, "leftover_table")
+    assert leftover.source_rows == -1 and leftover.target_rows == 2
+    kinds = [k for k, _ in leftover.sample_mismatches]
+    assert "target-only-table" in kinds
+    # Source tables keep their original order and still pass.
+    assert [t.table for t in report.tables][: len(sql.table_names)] == list(
+        sql.table_names
+    )
+    assert all(_table(report, name).ok for name in sql.table_names)

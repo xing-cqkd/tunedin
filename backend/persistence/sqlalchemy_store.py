@@ -62,8 +62,15 @@ def _guard_item_size(entity: Any) -> None:
     """Enforce the shared 400 KiB per-item limit before a write (XIN-95).
 
     Same guard and same :class:`ItemTooLargeError` as the DynamoDB backend
-    (which enforces it in ``codec.model_to_item``): an entity accepted here
-    is guaranteed to fit there, so a migration can never fail on item size.
+    (which enforces it in ``codec.model_to_item``). Note the approximation:
+    both sides measure the same canonical JSON serialization of the
+    entity's column values, but DynamoDB's on-the-wire item is strictly
+    larger (DynamoDB-JSON attribute-type wrappers plus key/index overhead).
+    A borderline entity (~399.9 KiB here) can therefore pass this guard yet
+    still be rejected by DynamoDB itself — in which case the service raises
+    loudly. The guard's job is to catch the realistic cases
+    (multi-hundred-KB transcripts/descriptions) identically on both
+    backends, at write time.
     """
     pk_cols = list(entity.__table__.primary_key.columns)
     pk = f"{pk_cols[0].name}={getattr(entity, pk_cols[0].name)}" if pk_cols else "?"
@@ -462,6 +469,7 @@ class _TaskLogRepository(TaskLogRepository):
         if entry is not None:
             entry.status = status
             entry.error_message = error_message
+            _guard_item_size(entry)
             await self._session.flush()
         return entry
 

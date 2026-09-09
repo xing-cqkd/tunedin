@@ -6,7 +6,8 @@ Usage:
 Compares, per table: row counts, feed counts by ``sync_status``, episode
 unprocessed counts, and payload spot-checks on a deterministic sample of
 rows (normalized so UUID/datetime representations compare equal across
-backends). Exit code 0 when everything matches, 1 on any mismatch.
+backends), plus missing-table (source-only) and target-only table
+detection. Exit code 0 when everything matches, 1 on any mismatch.
 
 Backends resolve exactly like ``backend.migrate_data`` (same env vars), so
 ``--target dynamodb`` against real AWS needs the standard AWS credential
@@ -100,10 +101,19 @@ class ParityReport:
 async def compare(
     source: Backend, target: Backend, *, sample_size: int = 25
 ) -> ParityReport:
-    """Compare two backends table by table. Does not close either backend."""
+    """Compare two backends table by table. Does not close either backend.
+
+    Memory characteristic: each backend's ``read_table`` loads whole tables
+    into memory (the same pattern the migration CLI uses), so on a
+    production-scale catalog this needs RAM proportional to the largest
+    table. Sampling (``sample_size``) only bounds the payload diff work,
+    not the rows held in memory.
+    """
     report = ParityReport(source=source.name, target=target.name)
-    for table_name in source.table_names:
-        if table_name not in target.table_names:
+    source_tables = list(source.table_names)
+    target_tables = list(target.table_names)
+    for table_name in source_tables:
+        if table_name not in target_tables:
             tp = TableParity(table=table_name, source_rows=-1, target_rows=-1)
             tp.sample_mismatches.append(
                 ("missing-table", f"table {table_name!r} absent from target backend")
@@ -122,6 +132,22 @@ async def compare(
             tp.source_unprocessed = sum(1 for r in s_rows if not r.get("processed"))
             tp.target_unprocessed = sum(1 for r in t_rows if not r.get("processed"))
         tp.sample_mismatches = _sample_diff(table_name, s_rows, t_rows, sample_size)
+        report.tables.append(tp)
+    # Target-only tables: a stale/extra table in the target (e.g. left over
+    # from an earlier partial backfill) is invisible when iterating only
+    # source tables, so flag it explicitly.
+    for table_name in sorted(set(target_tables) - set(source_tables)):
+        t_rows = await target.read_table(table_name)
+        tp = TableParity(
+            table=table_name, source_rows=-1, target_rows=len(t_rows)
+        )
+        tp.sample_mismatches.append(
+            (
+                "target-only-table",
+                f"table {table_name!r} present in target ({len(t_rows)} rows) "
+                f"but absent from source — possible leftover from a partial backfill",
+            )
+        )
         report.tables.append(tp)
     return report
 
