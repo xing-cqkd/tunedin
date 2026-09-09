@@ -1,23 +1,26 @@
 """Copy all rows from one configured database backend to another.
 
 Usage:
-    python -m backend.migrate_data --source simple --target app [--dry-run]
+    python -m backend.migrate_data --source simple --target dynamodb [--dry-run]
 
 Backends are resolved from the same environment variables the backend
 modules read at import time (never through the settings singleton, since
 source and target may differ)::
 
-    simple -> INGESTION_DATABASE_URL (default: backend/ingestion/simple.db)
-    app    -> DATABASE_URL           (default: ./tunedin.db)
+    simple   -> INGESTION_DATABASE_URL (default: backend/ingestion/simple.db)
+    app      -> DATABASE_URL           (default: ./tunedin.db)
+    dynamodb -> DATABASE_DYNAMODB_TABLE_NAME (default: tunedin),
+                DATABASE_DYNAMODB_REGION (default: us-east-1),
+                DATABASE_DYNAMODB_ENDPOINT_URL (unset: real AWS)
 
 Rows are copied table-by-table in foreign-key-safe order (parents before
 children) and upserted by primary key via ``session.merge()``, so re-running
 a migration is idempotent and never duplicates rows.
 
-The ``Backend`` abstraction below is the seam for a future DynamoDB backend:
-it only has to implement table read/write by table name
-(``table_names`` / ``read_table`` / ``write_rows``); the migration
-orchestration in ``migrate()`` stays untouched.
+The ``Backend`` abstraction below is the seam every backend implements
+(``table_names`` / ``read_table`` / ``write_rows``); the DynamoDB side
+lives in ``backend.persistence.dynamodb.migrate_adapter`` and the
+migration orchestration in ``migrate()`` stays untouched.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ from backend.persistence.models import Base
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_VALID_BACKENDS = ("simple", "app")
+_VALID_BACKENDS = ("simple", "app", "dynamodb")
 
 # backend name -> (module to import, env var it reads at import time)
 _BACKEND_MODULES = {
@@ -240,7 +243,7 @@ class SqlAlchemyBackend(Backend):
         await self._dispose()
 
 
-def get_backend(name: str) -> SqlAlchemyBackend:
+def get_backend(name: str) -> Backend:
     """Resolve a named backend the way its module would.
 
     The module is imported lazily, *after* its env var is pinned to the
@@ -252,6 +255,18 @@ def get_backend(name: str) -> SqlAlchemyBackend:
     """
     if name not in _VALID_BACKENDS:
         raise ValueError(f"Unknown backend {name!r} (expected one of {_VALID_BACKENDS})")
+    if name == "dynamodb":
+        # Same env vars the settings system maps to database.dynamodb.*;
+        # read directly (not through the settings singleton) because source
+        # and target may differ. Credentials always come from the standard
+        # AWS chain, never from these variables.
+        from backend.persistence.dynamodb.migrate_adapter import DynamoDBBackend
+
+        return DynamoDBBackend(
+            table_name=os.environ.get("DATABASE_DYNAMODB_TABLE_NAME", "tunedin"),
+            region_name=os.environ.get("DATABASE_DYNAMODB_REGION", "us-east-1"),
+            endpoint_url=os.environ.get("DATABASE_DYNAMODB_ENDPOINT_URL"),
+        )
     module_name, env_var = _BACKEND_MODULES[name]
     url = resolve_url(name)
     os.environ[env_var] = url
