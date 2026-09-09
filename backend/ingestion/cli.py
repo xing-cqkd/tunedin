@@ -3,13 +3,11 @@ import asyncio
 import logging
 import sys
 from typing import List, Optional
-from sqlalchemy import func, select
 
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
 from settings import describe_database, get_crawler_countries, init_db, session_scope
-from backend.persistence.models.episode import Episode
-from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,23 +20,12 @@ async def show_status() -> None:
     """Displays current catalog counts in the configured database."""
     await init_db()
     async with session_scope() as session:
-        feed_total = (await session.execute(select(func.count(Feed.feed_id)))).scalar_one()
-        feed_discovered = (
-            await session.execute(
-                select(func.count(Feed.feed_id)).where(Feed.sync_status == "discovered")
-            )
-        ).scalar_one()
-        feed_active = (
-            await session.execute(
-                select(func.count(Feed.feed_id)).where(Feed.sync_status == "active")
-            )
-        ).scalar_one()
-        ep_total = (await session.execute(select(func.count(Episode.episode_id)))).scalar_one()
-        ep_unprocessed = (
-            await session.execute(
-                select(func.count(Episode.episode_id)).where(Episode.processed == False)
-            )
-        ).scalar_one()
+        store = SQLAlchemyStore(lambda: session)
+        feed_total = await store.feeds.count_all()
+        feed_discovered = await store.feeds.count_by_status("discovered")
+        feed_active = await store.feeds.count_by_status("active")
+        ep_total = await store.episodes.count_all()
+        ep_unprocessed = await store.episodes.count_unprocessed()
 
     print("\n" + "=" * 55)
     print(" 📊 TunedIn Podcast Ingestion Database Status")

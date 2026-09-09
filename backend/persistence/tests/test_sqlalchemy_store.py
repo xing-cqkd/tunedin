@@ -134,6 +134,10 @@ async def test_feed_counts_and_list_all(store):
     assert await store.feeds.count_all() == 3
     assert await store.feeds.count_by_status("discovered") == 2
     assert await store.feeds.count_by_status("active") == 0
+    assert await store.feeds.count_by_statuses(["discovered", "pending"]) == 2
+    assert await store.feeds.count_by_statuses(["discovered", "pending", "error"]) == 3
+    assert await store.feeds.count_by_statuses([]) == 0
+    assert await store.feeds.count_by_statuses(["nope"]) == 0
 
     all_feeds = await store.feeds.list_all()
     assert len(all_feeds) == 3

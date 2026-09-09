@@ -101,6 +101,13 @@ class FeedRepository(ABC):
         """Return the number of feeds with the given ``sync_status``."""
 
     @abstractmethod
+    async def count_by_statuses(self, statuses: list[str]) -> int:
+        """Return the number of feeds whose ``sync_status`` is in ``statuses``.
+
+        An empty ``statuses`` list returns 0 without hitting the backend.
+        """
+
+    @abstractmethod
     async def count_all(self) -> int:
         """Return the total number of feeds."""
 

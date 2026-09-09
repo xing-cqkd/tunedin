@@ -119,6 +119,14 @@ class _FeedRepository(FeedRepository):
         )
         return res.scalar_one()
 
+    async def count_by_statuses(self, statuses: list[str]) -> int:
+        if not statuses:
+            return 0
+        res = await self._session.execute(
+            select(func.count(Feed.feed_id)).where(Feed.sync_status.in_(statuses))
+        )
+        return res.scalar_one()
+
     async def count_all(self) -> int:
         res = await self._session.execute(select(func.count(Feed.feed_id)))
         return res.scalar_one()
