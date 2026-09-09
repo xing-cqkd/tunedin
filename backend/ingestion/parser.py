@@ -635,7 +635,7 @@ class PodcastFeedParser:
         )
         headers = {
             "User-Agent": user_agent,
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            "Accept": "application/rss+xml, application/xml, text/xml, application/feed+json, */*",
         }
         if etag:
             headers["If-None-Match"] = etag
@@ -669,7 +669,9 @@ class PodcastFeedParser:
             new_etag = response.headers.get("ETag") or etag
             new_last_modified = response.headers.get("Last-Modified") or last_modified
 
-            return cls.parse_xml_content(
+            # Route through the unified entrypoint so JSON Feeds served over HTTP
+            # are detected and parsed as JSON instead of being misparsed as XML.
+            return cls.parse_content(
                 content=response.content,
                 rss_url=rss_url,
                 last_updated_at=last_updated_at,

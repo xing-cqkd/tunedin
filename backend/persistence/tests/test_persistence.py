@@ -179,3 +179,55 @@ async def test_task_log(test_session: AsyncSession):
     fetched_log = res.scalar_one_or_none()
     assert fetched_log is not None
     assert fetched_log.task_type == "PROCESS_EPISODE"
+
+
+@pytest.mark.asyncio
+async def test_init_db_migrates_fresh_database(tmp_path, monkeypatch):
+    """XIN-32: init_db() on an empty file creates the schema via Alembic."""
+    import importlib
+    import sqlite3
+
+    db_path = tmp_path / "fresh.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    import backend.persistence.database as db
+
+    importlib.reload(db)
+    try:
+        await db.init_db()
+    finally:
+        await db.engine.dispose()
+
+    con = sqlite3.connect(db_path)
+    tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+    assert {"feeds", "episodes", "alembic_version"} <= tables
+    version = con.execute("select version_num from alembic_version").fetchone()[0]
+    assert version  # stamped at head
+    con.close()
+    importlib.reload(db)  # restore default engine binding
+
+
+@pytest.mark.asyncio
+async def test_init_db_stamps_legacy_create_all_database(tmp_path, monkeypatch):
+    """XIN-32: init_db() stamps (not migrates) a DB built by the old create_all path."""
+    import importlib
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    import backend.persistence.database as db
+
+    importlib.reload(db)
+    try:
+        await db.create_all_tables()
+        await db.engine.dispose()
+        importlib.reload(db)
+        await db.init_db()  # must not fail: stamp instead of migrate
+        await db.init_db()  # idempotent re-run
+    finally:
+        await db.engine.dispose()
+
+    con = sqlite3.connect(db_path)
+    version = con.execute("select version_num from alembic_version").fetchone()[0]
+    assert version
+    con.close()
+    importlib.reload(db)  # restore default engine binding

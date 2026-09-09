@@ -1,7 +1,9 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from backend.persistence.models import Base
 
@@ -32,7 +34,40 @@ AsyncSessionLocal = async_sessionmaker(
 )
 
 async def init_db():
-    """Asynchronously create all tables defined in models."""
+    """Bring the app database schema up to date via Alembic migrations.
+
+    Databases created by the old create_all path (tables exist but no
+    alembic_version table) are stamped at head instead of migrated, since
+    they already match the current models.
+    """
+    from alembic import command as alembic_command
+    from alembic.config import Config
+
+    cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+
+    async with engine.begin() as conn:
+        has_version_table = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).has_table("alembic_version")
+        )
+        has_app_tables = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).has_table("feeds")
+        )
+
+    def _run_migrations():
+        if has_app_tables and not has_version_table:
+            alembic_command.stamp(cfg, "head")
+        else:
+            alembic_command.upgrade(cfg, "head")
+
+    # Alembic's env.py drives its own event loop, so run it in a thread.
+    await asyncio.to_thread(_run_migrations)
+
+
+async def create_all_tables():
+    """Create all tables directly from models (tests and throwaway DBs only).
+
+    Application startup should use init_db(), which runs Alembic migrations.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
