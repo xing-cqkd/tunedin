@@ -10,6 +10,7 @@ from backend.ingestion.service import FeedIngestionService
 from backend.persistence.models.base import Base
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -367,7 +368,7 @@ class TestIngestionService:
 
             # 1. Initial Ingestion
             feed, new_eps = await service.ingest_feed(
-                db=in_memory_session,
+                store=SQLAlchemyStore(lambda: in_memory_session),
                 rss_url=rss_url,
                 client=client,
             )
@@ -379,7 +380,7 @@ class TestIngestionService:
 
             # 2. Re-running ingestion without feed changes should detect known GUIDs and insert 0 new episodes
             feed2, second_run_eps = await service.ingest_feed(
-                db=in_memory_session,
+                store=SQLAlchemyStore(lambda: in_memory_session),
                 rss_url=rss_url,
                 client=client,
             )

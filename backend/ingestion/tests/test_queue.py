@@ -9,6 +9,7 @@ from backend.ingestion.task_queue import (
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.models import ParsedEpisode, FeedParseResult, ParsedFeedMetadata
 from backend.persistence.models.feed import Feed
+from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 
 @pytest.mark.asyncio
@@ -130,7 +131,7 @@ async def test_service_auto_queues_episodes(in_memory_session):
 
     with patch.object(service.parser, "fetch_and_parse", new=AsyncMock(return_value=mock_parse_result)):
         feed, episodes = await service.sync_podcast_episodes(
-            db=in_memory_session,
+            store=SQLAlchemyStore(lambda: in_memory_session),
             feed_or_id_or_url="https://example.com/queue_test.rss",
             auto_queue_episodes=2,
         )
