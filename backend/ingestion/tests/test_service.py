@@ -388,3 +388,95 @@ class TestSettingsYamlLoading:
         monkeypatch.setenv("INGESTION_DATABASE_URL", "sqlite+aiosqlite:////tmp/keep.db")
         settings._apply_to_env()
         assert os.environ["INGESTION_DATABASE_URL"].endswith("keep.db")
+
+
+class TestErrorRetryPolicy:
+    """XIN-34: feeds stuck in sync_status='error' must be retried with backoff."""
+
+    def _make_error_feed(self, error_count: int, last_fetched_ago_seconds: float) -> Feed:
+        from datetime import datetime, timedelta, timezone
+
+        return Feed(
+            rss_url=f"https://example.com/error-feed-{error_count}-{last_fetched_ago_seconds}.xml",
+            title="Error Feed",
+            sync_status="error",
+            error_count=error_count,
+            last_fetched_at=datetime.now(timezone.utc) - timedelta(seconds=last_fetched_ago_seconds),
+        )
+
+    def _ok_parse_result(self) -> "FeedParseResult":
+        from backend.ingestion.models import FeedParseResult, ParsedFeedMetadata
+
+        return FeedParseResult(
+            metadata=ParsedFeedMetadata(title="Recovered Podcast", rss_url="https://example.com/x.xml"),
+            episodes=[],
+            total_feed_episodes=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_errored_feed_retried_after_backoff_elapses(self, in_memory_session: AsyncSession):
+        """An errored feed past its backoff window is retried and recovers."""
+        from unittest.mock import AsyncMock, patch
+
+        from backend.ingestion import service as service_module
+
+        feed = self._make_error_feed(error_count=1, last_fetched_ago_seconds=3600)
+        in_memory_session.add(feed)
+        await in_memory_session.commit()
+
+        svc = FeedIngestionService()
+        with patch.object(
+            PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
+        ):
+            summary = await svc.sync_all_pending_feeds(in_memory_session)
+
+        assert summary["total_synced"] == 1
+        await in_memory_session.refresh(feed)
+        assert feed.sync_status == "active"
+        assert feed.error_count == 0
+        assert service_module.ERROR_RETRY_MAX_ATTEMPTS > 1
+
+    @pytest.mark.asyncio
+    async def test_errored_feed_not_retried_within_backoff(self, in_memory_session: AsyncSession):
+        """An errored feed inside its backoff window is left alone."""
+        from unittest.mock import AsyncMock, patch
+
+        feed = self._make_error_feed(error_count=1, last_fetched_ago_seconds=60)
+        in_memory_session.add(feed)
+        await in_memory_session.commit()
+
+        svc = FeedIngestionService()
+        with patch.object(
+            PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
+        ) as mock_fetch:
+            summary = await svc.sync_all_pending_feeds(in_memory_session)
+
+        mock_fetch.assert_not_called()
+        assert summary["total_synced"] == 0
+        await in_memory_session.refresh(feed)
+        assert feed.sync_status == "error"
+
+    @pytest.mark.asyncio
+    async def test_errored_feed_abandoned_after_max_attempts(self, in_memory_session: AsyncSession):
+        """An errored feed past the max attempt count is never retried."""
+        from unittest.mock import AsyncMock, patch
+
+        from backend.ingestion import service as service_module
+
+        feed = self._make_error_feed(
+            error_count=service_module.ERROR_RETRY_MAX_ATTEMPTS,
+            last_fetched_ago_seconds=30 * 24 * 3600,
+        )
+        in_memory_session.add(feed)
+        await in_memory_session.commit()
+
+        svc = FeedIngestionService()
+        with patch.object(
+            PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
+        ) as mock_fetch:
+            summary = await svc.sync_all_pending_feeds(in_memory_session)
+
+        mock_fetch.assert_not_called()
+        assert summary["total_synced"] == 0
+        await in_memory_session.refresh(feed)
+        assert feed.sync_status == "error"

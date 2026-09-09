@@ -303,6 +303,49 @@ class TestAsyncHttpAndCaching:
             assert result.is_not_modified is True
             assert len(result.episodes) == 0
 
+    @pytest.mark.asyncio
+    async def test_fetch_json_feed_over_http_is_not_misparsed_as_xml(self):
+        """Regression test for XIN-33: fetch_and_parse must route through the
+        unified parse_content entrypoint so JSON Feeds served over HTTP are
+        detected and parsed as JSON."""
+        mock_json = """{
+            "version": "https://jsonfeed.org/version/1.1",
+            "title": "Quantum Wave Podcast",
+            "items": [
+                {
+                    "id": "qw-ep-01",
+                    "title": "Superposition & Entanglement",
+                    "date_published": "2026-03-01T15:30:00Z",
+                    "url": "https://quantumwave.example.com/ep1",
+                    "attachments": [
+                        {"url": "https://quantumwave.example.com/audio/ep1.mp3",
+                         "mime_type": "audio/mpeg",
+                         "duration_in_seconds": 3600}
+                    ]
+                }
+            ]
+        }"""
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                content=mock_json.encode("utf-8"),
+                headers={"Content-Type": "application/feed+json"},
+            )
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await PodcastFeedParser.fetch_and_parse(
+                rss_url="https://quantumwave.example.com/feed.json",
+                client=client,
+            )
+
+            assert result.metadata.title == "Quantum Wave Podcast"
+            assert result.total_feed_episodes == 1
+            assert len(result.episodes) == 1
+            assert result.episodes[0].guid == "qw-ep-01"
+            assert result.episodes[0].audio_url == "https://quantumwave.example.com/audio/ep1.mp3"
+
 
 class TestIngestionService:
     @pytest.mark.asyncio

@@ -1,10 +1,10 @@
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.ingestion.itunes import ITunesSearchClient
@@ -15,6 +15,29 @@ from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
 logger = logging.getLogger(__name__)
+
+
+# Retry policy for feeds stuck in sync_status="error" (XIN-34). A transient
+# fetch/parse failure must not strand a feed forever: errored feeds become
+# eligible for retry after an exponential backoff based on consecutive
+# error_count, and are abandoned after MAX attempts.
+ERROR_RETRY_BASE_BACKOFF_SECONDS = 300  # 5 minutes; doubles per consecutive failure
+ERROR_RETRY_MAX_BACKOFF_SECONDS = 24 * 3600  # 1 day cap
+ERROR_RETRY_MAX_ATTEMPTS = 10  # stop retrying after this many consecutive failures
+
+
+def _error_retry_due(feed: "Feed", now: datetime) -> bool:
+    """True if an errored feed's backoff window has elapsed and it may be retried."""
+    if feed.error_count >= ERROR_RETRY_MAX_ATTEMPTS:
+        return False
+    backoff = min(
+        ERROR_RETRY_BASE_BACKOFF_SECONDS * (2 ** max(feed.error_count - 1, 0)),
+        ERROR_RETRY_MAX_BACKOFF_SECONDS,
+    )
+    last = feed.last_fetched_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)  # SQLite returns naive datetimes
+    return last is None or last <= now - timedelta(seconds=backoff)
 
 
 class IngestionMode(str, Enum):
@@ -366,12 +389,25 @@ class FeedIngestionService:
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
         """
-        Finds all feeds with sync_status in ('discovered', 'pending') or last_fetched_at is None,
-        and downloads all new episodes into the database for each feed.
+        Finds all feeds with sync_status in ('discovered', 'pending'), plus errored
+        feeds whose retry backoff has elapsed, and downloads all new episodes
+        into the database for each feed.
         """
+        now = datetime.now(timezone.utc)
+        min_backoff_cutoff = now - timedelta(seconds=ERROR_RETRY_BASE_BACKOFF_SECONDS)
         stmt = (
             select(Feed)
-            .where(Feed.sync_status.in_(["discovered", "pending"]))
+            .where(
+                or_(
+                    Feed.sync_status.in_(["discovered", "pending"]),
+                    and_(
+                        Feed.sync_status == "error",
+                        Feed.error_count < ERROR_RETRY_MAX_ATTEMPTS,
+                        Feed.last_fetched_at.is_not(None),
+                        Feed.last_fetched_at <= min_backoff_cutoff,
+                    ),
+                )
+            )
             .order_by(Feed.created_at.asc())
         )
         if max_feeds:
@@ -385,6 +421,10 @@ class FeedIngestionService:
         failed_feeds: List[str] = []
 
         for feed in pending_feeds:
+            # Per-feed exponential backoff: the SQL pre-filter uses the minimum
+            # backoff window, so re-check the exact window for this feed here.
+            if feed.sync_status == "error" and not _error_retry_due(feed, now):
+                continue
             try:
                 _, new_eps = await self.sync_podcast_episodes(db, feed, client=client)
                 total_synced += 1

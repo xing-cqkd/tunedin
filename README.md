@@ -53,6 +53,23 @@ python -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
 .venv/bin/pytest backend/ -q
 ```
 
+### Database migrations
+
+The app database (`database.backend: "app"`) is migrated with Alembic — never
+`create_all`. `init_db()` runs `alembic upgrade head` automatically; databases
+created by the old `create_all` path are stamped at head instead of migrated.
+
+```bash
+cd backend
+../.venv/bin/alembic upgrade head                    # migrate to latest
+../.venv/bin/alembic revision --autogenerate -m "..." # new migration after model changes
+```
+
+The migration scripts live in `backend/alembic/versions/` and target
+`$DATABASE_URL` (default `./tunedin.db`). SimpleDB (`"simple"` backend) keeps
+using `create_all` — it's the zero-setup local option with no migration
+history.
+
 Ingestion CLI:
 
 ```bash
