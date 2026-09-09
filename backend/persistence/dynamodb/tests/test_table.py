@@ -6,41 +6,13 @@ async adapter over a sync boto3 client — the production code path stays
 fully async (aioboto3).
 """
 
-import asyncio
-
 import boto3
 import pytest
 from moto import mock_aws
 
 from backend.persistence.dynamodb import table
 from backend.persistence.dynamodb.table import DEFAULT_TABLE_NAME, ensure_table
-
-
-class _AsyncWaiter:
-    def __init__(self, waiter):
-        self._waiter = waiter
-
-    async def wait(self, **kwargs):
-        await asyncio.to_thread(self._waiter.wait, **kwargs)
-
-
-class AsyncBoto3Client:
-    """Test-only async adapter over a sync boto3 client."""
-
-    def __init__(self, client):
-        self._client = client
-        self.exceptions = client.exceptions
-
-    def get_waiter(self, name):
-        return _AsyncWaiter(self._client.get_waiter(name))
-
-    def __getattr__(self, name):
-        meth = getattr(self._client, name)
-
-        async def _call(*args, **kwargs):
-            return await asyncio.to_thread(meth, *args, **kwargs)
-
-        return _call
+from backend.persistence.dynamodb.testing import AsyncBoto3Client
 
 
 @pytest.fixture()
