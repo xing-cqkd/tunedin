@@ -26,6 +26,7 @@ from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from sqlalchemy import Boolean, DateTime, Integer, Uuid
 
 from backend.persistence import models
+from backend.persistence import validation
 from backend.persistence.dynamodb import keys
 
 _SER = TypeSerializer()
@@ -135,6 +136,11 @@ def model_to_item(entity: Any, key_attrs: dict, type_name: str) -> dict:
     ``key_attrs`` are the plain-string key attributes from
     :mod:`backend.persistence.dynamodb.keys` (already in DynamoDB-JSON
     ``{"S": ...}`` form is NOT required — this function wraps them).
+
+    The shared 400 KiB item-size guard
+    (:mod:`backend.persistence.validation`) runs on every item built here,
+    so DynamoDB raises the same :class:`ItemTooLargeError` as the SQL
+    backends instead of failing later at the service.
     """
     item = {name: {"S": value} for name, value in key_attrs.items()}
     item["type"] = {"S": type_name}
@@ -143,6 +149,7 @@ def model_to_item(entity: Any, key_attrs: dict, type_name: str) -> dict:
         serialized = _serialize_value(value)
         if serialized is not None:
             item[column.name] = serialized
+    validation.check_item_size(item, what=f"{type_name} item")
     return item
 
 
