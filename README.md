@@ -91,8 +91,9 @@ transaction-critical paths (episode guid-dedup transactions,
 marked `slow` and skip automatically when the emulator isn't running:
 
 ```bash
-docker run -p 8000:8000 amazon/dynamodb-local
+docker run -d -p 8000:8000 amazon/dynamodb-local
 .venv/bin/pytest backend/ -q -m slow
+docker stop <container>   # when done
 ```
 
 ### Database migrations

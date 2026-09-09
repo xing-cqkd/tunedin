@@ -6,23 +6,30 @@ moto has known fidelity gaps around ``TransactWriteItems`` conditional
 checks, so this module is the only proof the ``attribute_not_exists(pk)``
 marker condition actually rejects duplicates outside moto.
 
-How to run::
+How to run (slow tests are opt-in via ``-m slow``)::
 
-    docker run -p 8000:8000 amazon/dynamodb-local
-    .venv/bin/pytest backend/persistence/dynamodb/tests/test_dynamodb_local.py -q
+    docker run -d -p 8000:8000 amazon/dynamodb-local
+    .venv/bin/pytest backend/ -q -m slow
+    docker stop <container>
 
-or ``-m slow`` to run all slow integration tests. When DynamoDB Local is
-not reachable on ``localhost:8000`` (override with ``DYNAMODB_LOCAL_HOST`` /
-``DYNAMODB_LOCAL_PORT``) every test in this module SKIPS — it never fails
-for a missing emulator. No AWS credentials are needed; fake ones are set
-because botocore requires *something* in the chain (DynamoDB Local ignores
-them). Nothing here touches real AWS.
+When DynamoDB Local is not reachable on ``localhost:8000`` (override with
+``DYNAMODB_LOCAL_HOST`` / ``DYNAMODB_LOCAL_PORT``) every test in this module
+SKIPS — it never fails for a missing emulator. No AWS credentials are
+needed; fake ones are set because botocore requires *something* in the
+chain (DynamoDB Local ignores them). Nothing here touches real AWS.
+
+Note: ``ensure_table`` is called with ``enable_pitr=False`` here because
+DynamoDB Local rejects ``update_continuous_backups`` with
+``UnsupportedOperationException``
+(awslabs/amazon-dynamodb-local-samples#17); PITR stays enabled by default
+on the real-AWS path.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
@@ -41,13 +48,31 @@ LOCAL_PORT = int(os.environ.get("DYNAMODB_LOCAL_PORT", "8000"))
 LOCAL_ENDPOINT = f"http://{LOCAL_HOST}:{LOCAL_PORT}"
 
 
-def _local_available() -> bool:
-    """True when something accepts TCP on the DynamoDB Local port."""
-    try:
-        with socket.create_connection((LOCAL_HOST, LOCAL_PORT), timeout=1):
-            return True
-    except OSError:
-        return False
+_LOCAL_STATUS: bool | None = None  # cached emulator reachability
+
+
+def _wait_for_local(timeout: float = 10.0) -> bool:
+    """True once something accepts TCP on the DynamoDB Local port.
+
+    Polls instead of probing once: DynamoDB Local takes a few seconds to
+    warm up its JVM, and a single probe would race a slow-starting
+    emulator and cause silent skips. The result is cached for the module
+    so a missing emulator costs the timeout only once.
+    """
+    global _LOCAL_STATUS
+    if _LOCAL_STATUS is not None:
+        return _LOCAL_STATUS
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.create_connection((LOCAL_HOST, LOCAL_PORT), timeout=1):
+                _LOCAL_STATUS = True
+                return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                _LOCAL_STATUS = False
+                return False
+            time.sleep(0.5)
 
 
 @pytest.fixture()
@@ -58,10 +83,10 @@ async def local_store(monkeypatch):
     client lifecycle is exercised, exactly as production does. Skips when
     the emulator is not running.
     """
-    if not _local_available():
+    if not _wait_for_local():
         pytest.skip(
             f"DynamoDB Local not reachable at {LOCAL_ENDPOINT} "
-            "(docker run -p 8000:8000 amazon/dynamodb-local)"
+            "(docker run -d -p 8000:8000 amazon/dynamodb-local)"
         )
     # botocore needs *some* credentials in the chain; Local ignores them.
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
@@ -73,7 +98,11 @@ async def local_store(monkeypatch):
     ) as store:
         # Reach into the store for provisioning: ensure_table needs the
         # raw client, which only exists after the store is entered.
-        created = await ensure_table(store._client, table_name=table_name)
+        # enable_pitr=False: DynamoDB Local rejects update_continuous_backups
+        # (UnsupportedOperationException; awslabs/amazon-dynamodb-local-samples#17).
+        created = await ensure_table(
+            store._client, table_name=table_name, enable_pitr=False
+        )
         assert created == "created"
         yield store
         try:
@@ -106,11 +135,26 @@ class TestEnsureTableOnLocal:
         desc = await local_store._client.describe_table(
             TableName=local_store.table_name
         )
-        gsis = {g["IndexName"] for g in desc["Table"].get("GlobalSecondaryIndexes", [])}
-        assert gsis == {g["IndexName"] for g in GSI_DEFS}
+        gsis = {
+            g["IndexName"]: g
+            for g in desc["Table"].get("GlobalSecondaryIndexes", [])
+        }
+        assert set(gsis) == {g["IndexName"] for g in GSI_DEFS}
+        # Names alone aren't enough: assert key schemas and projections too.
+        for expected in GSI_DEFS:
+            actual = gsis[expected["IndexName"]]
+            assert actual["KeySchema"] == expected["KeySchema"]
+            assert (
+                actual["Projection"]["ProjectionType"]
+                == expected["Projection"]["ProjectionType"]
+            )
         # Second call is a no-op.
         assert (
-            await ensure_table(local_store._client, table_name=local_store.table_name)
+            await ensure_table(
+                local_store._client,
+                table_name=local_store.table_name,
+                enable_pitr=False,
+            )
             == "exists"
         )
 
