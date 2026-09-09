@@ -1,4 +1,4 @@
-"""Central settings for the TuneIn backend.
+"""Central settings for the TuneIn app.
 
 Reads `settings.yaml` from the repo root, applies environment-variable
 overrides, and exposes the configured database backend's session helpers.
@@ -18,7 +18,7 @@ The database modules (`backend.ingestion.simple_db` and
 `backend.persistence.database`) read their configuration from the environment
 at import time, so this module mirrors the resolved settings into the
 environment *before* those modules are imported. Always go through
-`backend.settings` (`session_scope`, `init_db`, `get_db`) instead of
+`settings` (`session_scope`, `init_db`, `get_db`) instead of
 importing the backend modules directly.
 """
 
@@ -36,7 +36,7 @@ try:
 except ImportError:  # pragma: no cover - PyYAML is a required dependency
     yaml = None  # type: ignore[assignment]
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = REPO_ROOT / "settings.yaml"
 
 DEFAULTS: Dict[str, Any] = {
@@ -171,7 +171,7 @@ def _apply_to_env() -> None:
     """Mirror the resolved database settings into the environment.
 
     The backend modules read INGESTION_DATABASE_URL / DATABASE_URL at import
-    time, so this runs at import of backend.settings — before those modules
+    time, so this runs at import of settings — before those modules
     are imported anywhere. Explicitly-set environment variables win
     (setdefault), preserving the legacy override behavior.
     """

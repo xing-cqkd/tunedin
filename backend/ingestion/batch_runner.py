@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
-from backend.settings import describe_database, get_auto_queue_episodes, init_db, session_scope
+from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 

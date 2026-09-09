@@ -9,7 +9,7 @@ from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
-from backend.settings import get_auto_queue_episodes, get_crawler_countries, session_scope
+from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 

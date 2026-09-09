@@ -240,7 +240,7 @@ class TestFeedIngestionModes:
     @pytest.mark.asyncio
     async def test_settings_database_selection(self):
         """Verify the settings dispatcher selects SimpleDB by default and sessions work."""
-        from backend import settings
+        import settings
 
         assert settings.get_database_backend() == "simple"
         assert "simple.db" in settings.describe_database()
@@ -252,7 +252,7 @@ class TestFeedIngestionModes:
 
     def test_settings_env_override(self, monkeypatch):
         """DATABASE_BACKEND env var overrides the settings.yaml value."""
-        from backend import settings
+        import settings
 
         monkeypatch.setenv("DATABASE_BACKEND", "app")
         assert settings.get_database_backend() == "app"
@@ -269,8 +269,8 @@ class TestSettingsYamlLoading:
 
     @staticmethod
     def _use_yaml(monkeypatch, tmp_path, text):
-        """Point backend.settings at a tmp settings.yaml and clear its cache."""
-        from backend import settings
+        """Point settings at a tmp settings.yaml and clear its cache."""
+        import settings
 
         yaml_file = tmp_path / "settings.yaml"
         yaml_file.write_text(text, encoding="utf-8")
@@ -338,7 +338,7 @@ class TestSettingsYamlLoading:
 
     def test_describe_database_prefers_legacy_env_override(self, monkeypatch):
         """INGESTION_DATABASE_URL is what simple_db actually uses; name it."""
-        from backend import settings
+        import settings
 
         monkeypatch.setenv(
             "INGESTION_DATABASE_URL", "sqlite+aiosqlite:////tmp/legacy.db"
@@ -347,7 +347,7 @@ class TestSettingsYamlLoading:
 
     def test_describe_database_displays_url_path_as_is(self, tmp_path, monkeypatch):
         """A simple.path that is already a URL must not be path-resolved."""
-        from backend import settings
+        import settings
 
         self._use_yaml(
             monkeypatch,
@@ -363,7 +363,7 @@ class TestSettingsYamlLoading:
         )
 
     def test_invalid_backend_error_names_env_source(self, monkeypatch):
-        from backend import settings
+        import settings
 
         monkeypatch.setenv("DATABASE_BACKEND", "bogus")
         with pytest.raises(ValueError, match="DATABASE_BACKEND environment variable"):
@@ -373,7 +373,7 @@ class TestSettingsYamlLoading:
         """The yaml simple.path is mirrored into INGESTION_DATABASE_URL (setdefault)."""
         import os
 
-        from backend import settings
+        import settings
 
         self._use_yaml(
             monkeypatch,

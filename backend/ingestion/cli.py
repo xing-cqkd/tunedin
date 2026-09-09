@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.service import FeedIngestionService
-from backend.settings import describe_database, get_crawler_countries, init_db, session_scope
+from settings import describe_database, get_crawler_countries, init_db, session_scope
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 

@@ -16,7 +16,7 @@ from backend.ingestion.task_queue import (
     get_queue_driver,
 )
 from backend.ingestion.service import FeedIngestionService, IngestionMode
-from backend.settings import (
+from settings import (
     describe_database,
     get_db,
     init_db,
