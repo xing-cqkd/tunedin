@@ -22,6 +22,7 @@ from moto import mock_aws
 
 from backend.migrate_data import SqlAlchemyBackend, migrate
 from backend.persistence.dynamodb import codec
+from backend.persistence.dynamodb import migrate_adapter as ma
 from backend.persistence.dynamodb.migrate_adapter import DynamoDBBackend
 from backend.persistence.dynamodb.table import DEFAULT_TABLE_NAME, ensure_table
 from backend.persistence.dynamodb.testing import AsyncBoto3Client
@@ -394,3 +395,61 @@ async def test_owned_client_entered_lazily_and_close_idempotent():
     await backend.close()
     await backend.close()  # idempotent
     assert backend._client is None
+
+
+def test_migration_table_spec_coverage():
+    # Explicit pin of the import-time coverage assertion: every SQL table
+    # must have both a write builder and a read spec, and nothing extra —
+    # so the next added model fails fast instead of breaking migration
+    # with a cryptic KeyError/ValueError mid-run.
+    assert set(ma._MIGRATION_TABLES) == set(ma._ITEM_BUILDERS) == set(ma._READ_SPECS)
+    backend = DynamoDBBackend(client=object())  # injected; never touched here
+    assert backend.table_names == list(ma._MIGRATION_TABLES)
+
+
+class _FlakyBatchClient:
+    """Fake DynamoDB client: batch_write_item returns UnprocessedItems
+    until `succeed_after` calls, then succeeds. No network."""
+
+    def __init__(self, succeed_after: int = 0):
+        self.calls = 0
+        self.succeed_after = succeed_after
+
+    async def batch_write_item(self, RequestItems):
+        self.calls += 1
+        if self.calls <= self.succeed_after:
+            return {"UnprocessedItems": RequestItems}
+        return {"UnprocessedItems": {}}
+
+
+async def test_batch_write_retries_unprocessed_items_with_backoff():
+    sleeps: List[float] = []
+
+    async def no_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    client = _FlakyBatchClient(succeed_after=2)
+    await ma._batch_write_chunk(
+        client, "ddb-table", "feeds", [{"pk": {"S": "x"}}], sleep=no_sleep
+    )
+    assert client.calls == 3
+    # Exponential backoff + jitter: [base, 2*base] then [2*base, 4*base].
+    assert len(sleeps) == 2
+    assert 0.1 <= sleeps[0] <= 0.2
+    assert 0.2 <= sleeps[1] <= 0.4
+
+
+async def test_batch_write_raises_after_max_attempts(monkeypatch):
+    monkeypatch.setattr(ma, "_BATCH_WRITE_MAX_ATTEMPTS", 3)
+
+    async def no_sleep(delay: float) -> None:
+        pass
+
+    client = _FlakyBatchClient(succeed_after=999)  # never succeeds
+    with pytest.raises(RuntimeError, match="feeds"):
+        await ma._batch_write_chunk(
+            client, "ddb-table", "feeds", [{"pk": {"S": "x"}}], sleep=no_sleep
+        )
+    # Bounded: exactly the cap, then a loud failure naming the table —
+    # no infinite hot loop against a throttled table.
+    assert client.calls == 3

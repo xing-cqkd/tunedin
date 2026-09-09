@@ -32,6 +32,8 @@ is a safe, documented choice for the bulk path.
 
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID
 
@@ -52,6 +54,53 @@ _TYPE_NAMES = {"#t": "type"}
 
 def _chunks(items: List[dict], size: int) -> List[List[dict]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# ---------------------------------------------------------------------------
+# BatchWriteItem retry policy for the migration bulk path.
+# ---------------------------------------------------------------------------
+
+# UnprocessedItems usually means throttling; retry with exponential
+# backoff + jitter, but fail loudly after a cap — spinning forever
+# against a hot table is worse than an aborted migration.
+_BATCH_WRITE_MAX_ATTEMPTS = 10
+_BATCH_WRITE_BASE_DELAY = 0.1  # seconds; doubles each attempt, plus jitter.
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff for a 1-based attempt number: base * 2^(n-1), plus jitter."""
+    delay = _BATCH_WRITE_BASE_DELAY * (2 ** (attempt - 1))
+    return delay + random.uniform(0, delay)
+
+
+async def _batch_write_chunk(
+    client: Any,
+    dynamodb_table: str,
+    table_name: str,
+    chunk: List[dict],
+    *,
+    sleep: Callable[..., Any] = asyncio.sleep,
+) -> None:
+    """Write one <=25-item chunk, retrying UnprocessedItems with backoff.
+
+    ``table_name`` is the migration (SQL) table name, used only for the
+    error message. Raises RuntimeError naming the table if items remain
+    unprocessed after ``_BATCH_WRITE_MAX_ATTEMPTS`` attempts. ``sleep`` is
+    injectable so tests can assert the backoff without waiting.
+    """
+    request_items = {dynamodb_table: [{"PutRequest": {"Item": i}} for i in chunk]}
+    for attempt in range(1, _BATCH_WRITE_MAX_ATTEMPTS + 1):
+        resp = await client.batch_write_item(RequestItems=request_items)
+        request_items = resp.get("UnprocessedItems", {})
+        if not request_items:
+            return
+        await sleep(_retry_delay(attempt))
+    leftover = sum(len(reqs) for reqs in request_items.values())
+    raise RuntimeError(
+        f"DynamoDB batch_write_item for migration table {table_name!r} still "
+        f"had {leftover} unprocessed item(s) after {_BATCH_WRITE_MAX_ATTEMPTS} "
+        "attempts; aborting instead of retrying forever"
+    )
 
 
 async def _scan_all(client: Any, table_name: str, **kwargs: Any) -> List[dict]:
@@ -281,6 +330,34 @@ _READ_SPECS: Dict[str, tuple] = {
 }
 
 
+# SQL table names in FK-safe parents-first order (identical to
+# SqlAlchemyBackend.table_names). Internal item types (guid markers, tag
+# claims) have no SQL table and are never listed, so they are never read
+# as migration rows.
+_MIGRATION_TABLES: List[str] = [t.name for t in Base.metadata.sorted_tables]
+
+
+# Fail fast at import if a model is added without migration coverage: the
+# write builders and read specs must cover exactly the SQL table set, or
+# the next added table breaks migration with a cryptic KeyError/ValueError
+# deep in a run instead of a clear import-time error.
+_coverage = {
+    "missing write builders": sorted(set(_MIGRATION_TABLES) - set(_ITEM_BUILDERS)),
+    "missing read specs": sorted(set(_MIGRATION_TABLES) - set(_READ_SPECS)),
+    "unknown write builders": sorted(set(_ITEM_BUILDERS) - set(_MIGRATION_TABLES)),
+    "unknown read specs": sorted(set(_READ_SPECS) - set(_MIGRATION_TABLES)),
+}
+_mismatches = {k: v for k, v in _coverage.items() if v}
+if _mismatches:
+    details = "; ".join(f"{k}={v}" for k, v in _mismatches.items())
+    raise AssertionError(
+        f"DynamoDB migration coverage mismatch: {details}. "
+        "Every table in Base.metadata needs both an _ITEM_BUILDERS entry "
+        "and a _READ_SPECS entry."
+    )
+del _coverage, _mismatches
+
+
 class DynamoDBBackend(Backend):
     """A :class:`backend.migrate_data.Backend` over the single-table layout."""
 
@@ -323,10 +400,7 @@ class DynamoDBBackend(Backend):
 
     @property
     def table_names(self) -> List[str]:
-        # Same FK-safe parents-first order as SqlAlchemyBackend; internal
-        # item types (guid markers, tag claims) have no SQL table and are
-        # never listed, so they are never read as migration rows.
-        return [t.name for t in Base.metadata.sorted_tables]
+        return list(_MIGRATION_TABLES)
 
     async def init(self) -> None:
         client = await self._ensure_client()
@@ -355,14 +429,11 @@ class DynamoDBBackend(Backend):
         items: List[dict] = []
         for row in rows:
             items.extend(_row_items(table_name, row))
-        # 25-item BatchWriteItem chunks; retry unprocessed items.
+        # 25-item BatchWriteItem chunks; unprocessed items are retried with
+        # exponential backoff + jitter, failing loudly after a cap
+        # (see _batch_write_chunk).
         for chunk in _chunks(items, 25):
-            request_items = {
-                self._table_name: [{"PutRequest": {"Item": item}} for item in chunk]
-            }
-            while request_items:
-                resp = await client.batch_write_item(RequestItems=request_items)
-                request_items = resp.get("UnprocessedItems", {})
+            await _batch_write_chunk(client, self._table_name, table_name, chunk)
         return len(rows)
 
     async def close(self) -> None:
