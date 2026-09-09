@@ -447,6 +447,13 @@ class _EpisodeRepository(EpisodeRepository):
         guarantee lives in :meth:`save_many`, which is what the sync
         pipeline uses; concurrent ``save()`` calls racing on the same
         guid are last-writer-wins.
+
+        Consistency: the old-guid lookup goes through :meth:`get_by_id`,
+        which reads gsi1 — eventually consistent on real AWS, so a read
+        immediately after a prior write can see stale data (e.g. miss an
+        episode that was just saved and skip the stale-marker cleanup).
+        The cleanup is self-healing: the next save sees the current row
+        and removes the stale marker then.
         """
         is_new = episode.episode_id is None
         codec.apply_defaults(episode)
@@ -554,6 +561,13 @@ class _EpisodeRepository(EpisodeRepository):
         marker belongs to the same episode, so this is an idempotent
         re-write rather than a duplicate. Also cleans up a stale marker
         when the episode's guid itself changed.
+
+        Consistency: the marker read is a main-table ``GetItem``
+        (strongly consistent), but the old-episode read goes through
+        :meth:`get_by_id`, which queries gsi1 — eventually consistent on
+        real AWS, so a read immediately after a prior write can see stale
+        data. A stale ``old`` only skips a stale-marker cleanup, which
+        the next save of the episode performs (self-healing).
         """
         resp = await self._c.get_item(
             TableName=self._t,
@@ -584,6 +598,12 @@ class _EpisodeRepository(EpisodeRepository):
         ``PutItem`` — last-writer-wins, same as the SQL read-modify-flush.
         Marking processed removes the item from the sparse gsi3 index in
         the same write; un-marking re-adds it.
+
+        Consistency: the episode is read through :meth:`get_by_id`,
+        which queries gsi1 — eventually consistent on real AWS, so a read
+        immediately after a prior write can see stale data. Rewriting a
+        slightly stale row is harmless (last-writer-wins, same as SQL);
+        the next read observes the latest write.
         """
         episode = await self.get_by_id(episode_id)
         if episode is None:
@@ -748,7 +768,19 @@ class _TagRepository(TagRepository):
         the winner's tag with bounded retry. At most one tag per
         (name, category) is ever visible — the DynamoDB analogue of the
         SQL unique constraint that backs this method.
+
+        Crash recovery: a claim item is never deleted on the happy path,
+        so a winner crash between the claim put and the tag put would
+        otherwise poison the natural key forever (every future call would
+        wait out the retry budget and raise). When the retry budget is
+        exhausted, the stale claim is deleted and the whole operation is
+        retried once — bounded, no infinite loop.
         """
+        return await self._get_or_create(name, category, recovered=False)
+
+    async def _get_or_create(
+        self, name: str, category: Optional[str], *, recovered: bool
+    ) -> models.Tag:
         existing = await self.get_by_name_category(name, category)
         if existing is not None:
             return existing
@@ -770,7 +802,20 @@ class _TagRepository(TagRepository):
                 ConditionExpression="attribute_not_exists(pk)",
             )
         except self._c.exceptions.ConditionalCheckFailedException:
-            return await self._read_claim_winner(claim_pk)
+            try:
+                return await self._read_claim_winner(claim_pk)
+            except RuntimeError:
+                if recovered:
+                    raise
+                # Stale claim: the winner crashed between its claim put
+                # and its tag put, so the claim can never resolve. Delete
+                # the poisoned claim and retry once (bounded).
+                await self._c.delete_item(
+                    TableName=self._t, Key=_key(claim_pk, keys.META)
+                )
+                return await self._get_or_create(
+                    name, category, recovered=True
+                )
         await self._c.put_item(TableName=self._t, Item=_tag_item(tag))
         return tag
 
@@ -1110,6 +1155,12 @@ class _TaskLogRepository(TaskLogRepository):
 
         Atomicity: single-entity read-modify-write via full-item
         ``PutItem`` — last-writer-wins, same as the SQL read-modify-flush.
+
+        Consistency: the read is a main-table ``GetItem`` (strongly
+        consistent by default), not a gsi1 query, so a read immediately
+        after a prior write sees the latest data — no read-after-write
+        staleness to self-heal here. Concurrent updates remain
+        last-writer-wins.
         """
         resp = await self._c.get_item(
             TableName=self._t, Key=_key(f"TASK#{task_log_id}", keys.META)

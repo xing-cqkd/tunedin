@@ -177,3 +177,32 @@ class TestTagClaim:
         finally:
             await winner
         assert tag.tag_id == tag_id
+
+    async def test_stale_claim_recovered(self, store):
+        # Simulate a winner crash: a claim item exists whose tag will
+        # never materialize. get_or_create must delete the stale claim
+        # and recover (once, bounded) instead of raising forever.
+        from backend.persistence.dynamodb import keys
+
+        dead_tag_id = uuid4()
+        claim_pk = keys.tag_keys(dead_tag_id, name="stale", category="topic")[
+            "gsi1pk"
+        ].replace("TAGNAME#", "TAGCLAIM#", 1)
+        await store._tags._c.put_item(
+            TableName=store.table_name,
+            Item={
+                "pk": {"S": claim_pk},
+                "sk": {"S": "META"},
+                "type": {"S": "tag_claim"},
+                "tag_id": {"S": str(dead_tag_id)},
+            },
+        )
+        tag = await store.tags.get_or_create("stale", "topic")
+        assert tag.name == "stale"
+        assert tag.category == "topic"
+        # Recovered with a fresh tag — not the dead claim's tag_id.
+        assert tag.tag_id != dead_tag_id
+        # The recovered state is stable: the natural key now resolves to
+        # the real tag.
+        again = await store.tags.get_or_create("stale", "topic")
+        assert again.tag_id == tag.tag_id
