@@ -19,7 +19,7 @@ NO commit. The store is the unit of work; callers commit explicitly via
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from uuid import UUID
 
 from sqlalchemy import and_, event, func, select
@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from backend.persistence import validation
 from backend.persistence.models import (
     Base,
     CuratedPlaylist,
@@ -55,6 +56,21 @@ from backend.persistence.repositories import (
 )
 
 SessionFactory = Callable[[], AsyncSession]
+
+
+def _guard_item_size(entity: Any) -> None:
+    """Enforce the shared 400 KiB per-item limit before a write (XIN-95).
+
+    Same guard and same :class:`ItemTooLargeError` as the DynamoDB backend
+    (which enforces it in ``codec.model_to_item``): an entity accepted here
+    is guaranteed to fit there, so a migration can never fail on item size.
+    """
+    pk_cols = list(entity.__table__.primary_key.columns)
+    pk = f"{pk_cols[0].name}={getattr(entity, pk_cols[0].name)}" if pk_cols else "?"
+    validation.check_item_size(
+        validation.entity_fields(entity),
+        what=f"{type(entity).__name__}({pk})",
+    )
 
 
 class _FeedRepository(FeedRepository):
@@ -109,6 +125,7 @@ class _FeedRepository(FeedRepository):
         return list(res.scalars().all())
 
     async def save(self, feed: Feed) -> Feed:
+        _guard_item_size(feed)
         self._session.add(feed)
         await self._session.flush()
         return feed
@@ -182,12 +199,14 @@ class _EpisodeRepository(EpisodeRepository):
         return list(res.scalars().all())
 
     async def save(self, episode: Episode) -> Episode:
+        _guard_item_size(episode)
         self._session.add(episode)
         await self._session.flush()
         return episode
 
     async def save_many(self, episodes: list[Episode]) -> list[Episode]:
         for episode in episodes:
+            _guard_item_size(episode)
             self._session.add(episode)
         await self._session.flush()
         return episodes
@@ -230,12 +249,14 @@ class _InsightRepository(InsightRepository):
         return list(res.scalars().all())
 
     async def save(self, insight: Insight) -> Insight:
+        _guard_item_size(insight)
         self._session.add(insight)
         await self._session.flush()
         return insight
 
     async def save_many(self, insights: list[Insight]) -> list[Insight]:
         for insight in insights:
+            _guard_item_size(insight)
             self._session.add(insight)
         await self._session.flush()
         return insights
@@ -261,6 +282,7 @@ class _TagRepository(TagRepository):
         if tag is not None:
             return tag
         tag = Tag(name=name, category=category)
+        _guard_item_size(tag)
         self._session.add(tag)
         # The uq_tag_name_category constraint is the concurrency backstop: a
         # concurrent insert raises IntegrityError on flush, per the ABC
@@ -308,6 +330,7 @@ class _UserRepository(UserRepository):
         return res.scalar_one_or_none()
 
     async def save(self, user: User) -> User:
+        _guard_item_size(user)
         self._session.add(user)
         await self._session.flush()
         return user
@@ -334,6 +357,7 @@ class _PlaylistRepository(PlaylistRepository):
         return res.scalar_one_or_none()
 
     async def save(self, playlist: CuratedPlaylist) -> CuratedPlaylist:
+        _guard_item_size(playlist)
         self._session.add(playlist)
         await self._session.flush()
         return playlist
@@ -393,6 +417,7 @@ class _ProgressRepository(ProgressRepository):
         # raise IntegrityError when a second instance with the same
         # (user_id, episode_id) is saved in one unit of work, but the ABC
         # contract for save() is "upsert by primary key".
+        _guard_item_size(progress)
         merged = await self._session.merge(progress)
         await self._session.flush()
         return merged
@@ -403,6 +428,7 @@ class _TaskLogRepository(TaskLogRepository):
         self._session = session
 
     async def save(self, task_log: TaskLog) -> TaskLog:
+        _guard_item_size(task_log)
         self._session.add(task_log)
         await self._session.flush()
         return task_log

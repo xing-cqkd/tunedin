@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 from uuid import UUID
 
 from backend.migrate_data import Backend
-from backend.persistence import models
+from backend.persistence import models, validation
 from backend.persistence.dynamodb import codec, keys
 from backend.persistence.dynamodb.table import DEFAULT_TABLE_NAME, ensure_table
 from backend.persistence.models.base import Base
@@ -428,6 +428,11 @@ class DynamoDBBackend(Backend):
         client = await self._ensure_client()
         items: List[dict] = []
         for row in rows:
+            # Same shared 400 KiB guard as the repository write paths: a row
+            # the source accepted is re-checked here so an oversized row
+            # fails the migration loudly instead of tripping DynamoDB's own
+            # (less descriptive) service-side limit mid-backfill.
+            validation.check_item_size(row, what=f"migration row {table_name}")
             items.extend(_row_items(table_name, row))
         # 25-item BatchWriteItem chunks; unprocessed items are retried with
         # exponential backoff + jitter, failing loudly after a cap
