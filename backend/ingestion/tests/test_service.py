@@ -312,7 +312,7 @@ class TestSettingsYamlLoading:
         # Built-in default countries still apply when the key is absent.
         assert settings.get_crawler_countries() == ["us", "gb", "ca", "au", "de", "fr"]
 
-    @pytest.mark.parametrize("bad", [-1, "many", 2.5, True, None, ""])
+    @pytest.mark.parametrize("bad", [-1, "many", 2.5, True, None, "", "--5", "5.5"])
     def test_auto_queue_episodes_rejects_bad_values(self, tmp_path, monkeypatch, bad):
         import yaml as pyyaml
 
@@ -344,6 +344,23 @@ class TestSettingsYamlLoading:
             "INGESTION_DATABASE_URL", "sqlite+aiosqlite:////tmp/legacy.db"
         )
         assert "legacy.db" in settings.describe_database()
+
+    def test_describe_database_displays_url_path_as_is(self, tmp_path, monkeypatch):
+        """A simple.path that is already a URL must not be path-resolved."""
+        from backend import settings
+
+        self._use_yaml(
+            monkeypatch,
+            tmp_path,
+            "database:\n"
+            "  backend: simple\n"
+            "  simple:\n"
+            "    path: sqlite+aiosqlite:////tmp/remote.db\n",
+        )
+        monkeypatch.delenv("INGESTION_DATABASE_URL", raising=False)
+        assert settings.describe_database() == (
+            "SimpleDB (SQLite): sqlite+aiosqlite:////tmp/remote.db"
+        )
 
     def test_invalid_backend_error_names_env_source(self, monkeypatch):
         from backend import settings

@@ -146,8 +146,11 @@ def get_auto_queue_episodes() -> int:
     value: int | None = None
     if isinstance(raw, int) and not isinstance(raw, bool):
         value = raw
-    elif isinstance(raw, str) and raw.strip().lstrip("+-").isdigit():
-        value = int(raw.strip())
+    elif isinstance(raw, str):
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            value = None
     if value is None or value < 0:
         raise ValueError(
             "Invalid ingestion.auto_queue_episodes in settings.yaml: "
@@ -193,6 +196,10 @@ def describe_database() -> str:
         env_url = os.environ.get("INGESTION_DATABASE_URL")
         if env_url and env_url != mirrored:
             return f"SimpleDB (SQLite): {env_url}"
+        if "://" in path:
+            # Already a URL: display it as-is instead of resolving it as a
+            # filesystem path.
+            return f"SimpleDB (SQLite): {path}"
         return f"SimpleDB (SQLite): {(REPO_ROOT / path).resolve()}"
     url = os.environ.get("DATABASE_URL", str(get_settings()["database"]["app"]["url"]))
     # Mask any password embedded in the URL.

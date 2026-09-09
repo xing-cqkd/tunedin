@@ -1,4 +1,4 @@
-from backend.ingestion.crawler import DEFAULT_COUNTRIES, DEFAULT_TOPICS, PodcastCrawler
+from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import (
     FeedParseResult,
@@ -30,7 +30,6 @@ __all__ = [
     "ITunesSearchClient",
     "PodcastCrawler",
     "DEFAULT_TOPICS",
-    "DEFAULT_COUNTRIES",
     "ParsedFeedMetadata",
     "ParsedEpisode",
     "FeedParseResult",
