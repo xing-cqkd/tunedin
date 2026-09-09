@@ -239,9 +239,27 @@ class FeedIngestionService:
             await db.refresh(feed)
             return feed, []
 
-        # 5. Insert new Episode records (ready for LLM ingestion)
+        # 5. Sort candidate episodes chronologically from earliest to latest
+        def _chronological_sort_key(ep: ParsedEpisode) -> tuple:
+            dt = ep.published_at
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+            else:
+                dt = datetime.min.replace(tzinfo=timezone.utc)
+            ep_num = ep.episode_number if ep.episode_number is not None else 0
+            return (dt, ep_num)
+
+        if all(ep.published_at is None for ep in parse_result.episodes):
+            sorted_episodes = list(reversed(parse_result.episodes))
+        else:
+            sorted_episodes = sorted(parse_result.episodes, key=_chronological_sort_key)
+
+        # Insert new Episode records (ready for LLM ingestion)
         new_episodes: List[Episode] = []
-        for ep_data in parse_result.episodes:
+        for ep_data in sorted_episodes:
             ep = Episode(
                 feed_id=feed.feed_id,
                 guid=ep_data.guid,

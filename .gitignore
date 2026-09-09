@@ -17,6 +17,8 @@ env/
 # Agent and tracking directories
 .agent/
 **/.agent/
+.local_agents/
+**/.local_agents/
 
 # Database files
 *.db
