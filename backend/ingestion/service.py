@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, Podcast
 from backend.ingestion.parser import PodcastFeedParser
+from backend.ingestion.task_queue.base import TaskQueueDriver
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
@@ -34,9 +35,11 @@ class FeedIngestionService:
         self,
         parser: Optional[PodcastFeedParser] = None,
         itunes_client: Optional[ITunesSearchClient] = None,
+        queue_driver: Optional[TaskQueueDriver] = None,
     ):
         self.parser = parser or PodcastFeedParser()
         self.itunes_client = itunes_client or ITunesSearchClient()
+        self.queue_driver = queue_driver
 
     # -------------------------------------------------------------------------
     # Mode 1: Show Discovery & Registration ("Find All Podcasts & Save Immediately")
@@ -145,6 +148,7 @@ class FeedIngestionService:
         db: AsyncSession,
         feed_or_id_or_url: Union[Feed, uuid.UUID, str],
         client: Optional[httpx.AsyncClient] = None,
+        auto_queue_episodes: int = 0,
     ) -> Tuple[Feed, List[Episode]]:
         """
         Given a Feed entity, feed_id, or rss_url:
@@ -286,6 +290,22 @@ class FeedIngestionService:
         for ep in new_episodes:
             await db.refresh(ep)
 
+        # 6. Optionally enqueue background tasks for downstream AI insight extraction
+        if self.queue_driver and auto_queue_episodes > 0 and new_episodes:
+            to_queue = new_episodes[-auto_queue_episodes:]
+            for ep in to_queue:
+                payload = {
+                    "episode_id": str(ep.episode_id),
+                    "feed_id": str(feed.feed_id),
+                    "title": ep.title,
+                    "audio_url": ep.audio_url,
+                    "transcript_url": ep.transcript_url,
+                }
+                await self.queue_driver.enqueue(
+                    task_type="PROCESS_EPISODE",
+                    payload=payload,
+                )
+
         return feed, new_episodes
 
     async def ingest_feed(
@@ -293,11 +313,17 @@ class FeedIngestionService:
         db: AsyncSession,
         rss_url: str,
         client: Optional[httpx.AsyncClient] = None,
+        auto_queue_episodes: int = 0,
     ) -> Tuple[Feed, List[Episode]]:
         """
         Convenience / backward compatible method to sync feed & episodes by RSS URL.
         """
-        return await self.sync_podcast_episodes(db, feed_or_id_or_url=rss_url, client=client)
+        return await self.sync_podcast_episodes(
+            db,
+            feed_or_id_or_url=rss_url,
+            client=client,
+            auto_queue_episodes=auto_queue_episodes,
+        )
 
     # -------------------------------------------------------------------------
     # Mode 3: Combined Discovery & Ingestion ("Register & Sync Immediately")

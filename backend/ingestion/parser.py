@@ -628,8 +628,13 @@ class PodcastFeedParser:
         Asynchronously fetches an RSS feed via HTTP (supporting ETag & Last-Modified caching)
         and parses new episodes.
         """
+        user_agent = (
+            client.headers.get("User-Agent")
+            if client and "User-Agent" in client.headers
+            else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 (compatible; TunedIn/1.0)"
+        )
         headers = {
-            "User-Agent": "TunedIn/1.0 (+https://github.com/tunedin)",
+            "User-Agent": user_agent,
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         }
         if etag:
