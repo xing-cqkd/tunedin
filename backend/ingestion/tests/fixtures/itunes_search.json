@@ -1,0 +1,65 @@
+{
+  "resultCount": 3,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionId": 1545953110,
+      "trackId": 1545953110,
+      "artistName": "Scicomm Media",
+      "collectionName": "Huberman Lab",
+      "trackName": "Huberman Lab",
+      "collectionCensoredName": "Huberman Lab",
+      "trackCensoredName": "Huberman Lab",
+      "collectionViewUrl": "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?uo=4",
+      "feedUrl": "https://feeds.megaphone.fm/hubermanlab",
+      "trackViewUrl": "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?uo=4",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts116/v4/huberman_100x100.jpg",
+      "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts116/v4/huberman_600x600.jpg",
+      "releaseDate": "2026-02-09T08:00:00Z",
+      "country": "USA",
+      "primaryGenreName": "Science",
+      "genres": [
+        "Science",
+        "Podcasts",
+        "Health & Fitness"
+      ],
+      "trackCount": 210
+    },
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionId": 1600000001,
+      "trackId": 1600000001,
+      "artistName": "Lex Fridman",
+      "collectionName": "Lex Fridman Podcast",
+      "trackName": "Lex Fridman Podcast",
+      "collectionViewUrl": "https://podcasts.apple.com/us/podcast/lex-fridman-podcast/id1600000001?uo=4",
+      "feedUrl": "https://lexfridman.com/feed/podcast/",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts/lex_100x100.jpg",
+      "artworkUrl600": "https://is1-ssl.mzstatic.com/image/thumb/Podcasts/lex_600x600.jpg",
+      "releaseDate": "2026-02-05T12:00:00Z",
+      "country": "USA",
+      "primaryGenreName": "Technology",
+      "genres": [
+        "Technology",
+        "Science"
+      ],
+      "trackCount": 420
+    },
+    {
+      "wrapperType": "track",
+      "kind": "podcast",
+      "collectionId": 1999999999,
+      "trackId": 1999999999,
+      "artistName": "Exclusive No Feed Host",
+      "collectionName": "Exclusive Show",
+      "trackName": "Exclusive Show",
+      "collectionViewUrl": "https://podcasts.apple.com/us/podcast/exclusive/id1999999999",
+      "artworkUrl100": "https://example.com/art100.jpg",
+      "primaryGenreName": "Society",
+      "genres": ["Society"],
+      "trackCount": 10
+    }
+  ]
+}
