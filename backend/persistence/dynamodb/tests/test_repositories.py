@@ -11,7 +11,6 @@ from uuid import uuid4
 import boto3
 import pytest
 from moto import mock_aws
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.persistence.dynamodb import keys
 from backend.persistence.dynamodb.repositories import (
@@ -21,9 +20,8 @@ from backend.persistence.dynamodb.repositories import (
 from backend.persistence.dynamodb.store import DynamoDBStore
 from backend.persistence.dynamodb.table import ensure_table
 from backend.persistence.dynamodb.testing import AsyncBoto3Client
-from backend.persistence.models import Base, CuratedPlaylist, Episode, Feed, User
+from backend.persistence.models import CuratedPlaylist, Episode, Feed, User
 from backend.persistence.repositories import MissingParentError, SlugConflictError
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 
 @pytest.fixture()
@@ -547,9 +545,10 @@ class TestAddEpisodeFkParity:
 
     ``add_episode`` with a nonexistent playlist or episode raises
     ``MissingParentError`` on ALL backends (SQLAlchemy maps the FK
-    ``IntegrityError``; DynamoDB checks parent existence before writing),
-    so callers catch one type regardless of backend. No orphaned link is
-    created on either backend.
+    ``IntegrityError`` — covered in
+    ``backend/persistence/tests/test_sqlalchemy_store.py``; DynamoDB
+    checks parent existence before writing), so callers catch one type
+    regardless of backend. No orphaned link is created on either backend.
     """
 
     async def test_dynamodb_add_episode_without_parents_raises(self, store):
@@ -590,25 +589,6 @@ class TestAddEpisodeFkParity:
         )
         with pytest.raises(MissingParentError):
             await store.playlists.add_episode(uuid4(), ep.episode_id, 0)
-
-    async def test_sql_add_episode_without_parents_raises_missing_parent(
-        self, tmp_path
-    ):
-        # Production SQL wiring (SQLAlchemyStore.from_url enables the
-        # SQLite foreign-key pragma, mirroring backend/persistence/database.py).
-        url = f"sqlite+aiosqlite:///{tmp_path}/fk_pin.db"
-        engine = create_async_engine(url, echo=False)
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        await engine.dispose()
-        sql = SQLAlchemyStore.from_url(url)
-        try:
-            with pytest.raises(MissingParentError):
-                await sql.playlists.add_episode(uuid4(), uuid4(), 0)
-                await sql.commit()
-        finally:
-            await sql.rollback()
-            await sql.close()
 
 
 class TestSaveManyOpChunks:
