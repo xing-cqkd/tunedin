@@ -155,11 +155,7 @@ def _rss_response(
     body = build_rss(playlist, entries, page_url=page_url, feed_url=feed_url)
     etag = '"' + hashlib.sha256(body).hexdigest() + '"'
 
-    instants = [ensure_aware(e.added_at) for e in entries if e.added_at]
-    created = ensure_aware(playlist.created_at)
-    if created is not None:
-        instants.append(created)
-    last_modified = max(instants) if instants else datetime.now().astimezone()
+    last_modified = playlist_last_modified(playlist, entries)
 
     # Unlisted (token-gated) feeds must not be stored by shared caches: a
     # CDN that drops the query string from its cache key could otherwise
@@ -206,6 +202,23 @@ def _parse_if_none_match(value: str) -> set[str]:
 
 def _base(request: Request) -> str:
     return str(request.base_url).rstrip("/")
+
+
+def playlist_last_modified(
+    playlist: CuratedPlaylist, entries: list
+) -> datetime:
+    """Newest content instant for a playlist.
+
+    Drives ``Last-Modified`` / ``last_modified`` on both the RSS feed
+    (XIN-98) and the developer polling contract (XIN-104) so the two
+    surfaces agree on what "changed" means: the newest episode
+    added-to-playlist date, falling back to playlist creation.
+    """
+    instants = [ensure_aware(e.added_at) for e in entries if e.added_at]
+    created = ensure_aware(playlist.created_at)
+    if created is not None:
+        instants.append(created)
+    return max(instants) if instants else datetime.now().astimezone()
 
 
 @router.get("/f/{slug}/feed.xml")
