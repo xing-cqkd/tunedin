@@ -16,97 +16,21 @@ from datetime import datetime, timezone
 from email.utils import format_datetime
 from uuid import uuid4
 
-import boto3
-import pytest
-from fastapi.testclient import TestClient
-from moto import mock_aws
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
+from backend.api.rss import (
+    ATOM_NS,
+    ITUNES_NS,
+    TUNEDIN_NS,
+    build_rss,
+    ensure_aware,
+    rfc2822,
 )
-
-from backend.api import create_app
-from backend.api.rss import ITUNES_NS, TUNEDIN_NS, build_rss, ensure_aware, rfc2822
-from backend.persistence.dynamodb.store import DynamoDBStore
-from backend.persistence.dynamodb.table import ensure_table
-from backend.persistence.dynamodb.testing import AsyncBoto3Client
 from backend.persistence.repositories import PlaylistEpisodeEntry
 from backend.persistence.models import (
-    Base,
     CuratedPlaylist,
     Episode,
     Feed,
     User,
 )
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
-
-
-# ---------------------------------------------------------------------------
-# Backend contexts (mirrors backend/persistence/tests/test_repository_conformance.py)
-# ---------------------------------------------------------------------------
-
-
-class _SqliteBackend:
-    async def setup(self) -> None:
-        self._engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        self._factory = async_sessionmaker(
-            bind=self._engine, class_=AsyncSession, expire_on_commit=False
-        )
-
-    def store_factory(self):
-        return lambda: SQLAlchemyStore(self._factory)
-
-    async def teardown(self) -> None:
-        await self._engine.dispose()
-
-
-class _DynamoDBBackend:
-    async def setup(self) -> None:
-        self._mock = mock_aws()
-        self._mock.start()
-        sync = boto3.client(
-            "dynamodb",
-            region_name="us-east-1",
-            aws_access_key_id="testing",
-            aws_secret_access_key="testing",
-        )
-        self._client = AsyncBoto3Client(sync)
-        self._table_name = f"api-feeds-{uuid4().hex}"
-        await ensure_table(self._client, table_name=self._table_name)
-
-    def store_factory(self):
-        return lambda: DynamoDBStore(
-            client=self._client, table_name=self._table_name
-        )
-
-    async def teardown(self) -> None:
-        await self._client.close()
-        self._mock.stop()
-
-
-_BACKENDS = {"sqlalchemy": _SqliteBackend, "dynamodb": _DynamoDBBackend}
-
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-@pytest.fixture(params=sorted(_BACKENDS))
-def api_client(request):
-    """A TestClient with a seeded, published playlist; yields (client, seed)."""
-    backend = _BACKENDS[request.param]()
-    _run(backend.setup())
-    try:
-        factory = backend.store_factory()
-        seed = _run(_seed(factory))
-        app = create_app(store_factory=factory)
-        with TestClient(app) as client:
-            yield client, seed
-    finally:
-        _run(backend.teardown())
 
 
 async def _seed(factory) -> dict:
@@ -299,7 +223,7 @@ def test_unlisted_token_gating(api_client):
 def test_public_feed_needs_no_token(api_client):
     client, seed = api_client
     pl = seed["playlist"]
-    _run(_make_public(client, seed))
+    asyncio.run(_make_public(client, seed))
     resp = client.get(f"/f/{pl.slug}/feed.xml")
     assert resp.status_code == 200
 
@@ -321,7 +245,7 @@ def test_rotated_token_invalidates_old(api_client):
         async with factory() as store:
             return await store.playlists.rotate_token(pl.playlist_id)
 
-    new_token = _run(rotate())
+    new_token = asyncio.run(rotate())
     assert new_token != old_token
 
     assert client.get(f"/f/{pl.slug}/feed.xml?t={old_token}").status_code == 410
@@ -377,7 +301,7 @@ def test_cache_control_privacy_for_unlisted_feeds(api_client):
     assert "max-age=900" in cc
 
     # Public feeds stay publicly cacheable.
-    _run(_make_public(client, seed))
+    asyncio.run(_make_public(client, seed))
     public = _rss(client, pl.slug)
     cc = public.headers["cache-control"]
     assert cc.split(",")[0].strip() == "public"
@@ -444,7 +368,7 @@ def test_html_stub_cache_control_scoping(api_client):
     assert "max-age=900" in cc
 
     # Public stubs stay publicly cacheable.
-    _run(_make_public(client, seed))
+    asyncio.run(_make_public(client, seed))
     public = _browser_page(client, pl.slug)
     assert public.status_code == 200
     cc = public.headers["cache-control"]
@@ -507,9 +431,245 @@ def test_html_stub_autodiscovery_token(api_client):
     assert f"?t={pl.token}" in alternate_href(unlisted)
 
     # Public: no token is needed, so the bare URL stays clean.
-    _run(_make_public(client, seed))
+    asyncio.run(_make_public(client, seed))
     public = _browser_page(client, pl.slug)
     assert public.status_code == 200
     href = alternate_href(public)
     assert "?t=" not in href
     assert href.endswith(f"/f/{pl.slug}/feed.xml")
+
+
+# ---------------------------------------------------------------------------
+# XIN-116: cache-poisoning and conditional-request correctness
+# ---------------------------------------------------------------------------
+
+
+def test_error_responses_are_no_store(api_client):
+    """404/410 are heuristically cacheable — never let a shared cache keep
+    one across a publish-state transition (e.g. unlisted -> public)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    browser_ua = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+
+    assert (
+        client.get("/f/no-such-slug/feed.xml").headers["cache-control"]
+        == "no-store"
+    )
+    assert (
+        client.get("/f/no-such-slug", headers=browser_ua).headers[
+            "cache-control"
+        ]
+        == "no-store"
+    )
+    revoked = client.get(f"/f/{pl.slug}/feed.xml?t=wrong-token")
+    assert revoked.status_code == 410
+    assert revoked.headers["cache-control"] == "no-store"
+
+
+def test_feed_page_vary_header(api_client):
+    """The content-negotiated /f/<slug> varies on Accept + User-Agent —
+    on the RSS branch, the HTML branch, and the 304s. /feed.xml is not
+    negotiated and needs no Vary."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/f/{pl.slug}?t={pl.token}"
+
+    rss = client.get(url, headers={"Accept": "application/rss+xml"})
+    assert rss.status_code == 200
+    assert rss.headers["vary"] == "Accept, User-Agent"
+
+    html_resp = client.get(
+        url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+    )
+    assert html_resp.status_code == 200
+    assert html_resp.headers["vary"] == "Accept, User-Agent"
+
+    not_modified = client.get(
+        url,
+        headers={
+            "Accept": "application/rss+xml",
+            "If-None-Match": rss.headers["etag"],
+        },
+    )
+    assert not_modified.status_code == 304
+    assert not_modified.headers["vary"] == "Accept, User-Agent"
+
+    assert "vary" not in client.get(f"/f/{pl.slug}/feed.xml?t={pl.token}").headers
+
+
+def test_ims_ignored_when_inm_present(api_client):
+    """RFC 9110 13.1.4: If-Modified-Since MUST be ignored when
+    If-None-Match is present but matches nothing."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/f/{pl.slug}/feed.xml?t={pl.token}"
+    resp = client.get(
+        url,
+        headers={
+            "If-None-Match": '"no-such-etag"',
+            "If-Modified-Since": "Wed, 01 Jan 2030 00:00:00 GMT",
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_malformed_ims_is_served(api_client):
+    """A malformed If-Modified-Since is ignored; the feed is served 200."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    resp = client.get(
+        f"/f/{pl.slug}/feed.xml?t={pl.token}",
+        headers={"If-Modified-Since": "not-a-date"},
+    )
+    assert resp.status_code == 200
+
+
+def test_if_none_match_star_and_multi_value(api_client):
+    """If-None-Match: * always 304s; multi-value headers match via the
+    shared parse_if_none_match parser."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/f/{pl.slug}/feed.xml?t={pl.token}"
+    etag = client.get(url).headers["etag"]
+
+    assert client.get(url, headers={"If-None-Match": "*"}).status_code == 304
+    multi = client.get(
+        url, headers={"If-None-Match": f'"aaa", {etag}, "bbb"'}
+    )
+    assert multi.status_code == 304
+    # No tag matches -> serve.
+    assert (
+        client.get(url, headers={"If-None-Match": '"aaa", "bbb"'}).status_code
+        == 200
+    )
+
+
+def test_feed_page_rss_branch_cache_scope(api_client):
+    """The negotiated RSS branch applies the same private/public scoping
+    as /feed.xml (unlisted feeds must never sit in a shared cache)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/f/{pl.slug}?t={pl.token}"
+    headers = {"Accept": "application/rss+xml"}
+
+    unlisted = client.get(url, headers=headers)
+    assert unlisted.headers["cache-control"].split(",")[0].strip() == "private"
+
+    asyncio.run(_make_public(client, seed))
+    public = client.get(f"/f/{pl.slug}", headers=headers)
+    assert public.status_code == 200
+    cc = public.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "public"
+    assert "private" not in cc
+
+
+# ---------------------------------------------------------------------------
+# XIN-117: token auth robustness
+# ---------------------------------------------------------------------------
+
+
+def test_non_ascii_token_returns_410_not_500(api_client):
+    """A non-ASCII ?t= token must 410 (revoked), never 500: any crawler
+    can trigger the compare_digest TypeError this guards against."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    for bad in ("🔑-token", "tökén", "%ff"):
+        resp = client.get(f"/f/{pl.slug}/feed.xml", params={"t": bad})
+        assert resp.status_code == 410
+        assert "revoked by the curator" in resp.text
+    # The negotiated page 410s too.
+    resp = client.get(
+        f"/f/{pl.slug}",
+        params={"t": "🔑"},
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"},
+    )
+    assert resp.status_code == 410
+
+
+def test_unlisted_rss_links_carry_token(api_client):
+    """Unlisted feeds: the channel <link>, item links, and the
+    <atom:link rel="self"> all carry ?t= so subscribers clicking through
+    in a podcatcher don't land on a 410. Public feeds stay untokenized."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    ns = {"atom": ATOM_NS}
+
+    root = _parse(_rss(client, pl.slug, token=pl.token).content)
+    channel = root.find("channel")
+    assert f"?t={pl.token}" in channel.find("link").text
+    items = channel.findall("item")
+    assert len(items) == 2
+    assert all(f"?t={pl.token}" in i.find("link").text for i in items)
+    self_link = channel.find("atom:link", ns)
+    assert self_link is not None
+    assert self_link.attrib["rel"] == "self"
+    assert f"?t={pl.token}" in self_link.attrib["href"]
+    assert self_link.attrib["href"].endswith(
+        f"/f/{pl.slug}/feed.xml?t={pl.token}"
+    )
+
+    # The negotiated /f/<slug> RSS branch tokenizes too.
+    negotiated = client.get(
+        f"/f/{pl.slug}?t={pl.token}",
+        headers={"Accept": "application/rss+xml"},
+    )
+    assert f"?t={pl.token}" in _parse(negotiated.content).find(
+        "channel"
+    ).find("link").text
+
+    # Public feeds: no token anywhere.
+    asyncio.run(_make_public(client, seed))
+    root = _parse(_rss(client, pl.slug).content)
+    channel = root.find("channel")
+    assert "?t=" not in channel.find("link").text
+    assert "?t=" not in channel.find("atom:link", ns).attrib["href"]
+
+
+# ---------------------------------------------------------------------------
+# XIN-118: coverage gaps
+# ---------------------------------------------------------------------------
+
+
+def test_itunes_explicit_none_means_no():
+    """explicit=None (unknown) renders itunes:explicit "no" — the
+    documented fallback; the seed only covers True/False."""
+    episode = Episode(
+        feed_id=uuid4(),
+        title="Mystery Ep",
+        audio_url="https://example.com/mystery.mp3",
+        explicit=None,
+    )
+    playlist = CuratedPlaylist(user_id=uuid4(), title="T")
+    entry = PlaylistEpisodeEntry(
+        episode=episode,
+        position=0,
+        added_at=datetime(2021, 1, 1, tzinfo=timezone.utc),
+    )
+    body = build_rss(
+        playlist,
+        [entry],
+        page_url="http://testserver/f/s",
+        feed_url="http://testserver/f/s/feed.xml",
+    )
+    ns = {"itunes": ITUNES_NS}
+    channel = _parse(body).find("channel")
+    assert channel.find("itunes:explicit", ns).text == "no"
+    assert channel.findall("item")[0].find("itunes:explicit", ns).text == "no"
+
+
+def test_public_feed_endpoints_share_rate_limiter(api_client):
+    """XIN-118 (Chester's call): the public /f/<slug> endpoints are covered
+    by the same per-IP rate limiter as the developer API."""
+    from backend.api.developer import RateLimiter
+
+    client, seed = api_client
+    pl = seed["playlist"]
+    client.app.state.rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    headers = {"Accept": "application/rss+xml"}
+    url = f"/f/{pl.slug}/feed.xml?t={pl.token}"
+    assert client.get(url, headers=headers).status_code == 200
+    limited = client.get(url, headers=headers)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == str(
+        limited.json()["detail"]["retry_after"]
+    )

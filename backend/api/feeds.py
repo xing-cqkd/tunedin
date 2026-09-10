@@ -10,21 +10,30 @@ Auth model (from the XIN-97 publish state):
   * ``visibility='unlisted'`` (default) — requires ``?t=<token>`` matching
     the playlist token (constant-time compare). A missing, wrong, or
     rotated token returns HTTP 410 with the friendly "revoked by the
-    curator" page — never a bare 404.
+    curator" page — never a bare 404. Non-ASCII ``?t=`` values can never
+    match, so they 410 too (never 500).
   * Unknown slug (or a playlist that was never published and therefore has
     no slug) — HTTP 404.
 
 Caching: strong ETag over the rendered feed bytes plus ``Last-Modified``
 from the newest playlist content; ``If-None-Match`` / ``If-Modified-Since``
-yield 304. ``Cache-Control: public, max-age=900`` for public feeds keeps
+yield 304 (``If-None-Match`` wins when both are present, per RFC 9110
+13.1.4). ``Cache-Control: public, max-age=900`` for public feeds keeps
 CDN caches at or under the 15-minute polling contract. Unlisted
 (token-gated) feeds emit ``Cache-Control: private, max-age=900`` instead:
 a CDN that drops the query string from its cache key must never serve a
 cached 200 to a missing/invalid-token request (which must be a 410), so
-unlisted responses are never stored in shared caches. The HTML landing
-page on ``/f/<slug>`` applies the same Cache-Control scoping, and for
-unlisted playlists its autodiscovery/subscribe link carries the token
-(``?t=<token>``) so the page itself is usable without re-authenticating.
+unlisted responses are never stored in shared caches. The content-
+negotiated ``/f/<slug>`` also emits ``Vary: Accept, User-Agent`` (on 200s
+and 304s) so a shared cache keyed on URL alone can't serve cached HTML to
+podcatchers or cached RSS to browsers; ``/f/<slug>/feed.xml`` is not
+negotiated and needs no ``Vary``. The 404/410 error responses are
+``Cache-Control: no-store`` — they are heuristically cacheable (RFC 9111
+4.2.2), and a poisoned 410 could survive a publish-state transition
+(e.g. unlisted -> public). The HTML landing page on ``/f/<slug>`` applies
+the same Cache-Control scoping, and for unlisted playlists its
+autodiscovery/subscribe link carries the token (``?t=<token>``) so the
+page itself is usable without re-authenticating.
 """
 
 from __future__ import annotations
@@ -34,12 +43,12 @@ import hmac
 import html
 import re
 from datetime import datetime
-from email.utils import format_datetime, parsedate_to_datetime
+from email.utils import format_datetime
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from backend.api.rss import build_rss, ensure_aware, rfc2822
-from backend.api._etag import parse_if_none_match
+from backend.api._etag import check_conditional
 from backend.persistence.models import CuratedPlaylist
 from backend.persistence.repositories import Store
 
@@ -117,30 +126,60 @@ def _html_stub(*, title: str, feed_url: str) -> str:
     )
 
 
+def _token_matches(provided: str | None, expected: str | None) -> bool:
+    """Constant-time token compare that never raises on exotic input.
+
+    ``hmac.compare_digest`` on ``str`` requires ASCII-only input and raises
+    ``TypeError`` otherwise; a non-ASCII ``?t=`` query token must be a 410
+    (revoked), not a 500 — any crawler can trigger it.
+    """
+    if not provided or not expected:
+        return False
+    try:
+        return hmac.compare_digest(
+            provided.encode("ascii"), expected.encode("ascii")
+        )
+    except (TypeError, UnicodeEncodeError):
+        return False
+
+
+def _cache_scope(visibility: str) -> str:
+    """Shared-cache scope for responses about a playlist.
+
+    Unlisted (token-gated) responses must be ``private``: a CDN that drops
+    the query string from its cache key must never serve a cached 200 to
+    an invalid-token request (which must be a 410).
+    """
+    return "public" if visibility == "public" else "private"
+
+
 async def _resolve_playlist(
     store: Store, slug: str, token: str | None
 ) -> CuratedPlaylist | Response:
-    """Return the playlist, or an error Response (404 / 410)."""
+    """Return the playlist, or an error Response (404 / 410).
+
+    Error responses are ``Cache-Control: no-store``: 404/410 are
+    heuristically cacheable (RFC 9111 4.2.2), and a poisoned error could
+    otherwise survive a publish-state transition (unlisted -> public).
+    """
     playlist = await store.playlists.get_by_slug(slug)
     if playlist is None or not playlist.slug:
         return Response(
             content=_not_found_html(slug),
             status_code=404,
             media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
         )
     if playlist.visibility == "public":
         return playlist
     # Unlisted: the token URL is the only auth. Constant-time compare so
     # token validity isn't oracle-able byte-by-byte.
-    if (
-        not token
-        or not playlist.token
-        or not hmac.compare_digest(token, playlist.token)
-    ):
+    if not _token_matches(token, playlist.token):
         return Response(
             content=_revoked_html(),
             status_code=410,
             media_type="text/html; charset=utf-8",
+            headers={"Cache-Control": "no-store"},
         )
     return playlist
 
@@ -152,34 +191,35 @@ def _rss_response(
     request: Request,
     page_url: str,
     feed_url: str,
+    token: str | None = None,
+    vary: str | None = None,
 ) -> Response:
+    # For unlisted playlists the channel/item links inside the RSS must
+    # carry the token: a subscriber clicking through in their podcatcher
+    # would otherwise land on a 410. ``feed_url`` rides along as the
+    # <atom:link rel="self"> (see build_rss).
+    if playlist.visibility != "public" and token:
+        page_url = f"{page_url}?t={token}"
+        feed_url = f"{feed_url}?t={token}"
     body = build_rss(playlist, entries, page_url=page_url, feed_url=feed_url)
     etag = '"' + hashlib.sha256(body).hexdigest() + '"'
 
     last_modified = playlist_last_modified(playlist, entries)
 
-    # Unlisted (token-gated) feeds must not be stored by shared caches: a
-    # CDN that drops the query string from its cache key could otherwise
-    # serve a cached 200 to an invalid-token request (which must be 410).
-    cache_scope = "private" if playlist.visibility != "public" else "public"
     headers = {
         "ETag": etag,
         "Last-Modified": format_datetime(last_modified),
-        "Cache-Control": f"{cache_scope}, max-age=900",
+        "Cache-Control": f"{_cache_scope(playlist.visibility)}, max-age=900",
     }
+    if vary:
+        headers["Vary"] = vary
 
     # Conditional requests: If-None-Match wins over If-Modified-Since.
-    inm = request.headers.get("if-none-match")
-    if inm is not None and (inm.strip() == "*" or etag in parse_if_none_match(inm)):
-        return Response(status_code=304, headers=headers)
-    ims = request.headers.get("if-modified-since")
-    if ims:
-        try:
-            ims_dt = parsedate_to_datetime(ims)
-            if last_modified <= ims_dt:
-                return Response(status_code=304, headers=headers)
-        except (TypeError, ValueError):
-            pass  # malformed date: ignore and serve the feed
+    not_modified = check_conditional(
+        request, etag=etag, last_modified=last_modified, headers=headers
+    )
+    if not_modified is not None:
+        return not_modified
 
     return Response(
         content=body,
@@ -228,6 +268,7 @@ async def feed_xml(
         request=request,
         page_url=f"{base}/f/{resolved.slug}",
         feed_url=f"{base}/f/{resolved.slug}/feed.xml",
+        token=t,
     )
 
 
@@ -253,16 +294,22 @@ async def feed_page(
             request=request,
             page_url=page_url,
             feed_url=feed_url,
+            token=t,
+            vary="Accept, User-Agent",
         )
     # HTML stub branch — the same CDN cache-poisoning threat model as the
     # RSS path applies (an unlisted stub could be served as 200 to an
     # invalid-token request that must be 410), so identical Cache-Control
-    # scoping, and the token-gated autodiscovery URL carries ?t=.
-    cache_scope = "private" if resolved.visibility != "public" else "public"
+    # scoping, and the token-gated autodiscovery URL carries ?t=. The page
+    # is content-negotiated too, so it varies on Accept/User-Agent.
+    cache_scope = _cache_scope(resolved.visibility)
     if resolved.visibility != "public":
         feed_url = f"{feed_url}?t={t}"
     return Response(
         content=_html_stub(title=resolved.title, feed_url=feed_url),
         media_type="text/html; charset=utf-8",
-        headers={"Cache-Control": f"{cache_scope}, max-age=900"},
+        headers={
+            "Cache-Control": f"{cache_scope}, max-age=900",
+            "Vary": "Accept, User-Agent",
+        },
     )

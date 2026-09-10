@@ -1,9 +1,11 @@
 """Tests for the developer polling contract (XIN-104).
 
 Backend-agnostic like ``test_feeds.py``: the same tests run against the
-SQLAlchemy (in-memory SQLite) and DynamoDB (moto) backends. All tests are
-synchronous: seeding runs via ``asyncio.run`` and HTTP assertions go
-through FastAPI's ``TestClient``.
+SQLAlchemy (in-memory SQLite) and DynamoDB (moto) backends — the shared
+scaffolding (backend contexts, the parametrized ``api_client`` fixture)
+lives in ``conftest.py``; only the per-file ``_seed`` stays here. All
+tests are synchronous: seeding runs via ``asyncio.run`` and HTTP
+assertions go through FastAPI's ``TestClient``.
 
 NOTE: these tests are written but not run here — Chester runs the suite
 himself. Only ``python -m py_compile`` sanity checks were done at author
@@ -14,99 +16,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
-import boto3
-import pytest
-from fastapi.testclient import TestClient
-from moto import mock_aws
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from starlette.requests import Request
 
-from backend.api import create_app
-from backend.api.developer import RateLimiter
-from backend.persistence.dynamodb.store import DynamoDBStore
-from backend.persistence.dynamodb.table import ensure_table
-from backend.persistence.dynamodb.testing import AsyncBoto3Client
+from backend.api.developer import RateLimiter, feed_changes
+from backend.api.rss import ensure_aware
+from backend.persistence.repositories import PlaylistEpisodeEntry
 from backend.persistence.models import (
-    Base,
     CuratedPlaylist,
     Episode,
     Feed,
     User,
 )
-from backend.persistence.sqlalchemy_store import SQLAlchemyStore
-
-
-# ---------------------------------------------------------------------------
-# Backend contexts (mirrors backend/api/tests/test_feeds.py)
-# ---------------------------------------------------------------------------
-
-
-class _SqliteBackend:
-    async def setup(self) -> None:
-        self._engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        self._factory = async_sessionmaker(
-            bind=self._engine, class_=AsyncSession, expire_on_commit=False
-        )
-
-    def store_factory(self):
-        return lambda: SQLAlchemyStore(self._factory)
-
-    async def teardown(self) -> None:
-        await self._engine.dispose()
-
-
-class _DynamoDBBackend:
-    async def setup(self) -> None:
-        self._mock = mock_aws()
-        self._mock.start()
-        sync = boto3.client(
-            "dynamodb",
-            region_name="us-east-1",
-            aws_access_key_id="testing",
-            aws_secret_access_key="testing",
-        )
-        self._client = AsyncBoto3Client(sync)
-        self._table_name = f"api-dev-{uuid4().hex}"
-        await ensure_table(self._client, table_name=self._table_name)
-
-    def store_factory(self):
-        return lambda: DynamoDBStore(
-            client=self._client, table_name=self._table_name
-        )
-
-    async def teardown(self) -> None:
-        await self._client.close()
-        self._mock.stop()
-
-
-_BACKENDS = {"sqlalchemy": _SqliteBackend, "dynamodb": _DynamoDBBackend}
-
-
-def _run(coro):
-    return asyncio.run(coro)
-
-
-@pytest.fixture(params=sorted(_BACKENDS))
-def api_client(request):
-    """A TestClient with a seeded, published playlist; yields (client, seed)."""
-    backend = _BACKENDS[request.param]()
-    _run(backend.setup())
-    try:
-        factory = backend.store_factory()
-        seed = _run(_seed(factory))
-        app = create_app(store_factory=factory)
-        with TestClient(app) as client:
-            yield client, seed
-    finally:
-        _run(backend.teardown())
 
 
 async def _seed(factory) -> dict:
@@ -211,7 +135,7 @@ def test_feed_metadata_404(api_client):
                 CuratedPlaylist(user_id=user.user_id, title="Draft")
             )
 
-    draft = _run(make_unpublished())
+    draft = asyncio.run(make_unpublished())
     assert (
         client.get(f"/api/v1/playlists/{draft.playlist_id}/feed").status_code
         == 404
@@ -297,7 +221,7 @@ def test_changes_detects_add(api_client):
     # position=-1 keeps the ordering deterministic: both backends order by
     # (position ASC, episode_id ASC) and episode_ids are random UUIDs, so
     # two entries at position 0 would make items[0] a coin flip.
-    ep3 = _run(
+    ep3 = asyncio.run(
         _add_episode(
             factory, seed["feed_id"], "Ep Three", -1, pl.playlist_id
         )
@@ -353,3 +277,303 @@ def test_rate_limit(api_client):
     assert limited.status_code == 429
     assert limited.headers.get("retry-after")
     assert limited.json()["detail"]["error"] == "rate_limit_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+async def _make_draft(factory):
+    """A never-published playlist (no slug) — resolves to 404 everywhere."""
+    async with factory() as store:
+        user = await store.users.save(
+            User(email=f"{uuid4().hex}@example.com")
+        )
+        return await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="Draft")
+        )
+
+
+async def _publish_public(factory, playlist_id):
+    async with factory() as store:
+        await store.playlists.publish(playlist_id, "public")
+
+
+# ---------------------------------------------------------------------------
+# XIN-116: cache-poisoning and conditional-request correctness
+# ---------------------------------------------------------------------------
+
+
+def test_rotate_token_never_304(api_client):
+    """POST rotate-token always mutates: even ``If-None-Match: *`` (or a
+    matching ETag) must 200 — never 304 — and the response is
+    ``Cache-Control: no-store`` (documented contract, previously
+    untested)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/api/v1/playlists/{pl.playlist_id}/feed/rotate-token"
+
+    first = client.post(url)
+    assert first.status_code == 200
+    assert first.headers["cache-control"] == "no-store"
+    first_token = first.json()["feed_url"].split("?t=")[1]
+
+    # The bug: the old conditional logic 304'd AFTER rotating the token.
+    second = client.post(url, headers=[("If-None-Match", "*")])
+    assert second.status_code == 200
+    assert second.headers["cache-control"] == "no-store"
+    second_token = second.json()["feed_url"].split("?t=")[1]
+    assert second_token and second_token != first_token
+
+    # A matching ETag must not 304 either.
+    third = client.post(url, headers={"If-None-Match": first.headers["etag"]})
+    assert third.status_code == 200
+
+
+def test_ims_ignored_when_inm_present(api_client):
+    """RFC 9110 13.1.4 on the JSON surface: If-Modified-Since MUST be
+    ignored when If-None-Match is present but matches nothing."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/api/v1/playlists/{pl.playlist_id}/feed"
+    resp = client.get(
+        url,
+        headers={
+            "If-None-Match": '"no-such-etag"',
+            "If-Modified-Since": "Wed, 01 Jan 2030 00:00:00 GMT",
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_changes_cache_scope(api_client):
+    """The changes endpoint applies the same private/public Cache-Control
+    scoping as the feed metadata (unlisted URLs embed the ?t= token)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/api/v1/playlists/{pl.playlist_id}/feed/changes"
+    params = {"since": "2020-01-01T00:00:00Z"}
+
+    unlisted = client.get(url, params=params)
+    assert unlisted.status_code == 200
+    assert unlisted.headers["cache-control"].split(",")[0].strip() == "private"
+
+    asyncio.run(
+        _publish_public(client.app.state.store_factory, pl.playlist_id)
+    )
+    public = client.get(url, params=params)
+    assert public.status_code == 200
+    cc = public.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "public"
+    assert "private" not in cc
+
+
+# ---------------------------------------------------------------------------
+# XIN-117: /changes None-handling
+# ---------------------------------------------------------------------------
+
+
+def test_changes_added_at_none(api_client):
+    """``added_at=None`` entries must not 500 /changes: they fall back to
+    the playlist creation date (mirrors the RSS pubDate fallback)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+
+    async def _entries():
+        factory = client.app.state.store_factory
+        async with factory() as store:
+            return await store.playlists.list_entries(pl.playlist_id)
+
+    real = asyncio.run(_entries())
+    assert len(real) == 2
+    no_dates = [
+        PlaylistEpisodeEntry(
+            episode=e.episode, position=e.position, added_at=None
+        )
+        for e in real
+    ]
+
+    class _FakePlaylists:
+        async def get_by_id(self, pid):
+            return pl
+
+        async def list_entries(self, pid):
+            return no_dates
+
+    class _FakeStore:
+        def __init__(self):
+            self.playlists = _FakePlaylists()
+
+    def _request():
+        return Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": [],
+                "server": ("testserver", 80),
+                "scheme": "http",
+                "query_string": b"",
+            }
+        )
+
+    resp = asyncio.run(
+        feed_changes(
+            str(pl.playlist_id), "2020-01-01T00:00:00Z", _request(),
+            _FakeStore(),
+        )
+    )
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    fallback = ensure_aware(pl.created_at).isoformat()
+    assert len(body["items"]) == 2
+    assert all(i["added_at"] == fallback for i in body["items"])
+    # since (2020) predates the fallback: both episodes count as added.
+    assert len(body["added"]) == 2
+
+    # A since after the fallback yields no additions — no TypeError from
+    # the ``added`` filter either.
+    later = asyncio.run(
+        feed_changes(
+            str(pl.playlist_id), "2030-01-01T00:00:00Z", _request(),
+            _FakeStore(),
+        )
+    )
+    assert later.status_code == 200
+    assert json.loads(later.body)["added"] == []
+
+
+# ---------------------------------------------------------------------------
+# XIN-118: coverage gaps
+# ---------------------------------------------------------------------------
+
+
+def test_changes_404(api_client):
+    """The changes endpoint 404s like the metadata endpoint does: unknown
+    id, malformed UUID, never-published playlist."""
+    client, _ = api_client
+    params = {"since": "2020-01-01T00:00:00Z"}
+    base = "/api/v1/playlists/{}/feed/changes"
+    assert client.get(base.format(uuid4()), params=params).status_code == 404
+    assert (
+        client.get(base.format("not-a-uuid"), params=params).status_code
+        == 404
+    )
+    draft = asyncio.run(_make_draft(client.app.state.store_factory))
+    assert (
+        client.get(base.format(draft.playlist_id), params=params).status_code
+        == 404
+    )
+
+
+def test_feed_metadata_public_playlist(api_client):
+    """Public playlist: ``_cache_scope``'s public branch and tokenless
+    ``_playlist_urls`` (``test_feed_metadata`` only seeds unlisted)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    asyncio.run(
+        _publish_public(client.app.state.store_factory, pl.playlist_id)
+    )
+
+    resp = client.get(f"/api/v1/playlists/{pl.playlist_id}/feed")
+    assert resp.status_code == 200
+    cc = resp.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "public"
+    assert "private" not in cc
+    body = resp.json()
+    assert body["visibility"] == "public"
+    assert body["feed_url"].endswith(f"/f/{pl.slug}/feed.xml")
+    assert body["landing_url"].endswith(f"/f/{pl.slug}")
+    assert "?t=" not in body["feed_url"]
+    assert "?t=" not in body["landing_url"]
+
+
+def test_json_conditional_variants(api_client):
+    """Conditional-request coverage on the JSON surface: ``If-None-Match:
+    *`` -> 304, weak validators match via the shared parser, multi-value
+    headers match, and malformed If-Modified-Since is ignored (200)."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/api/v1/playlists/{pl.playlist_id}/feed"
+    etag = client.get(url).headers["etag"]
+
+    assert client.get(url, headers={"If-None-Match": "*"}).status_code == 304
+    assert (
+        client.get(url, headers={"If-None-Match": f"W/{etag}"}).status_code
+        == 304
+    )
+    multi = client.get(url, headers={"If-None-Match": f'"zzz", {etag}'})
+    assert multi.status_code == 304
+    assert (
+        client.get(url, headers={"If-None-Match": '"aaa", "bbb"'}).status_code
+        == 200
+    )
+    malformed = client.get(url, headers={"If-Modified-Since": "garbage"})
+    assert malformed.status_code == 200
+
+
+def test_changes_since_equals_added_at_boundary(api_client):
+    """``added`` uses strict ``>``: ``since == added_at`` excludes the
+    episode. Pins the boundary semantics."""
+    client, seed = api_client
+    pl = seed["playlist"]
+
+    async def _entries():
+        factory = client.app.state.store_factory
+        async with factory() as store:
+            return await store.playlists.list_entries(pl.playlist_id)
+
+    entries = asyncio.run(_entries())
+    target = entries[0]
+    since = ensure_aware(target.added_at).isoformat()
+    body = client.get(
+        f"/api/v1/playlists/{pl.playlist_id}/feed/changes",
+        params={"since": since},
+    ).json()
+    assert str(target.episode.episode_id) not in {
+        a["episode_id"] for a in body["added"]
+    }
+
+
+def test_rate_limiter_retry_after_value():
+    """Unit: Retry-After seconds stay within the configured window."""
+    limiter = RateLimiter(limit=2, window_seconds=60)
+    assert limiter.check("1.2.3.4") is None
+    assert limiter.check("1.2.3.4") is None
+    retry = limiter.check("1.2.3.4")
+    assert retry is not None
+    assert 0 < retry <= 60
+
+
+def test_rate_limiter_sliding_window_expiry(monkeypatch):
+    """Unit: hits slide out of the window; the bucket recovers."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    limiter = RateLimiter(limit=1, window_seconds=60)
+    assert limiter.check("9.9.9.9") is None
+    assert limiter.check("9.9.9.9") is not None
+    now[0] += 61  # the first hit slides out of the window
+    assert limiter.check("9.9.9.9") is None
+
+
+def test_rate_limiter_per_ip_isolation():
+    """Unit: buckets are per-IP — one IP's traffic never limits another."""
+    limiter = RateLimiter(limit=1, window_seconds=60)
+    assert limiter.check("1.1.1.1") is None
+    assert limiter.check("1.1.1.1") is not None  # over the limit
+    assert limiter.check("2.2.2.2") is None  # separate bucket
+
+
+def test_rate_limit_retry_after_agrees_with_body(api_client):
+    """HTTP: the Retry-After header matches the body's retry_after."""
+    client, seed = api_client
+    pl = seed["playlist"]
+    client.app.state.rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    url = f"/api/v1/playlists/{pl.playlist_id}/feed"
+    assert client.get(url).status_code == 200
+    limited = client.get(url)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == str(
+        limited.json()["detail"]["retry_after"]
+    )

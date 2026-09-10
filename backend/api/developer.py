@@ -48,6 +48,12 @@ proxies via middleware) or every client behind the proxy shares one
 bucket. The limiter is in-memory and therefore single-process; a
 Redis-backed limiter is the follow-up when this API runs on more than one
 process. There is deliberately no podcatcher User-Agent allowlist.
+
+XIN-118 (decided 2026-09-09): the limiter is also wired into the
+public feeds router (``/f/<slug>``, ``/f/<slug>/feed.xml``) via
+``include_router(dependencies=[Depends(rate_limited)])`` — the same
+600 req / 15 min in-memory budget is shared with the developer routes,
+since public feed rendering is unauthenticated and database-backed.
 """
 
 from __future__ import annotations
@@ -62,8 +68,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from backend.api._etag import parse_if_none_match
-from backend.api.feeds import get_store, playlist_last_modified
+from backend.api._etag import check_conditional
+from backend.api.feeds import _base, _cache_scope, get_store, playlist_last_modified
 from backend.api.rss import ensure_aware
 from backend.persistence.models import CuratedPlaylist
 from backend.persistence.repositories import Store
@@ -94,11 +100,11 @@ class RateLimiter:
         while hits and hits[0] <= cutoff:
             hits.popleft()
         if not hits:
-            # Evict fully-expired buckets so _hits doesn't accumulate one
-            # key per distinct IP ever seen (eviction is lazy: other IPs'
-            # entries are dropped when they next call check()).
-            del self._hits[ip]
-            hits = self._hits[ip] = deque()
+            # Reuse the (now empty) deque instead of dropping and
+            # re-creating it: fully-expired buckets don't accumulate one
+            # stale key per distinct IP ever seen (eviction is lazy: other
+            # IPs' entries are dropped when they next call check()).
+            hits.clear()
         if len(hits) >= self.limit:
             return max(0.0, hits[0] + self.window_seconds - now)
         hits.append(now)
@@ -146,32 +152,18 @@ async def _published_playlist(store: Store, playlist_id: str) -> CuratedPlaylist
     return playlist
 
 
-def _base(request: Request) -> str:
-    return str(request.base_url).rstrip("/")
+def _playlist_urls(base: str, playlist: CuratedPlaylist) -> tuple[str, str]:
+    """(feed_url, landing_url) for a playlist.
 
-
-def _feed_url(base: str, playlist: CuratedPlaylist) -> str:
-    url = f"{base}/f/{playlist.slug}/feed.xml"
-    if playlist.visibility == "unlisted" and playlist.token:
-        url += f"?t={playlist.token}"
-    return url
-
-
-def _landing_url(base: str, playlist: CuratedPlaylist) -> str:
-    url = f"{base}/f/{playlist.slug}"
-    if playlist.visibility == "unlisted" and playlist.token:
-        url += f"?t={playlist.token}"
-    return url
-
-
-def _cache_scope(playlist: CuratedPlaylist) -> str:
-    """Shared-cache scope for JSON responses about a playlist.
-
-    Mirrors ``feeds.py``: unlisted playlists' metadata embeds the ``?t=``
-    capability token in ``feed_url`` / ``landing_url``, so those responses
-    must be ``private``; public playlists' are ``public``.
+    Unlisted playlists' URLs carry the ``?t=`` capability token; public
+    playlists' stay bare.
     """
-    return "public" if playlist.visibility == "public" else "private"
+    feed_url = f"{base}/f/{playlist.slug}/feed.xml"
+    landing_url = f"{base}/f/{playlist.slug}"
+    if playlist.visibility == "unlisted" and playlist.token:
+        feed_url += f"?t={playlist.token}"
+        landing_url += f"?t={playlist.token}"
+    return feed_url, landing_url
 
 
 def _json_response(
@@ -180,6 +172,7 @@ def _json_response(
     payload: dict,
     last_modified: datetime,
     cache_control: str = "public, max-age=900",
+    allow_conditional: bool = True,
 ) -> Response:
     """JSON body with ETag / Last-Modified / Cache-Control.
 
@@ -187,6 +180,9 @@ def _json_response(
     ``If-Modified-Since`` is ignored and the body is served.
     ``cache_control`` lets endpoints override the default 15-minute
     ``public`` TTL (e.g. the rotate-token POST sends ``no-store``).
+    ``allow_conditional=False`` disables 304s entirely — for endpoints
+    that always mutate (rotate-token): the mutation must never be
+    reported as "not modified".
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     etag = '"' + hashlib.sha256(body).hexdigest() + '"'
@@ -195,18 +191,12 @@ def _json_response(
         "Last-Modified": format_datetime(ensure_aware(last_modified)),
         "Cache-Control": cache_control,
     }
-    inm = request.headers.get("if-none-match")
-    if inm is not None and (inm.strip() == "*" or etag in parse_if_none_match(inm)):
-        return Response(status_code=304, headers=headers)
-    ims = request.headers.get("if-modified-since")
-    if ims:
-        try:
-            from email.utils import parsedate_to_datetime
-
-            if ensure_aware(last_modified) <= parsedate_to_datetime(ims):
-                return Response(status_code=304, headers=headers)
-        except (TypeError, ValueError):
-            pass
+    if allow_conditional:
+        not_modified = check_conditional(
+            request, etag=etag, last_modified=last_modified, headers=headers
+        )
+        if not_modified is not None:
+            return not_modified
     return Response(
         content=body, media_type="application/json", headers=headers
     )
@@ -239,13 +229,14 @@ async def feed_metadata(
     revoked_at = ensure_aware(playlist.token_revoked_at)
     if revoked_at is not None and revoked_at > last_modified:
         last_modified = revoked_at
+    feed_url, landing_url = _playlist_urls(base, playlist)
     payload = {
         "playlist_id": str(playlist.playlist_id),
         "title": playlist.title,
         "slug": playlist.slug,
         "visibility": playlist.visibility,
-        "feed_url": _feed_url(base, playlist),
-        "landing_url": _landing_url(base, playlist),
+        "feed_url": feed_url,
+        "landing_url": landing_url,
         "episode_count": len(entries),
         "last_modified": last_modified.isoformat(),
     }
@@ -253,7 +244,7 @@ async def feed_metadata(
         request=request,
         payload=payload,
         last_modified=last_modified,
-        cache_control=f"{_cache_scope(playlist)}, max-age=900",
+        cache_control=f"{_cache_scope(playlist.visibility)}, max-age=900",
     )
 
 
@@ -279,10 +270,11 @@ async def rotate_feed_token(
     last_modified = ensure_aware(playlist.token_revoked_at) or datetime.now(
         timezone.utc
     )
+    feed_url, landing_url = _playlist_urls(base, playlist)
     payload = {
         "playlist_id": str(playlist.playlist_id),
-        "feed_url": _feed_url(base, playlist),
-        "landing_url": _landing_url(base, playlist),
+        "feed_url": feed_url,
+        "landing_url": landing_url,
         "token_revoked_at": last_modified.isoformat(),
     }
     return _json_response(
@@ -290,6 +282,8 @@ async def rotate_feed_token(
         payload=payload,
         last_modified=last_modified,
         cache_control="no-store",
+        # Always mutates: never answer 304, even to If-None-Match: *.
+        allow_conditional=False,
     )
 
 
@@ -319,18 +313,27 @@ async def feed_changes(
     if revoked_at is not None and revoked_at > last_modified:
         last_modified = revoked_at
 
+    # Entries with added_at=None fall back to the playlist creation date
+    # (mirrors the RSS pubDate fallback in backend/api/rss.py): the API
+    # layer treats None as possible, so the changelog must never 500 on
+    # missing metadata.
+    fallback_added = ensure_aware(playlist.created_at) or datetime.now(
+        timezone.utc
+    )
+
+    def _added_at(e) -> datetime:
+        return ensure_aware(e.added_at) or fallback_added
+
     def _entry(e) -> dict:
         return {
             "episode_id": str(e.episode.episode_id),
             "position": e.position,
-            "added_at": ensure_aware(e.added_at).isoformat(),
+            "added_at": _added_at(e).isoformat(),
         }
 
     items = [_entry(e) for e in entries]
     added = [
-        item
-        for item, e in zip(items, entries)
-        if ensure_aware(e.added_at) > since_dt
+        item for item, e in zip(items, entries) if _added_at(e) > since_dt
     ]
     payload = {
         "playlist_id": str(playlist.playlist_id),
@@ -345,5 +348,5 @@ async def feed_changes(
         request=request,
         payload=payload,
         last_modified=last_modified,
-        cache_control=f"{_cache_scope(playlist)}, max-age=900",
+        cache_control=f"{_cache_scope(playlist.visibility)}, max-age=900",
     )
