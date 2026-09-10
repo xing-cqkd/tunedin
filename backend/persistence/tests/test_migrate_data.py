@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -11,11 +12,14 @@ from backend.migrate_data import (
     SameBackendError,
     SqlAlchemyBackend,
     _normalize_url,
+    assert_distinct_backends,
     get_backend,
     main,
     migrate,
+    reconcile_tables,
     resolve_url,
 )
+from backend.persistence.dynamodb.migrate_adapter import DynamoDBBackend
 from backend.persistence.models import (
     Episode,
     EpisodeTag,
@@ -192,6 +196,88 @@ def test_resolve_url_honors_env(monkeypatch):
     assert resolve_url("app") == "sqlite+aiosqlite:///./tunedin.db"
 
 
+def test_resolve_url_dynamodb_raises_value_error():
+    # "dynamodb" is in _VALID_BACKENDS but has no URL; it must raise the
+    # documented ValueError, not fall through to a KeyError on
+    # _BACKEND_MODULES (XIN-132).
+    with pytest.raises(ValueError, match="no database URL"):
+        resolve_url("dynamodb")
+
+
+def test_resolve_url_unknown_backend_raises_value_error():
+    with pytest.raises(ValueError, match="Unknown backend"):
+        resolve_url("nope")
+
+
+@pytest.mark.asyncio
+async def test_write_rows_empty_list_short_circuits(tmp_path):
+    backend = SqlAlchemyBackend.from_url("s", _url(tmp_path / "empty.db"))
+    try:
+        assert await backend.write_rows("feeds", []) == 0
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_write_rows_flushes_in_chunks(tmp_path):
+    # More rows than _WRITE_FLUSH_EVERY so the periodic flush+evict path
+    # runs at least once (XIN-132 write-side OOM fix); all rows must still
+    # land, upserted by primary key.
+    from backend.migrate_data import _WRITE_FLUSH_EVERY
+
+    backend = SqlAlchemyBackend.from_url("s", _url(tmp_path / "chunk.db"))
+    try:
+        await backend.init()
+        n = _WRITE_FLUSH_EVERY + 5
+        rows = [
+            {
+                "feed_id": uuid4(),
+                "rss_url": f"https://example.com/chunk/{i}.xml",
+                "title": f"Chunk {i}",
+            }
+            for i in range(n)
+        ]
+        assert await backend.write_rows("feeds", rows) == n
+        assert await backend.count_rows("feeds") == n
+        titles = {r["title"] for r in await backend.read_table("feeds")}
+        assert len(titles) == n
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_count_rows_matches_read_table(tmp_path):
+    src = _url(tmp_path / "src.db")
+    await _seed_source(src)
+    backend = SqlAlchemyBackend.from_url("s", src)
+    try:
+        assert await backend.count_rows("feeds") == 1
+        assert await backend.count_rows("episodes") == 2
+        assert await backend.count_rows("tags") == 1
+    finally:
+        await backend.close()
+
+
+def test_dynamodb_identity_differs_across_endpoints():
+    # Same region/table but different endpoints (moto-local vs real AWS)
+    # must NOT share an identity, or the same-database guard misfires
+    # (XIN-132).
+    local = DynamoDBBackend(
+        table_name="t", region_name="us-east-1", endpoint_url="http://localhost:8000"
+    )
+    aws = DynamoDBBackend(table_name="t", region_name="us-east-1")
+    other = DynamoDBBackend(
+        table_name="t", region_name="us-east-1", endpoint_url="http://other:8000"
+    )
+    assert local.identity != aws.identity
+    assert local.identity != other.identity
+    assert aws.identity != other.identity
+    same = DynamoDBBackend(
+        table_name="t", region_name="us-east-1", endpoint_url="http://localhost:8000"
+    )
+    assert same.identity == local.identity
+
+
 def _run_cli(args, env_overrides, cwd):
     env = dict(os.environ)
     env.update(env_overrides)
@@ -263,7 +349,7 @@ def test_get_backend_dynamodb_uses_env_config(monkeypatch):
     assert backend._table_name == "mytable"
     assert backend._region_name == "eu-west-1"
     assert backend._endpoint_url == "http://localhost:8000"
-    assert backend.identity == "dynamodb:eu-west-1:mytable"
+    assert backend.identity == "dynamodb:eu-west-1:mytable:http://localhost:8000"
 
 
 def test_get_backend_dynamodb_defaults(monkeypatch):
@@ -303,7 +389,11 @@ async def test_skipped_tables_warned_and_reported(tmp_path, capsys):
     assert by_table["feeds"].copied_rows == 1
     assert by_table["tags"].skipped is True
     assert by_table["tags"].copied_rows == 0
+    # Skipped tables get their count from a count-only read -- the rows are
+    # never loaded (XIN-132 nit: skip check moved before read_table).
+    assert by_table["tags"].source_rows == 1
     assert by_table["insights"].skipped is True
+    assert by_table["insights"].source_rows == 1
 
     err = capsys.readouterr().err
     assert "skipping table 'tags'" in err
@@ -312,7 +402,38 @@ async def test_skipped_tables_warned_and_reported(tmp_path, capsys):
     assert "skipping table 'feeds'" not in err
 
 
-def test_normalize_url_unifies_sqlite_spellings(tmp_path, monkeypatch):
+def test_assert_distinct_backends(tmp_path):
+    a = SqlAlchemyBackend.from_url("a", _url(tmp_path / "a.db"))
+    b = SqlAlchemyBackend.from_url("b", _url(tmp_path / "b.db"))
+    assert_distinct_backends(a, b)  # distinct: no raise
+    same = SqlAlchemyBackend.from_url("c", _url(tmp_path / "a.db"))
+    with pytest.raises(SameBackendError, match="refusing"):
+        assert_distinct_backends(a, same)
+
+
+def test_reconcile_tables_partitions_and_orders():
+    common, source_only, target_only = reconcile_tables(
+        ["feeds", "episodes", "tags", "ghost"],
+        ["tags", "feeds", "episodes", "leftover_b", "leftover_a"],
+    )
+    # common/source_only keep source order; target_only is sorted.
+    assert common == ["feeds", "episodes", "tags"]
+    assert source_only == ["ghost"]
+    assert target_only == ["leftover_a", "leftover_b"]
+
+
+def test_reconcile_tables_identical_sets():
+    common, source_only, target_only = reconcile_tables(["a", "b"], ["b", "a"])
+    assert (common, source_only, target_only) == (["a", "b"], [], [])
+
+
+@pytest.mark.asyncio
+async def test_migrate_same_backend_error_message_names_both(tmp_path):
+    url = _url(tmp_path / "same.db")
+    with pytest.raises(SameBackendError, match="refusing"):
+        await migrate(
+            SqlAlchemyBackend.from_url("s", url), SqlAlchemyBackend.from_url("t", url)
+        )
     monkeypatch.chdir(tmp_path)
     relative = _normalize_url("sqlite+aiosqlite:///./same.db")
     absolute = _normalize_url(f"sqlite+aiosqlite:///{tmp_path}/same.db")

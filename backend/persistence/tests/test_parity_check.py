@@ -18,7 +18,8 @@ import pytest
 from moto import mock_aws
 
 from backend.migrate_data import Backend, SqlAlchemyBackend, migrate
-from backend.parity_check import compare
+from backend import parity_check
+from backend.parity_check import _run, compare, main
 from backend.persistence.dynamodb.migrate_adapter import DynamoDBBackend
 from backend.persistence.dynamodb.table import DEFAULT_TABLE_NAME, ensure_table
 from backend.persistence.dynamodb.testing import AsyncBoto3Client
@@ -232,6 +233,11 @@ class _ExtraTableBackend:
             return [dict(r) for r in self._extra_rows]
         return await self._inner.read_table(table_name)
 
+    async def count_rows(self, table_name: str) -> int:
+        if table_name == self._extra_table:
+            return len(self._extra_rows)
+        return await self._inner.count_rows(table_name)
+
     async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
         return await self._inner.write_rows(table_name, rows)
 
@@ -256,3 +262,222 @@ async def test_compare_flags_target_only_tables(backends):
         sql.table_names
     )
     assert all(_table(report, name).ok for name in sql.table_names)
+
+
+class _SourceOnlyTableBackend:
+    """Wraps a Backend, pretending the source holds one extra table."""
+
+    def __init__(self, inner: Backend, extra_table: str):
+        self._inner = inner
+        self.name = inner.name
+        self._extra_table = extra_table
+
+    @property
+    def identity(self) -> str:
+        return self._inner.identity
+
+    @property
+    def table_names(self) -> List[str]:
+        return [*self._inner.table_names, self._extra_table]
+
+    async def init(self) -> None:
+        await self._inner.init()
+
+    async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+        return await self._inner.read_table(table_name)
+
+    async def count_rows(self, table_name: str) -> int:
+        return await self._inner.count_rows(table_name)
+
+    async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
+        return await self._inner.write_rows(table_name, rows)
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+async def test_compare_reports_source_side_missing_table(backends):
+    sql, ddb, seed = backends
+    await migrate(sql, ddb)
+    # A table present in the source but absent from the target is a
+    # "missing-table" mismatch (only the target-only branch was tested).
+    source = _SourceOnlyTableBackend(sql, "ghost_table")
+
+    report = await compare(source, ddb)
+    assert not report.ok
+    ghost = _table(report, "ghost_table")
+    assert ghost.source_rows == -1 and ghost.target_rows == -1
+    kinds = [k for k, _ in ghost.sample_mismatches]
+    assert "missing-table" in kinds
+
+
+async def test_compare_empty_string_treated_as_none_after_migrate(backends):
+    sql, ddb, seed = backends
+    # feedparser yields "" for missing text fields; the DynamoDB codec maps
+    # "" -> attribute-omitted -> None on read BY DESIGN, so compare() must
+    # treat them as equivalent (XIN-131) -- not a payload-diff.
+    await sql.write_rows(
+        "feeds",
+        [
+            {
+                "feed_id": uuid4(),
+                "rss_url": "https://example.com/empty-title.xml",
+                "title": "",
+                "sync_status": "pending",
+                "error_count": 0,
+                "created_at": datetime.now(UTC),
+            }
+        ],
+    )
+    await migrate(sql, ddb)
+
+    fwd = await compare(sql, ddb)
+    assert fwd.ok, [(t.table, t.sample_mismatches) for t in fwd.tables if not t.ok]
+    rev = await compare(ddb, sql)
+    assert rev.ok, [(t.table, t.sample_mismatches) for t in rev.tables if not t.ok]
+
+
+async def test_compare_missing_row_detected_with_sample_zero(backends):
+    sql, ddb, seed = backends
+    await migrate(sql, ddb)
+    extra = {
+        "episode_id": uuid4(),
+        "feed_id": seed["feeds"][0]["feed_id"],
+        "guid": "guid-9",
+        "title": "Episode 9",
+        "audio_url": "https://example.com/e9.mp3",
+        "published_at": None,
+        "processed": False,
+        "created_at": datetime.now(UTC),
+    }
+    await sql.write_rows("episodes", [extra])
+    # Existence is checked over the FULL pk sets, so a missing row is
+    # still caught when payload sampling is disabled (XIN-131).
+    report = await compare(sql, ddb, sample_size=0)
+    assert not report.ok
+    episodes = _table(report, "episodes")
+    assert [k for k, _ in episodes.sample_mismatches] == ["missing-row"]
+
+
+# ---------------------------------------------------------------------------
+# CLI tests: main() / _run() exit codes (XIN-131 coverage)
+# ---------------------------------------------------------------------------
+
+
+class _MemoryBackend(Backend):
+    """In-memory Backend for CLI tests (no sqlite, no moto)."""
+
+    def __init__(self, name: str, identity: str, rows: Dict[str, List[Dict[str, Any]]]):
+        self.name = name
+        self._identity = identity
+        self._rows = {t: [dict(r) for r in rs] for t, rs in rows.items()}
+
+    @property
+    def identity(self) -> str:
+        return self._identity
+
+    @property
+    def table_names(self) -> List[str]:
+        return list(self._rows)
+
+    async def init(self) -> None:
+        pass
+
+    async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self._rows[table_name]]
+
+    async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
+        self._rows.setdefault(table_name, []).extend(dict(r) for r in rows)
+        return len(rows)
+
+    async def close(self) -> None:
+        pass
+
+
+def _feed_rows(title: str = "Feed", feed_id=None):
+    return [
+        {
+            "feed_id": feed_id if feed_id is not None else uuid4(),
+            "rss_url": "https://example.com/f.xml",
+            "title": title,
+            "sync_status": "active",
+        }
+    ]
+
+
+def _payload_pair(title_a: str, title_b: str):
+    """Two backends holding the SAME feed row except for ``title``.
+
+    Same pk on both sides, so the only mismatch is a payload-diff (no
+    missing/extra rows to confuse the sampling tests).
+    """
+    feed_id = uuid4()
+    return (
+        _MemoryBackend("simple", "mem:one", {"feeds": _feed_rows(title_a, feed_id)}),
+        _MemoryBackend("app", "mem:two", {"feeds": _feed_rows(title_b, feed_id)}),
+    )
+
+
+def _cli_backends(monkeypatch, source: _MemoryBackend, target: _MemoryBackend):
+    """Route the CLI's get_backend() at the two in-memory backends."""
+    mapping = {"simple": source, "app": target}
+    monkeypatch.setattr(parity_check, "get_backend", lambda name: mapping[name])
+
+
+def test_main_exits_zero_on_parity(monkeypatch, capsys):
+    source, target = _payload_pair("Feed", "Feed")
+    _cli_backends(monkeypatch, source, target)
+    assert main(["--source", "simple", "--target", "app"]) == 0
+    assert "PARITY OK" in capsys.readouterr().out
+
+
+def test_main_exits_one_on_mismatch(monkeypatch, capsys):
+    source, target = _payload_pair("Feed", "Renamed")
+    _cli_backends(monkeypatch, source, target)
+    assert main(["--source", "simple", "--target", "app"]) == 1
+    assert "PARITY MISMATCH" in capsys.readouterr().out
+
+
+def test_main_exits_two_on_same_backend(monkeypatch, capsys):
+    rows = {"feeds": _feed_rows()}
+    _cli_backends(
+        monkeypatch,
+        _MemoryBackend("simple", "mem:same", rows),
+        _MemoryBackend("app", "mem:same", rows),
+    )
+    # Safety-critical refusal path: never compare a database with itself.
+    assert main(["--source", "simple", "--target", "app"]) == 2
+    assert "refusing" in capsys.readouterr().out
+
+
+def test_main_sample_zero_skips_payload_diff(monkeypatch):
+    source, target = _payload_pair("Feed", "Renamed")
+    _cli_backends(monkeypatch, source, target)
+    # Counts match; --sample 0 disables payload spot-checks only.
+    assert main(["--source", "simple", "--target", "app", "--sample", "0"]) == 0
+
+
+def test_main_negative_sample_skips_payload_diff(monkeypatch):
+    source, target = _payload_pair("Feed", "Renamed")
+    _cli_backends(monkeypatch, source, target)
+    assert main(["--source", "simple", "--target", "app", "--sample", "-5"]) == 0
+
+
+def test_main_sample_zero_still_catches_missing_row(monkeypatch):
+    _cli_backends(
+        monkeypatch,
+        _MemoryBackend("simple", "mem:one", {"feeds": _feed_rows()}),
+        _MemoryBackend("app", "mem:two", {"feeds": []}),
+    )
+    assert main(["--source", "simple", "--target", "app", "--sample", "0"]) == 1
+
+
+async def test_run_refuses_same_backend(monkeypatch, capsys):
+    rows = {"feeds": _feed_rows()}
+    _cli_backends(
+        monkeypatch,
+        _MemoryBackend("simple", "mem:same", rows),
+        _MemoryBackend("app", "mem:same", rows),
+    )
+    assert await _run("simple", "app", 25) == 2
+    assert "refusing" in capsys.readouterr().out

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import boto3
 import pytest
@@ -55,6 +55,64 @@ def test_entity_fields_extracts_columns():
     assert fields["rss_url"] == "https://example.com/f.xml"
     assert fields["title"] == "T"
     assert "_sa_instance_state" not in fields
+
+
+# ---------------------------------------------------------------------------
+# _json_default branches (XIN-133)
+# ---------------------------------------------------------------------------
+
+
+def test_json_default_uuid_and_datetime():
+    uid = uuid.uuid4()
+    assert validation._json_default(uid) == str(uid)
+    assert validation._json_default(datetime(2026, 1, 2, 3, 4, 5)) == "2026-01-02T03:04:05"
+
+
+def test_json_default_date():
+    assert validation._json_default(date(2026, 1, 2)) == "2026-01-02"
+
+
+def test_json_default_bytes():
+    assert validation._json_default(b"hello") == "hello"
+
+
+def test_json_default_bytes_non_utf8_replaces():
+    assert validation._json_default(b"\xff\xfe binary") == "�� binary"
+
+
+def test_json_default_set_and_frozenset_sorted_by_repr():
+    assert validation._json_default({3, 1, 2}) == [1, 2, 3]
+    assert validation._json_default(frozenset({"b", "a"})) == ["a", "b"]
+
+
+def test_json_default_unknown_type_raises():
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        validation._json_default(object())
+
+
+# ---------------------------------------------------------------------------
+# MAX_ITEM_BYTES boundary (XIN-133)
+# ---------------------------------------------------------------------------
+
+
+def test_exactly_at_limit_passes():
+    # {"blob":"<N x's>"} serializes to exactly N+11 bytes; choose N so the
+    # size lands exactly on MAX_ITEM_BYTES -- the check is `>`, so this
+    # must pass (pinned boundary).
+    fields = {"blob": "x" * (MAX_ITEM_BYTES - 11)}
+    assert validation.item_size_bytes(fields) == MAX_ITEM_BYTES
+    validation.check_item_size(fields, what="boundary")  # must not raise
+
+
+def test_one_byte_over_limit_raises_with_byte_counts():
+    fields = {"blob": "x" * (MAX_ITEM_BYTES - 10)}
+    with pytest.raises(ItemTooLargeError) as exc:
+        validation.check_item_size(fields, what="big-episode")
+    message = str(exc.value)
+    # The error must include both the measured size and the limit.
+    assert "409,601 bytes" in message
+    assert "409,600-byte" in message
+    assert "big-episode" in message
 
 
 # ---------------------------------------------------------------------------

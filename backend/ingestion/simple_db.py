@@ -2,9 +2,9 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
-from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.persistence._sqlite import configure_sqlite_fk
 from backend.persistence.models.base import Base
 
 # Database file path located directly in the ingestion directory
@@ -23,11 +23,7 @@ engine: AsyncEngine = create_async_engine(
 
 # Enable Foreign Key enforcement for SQLite
 if DATABASE_URL.startswith("sqlite"):
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    configure_sqlite_fk(engine)
 
 # Session Factory
 AsyncSessionLocal = async_sessionmaker(

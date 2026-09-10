@@ -118,6 +118,25 @@ async def _scan_all(client: Any, table_name: str, **kwargs: Any) -> List[dict]:
             return items
 
 
+async def _scan_count(client: Any, table_name: str, **kwargs: Any) -> int:
+    """Scan to exhaustion with ``Select="COUNT"``; items are never returned.
+
+    For callers that only need a row count (target-only-table detection in
+    parity checks) -- cheaper than a full scan on large tables.
+    """
+    total = 0
+    start_key: Optional[dict] = None
+    while True:
+        kw = dict(kwargs, Select="COUNT")
+        if start_key is not None:
+            kw["ExclusiveStartKey"] = start_key
+        resp = await client.scan(TableName=table_name, **kw)
+        total += resp.get("Count", 0)
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            return total
+
+
 # ---------------------------------------------------------------------------
 # Item builders (write path): row dict -> DynamoDB-JSON item(s).
 #
@@ -396,7 +415,14 @@ class DynamoDBBackend(Backend):
 
     @property
     def identity(self) -> str:
-        return f"dynamodb:{self._region_name}:{self._table_name}"
+        # endpoint_url is part of the identity: two backends with the same
+        # region/table but different endpoints (moto-local vs real AWS)
+        # are different stores, and the same-database guard must not
+        # conflate them (XIN-132).
+        return (
+            f"dynamodb:{self._region_name}:{self._table_name}"
+            f":{self._endpoint_url or ''}"
+        )
 
     @property
     def table_names(self) -> List[str]:
@@ -419,6 +445,19 @@ class DynamoDBBackend(Backend):
         if row_reader is _model_row:
             return [row_reader(model_cls, item) for item in items]
         return [row_reader(item) for item in items]
+
+    async def count_rows(self, table_name: str) -> int:
+        # Count-only scan: no items are returned, so target-only-table
+        # detection in parity checks never materializes a full table.
+        client = await self._ensure_client()
+        _model_cls, type_name, _row_reader = _READ_SPECS[table_name]
+        return await _scan_count(
+            client,
+            self._table_name,
+            FilterExpression=_TYPE_FILTER,
+            ExpressionAttributeNames=_TYPE_NAMES,
+            ExpressionAttributeValues={":t": _s(type_name)},
+        )
 
     async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
         if not rows:

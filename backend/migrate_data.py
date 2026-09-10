@@ -33,9 +33,9 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Tuple
 
-from sqlalchemy import Table, event, make_url, select
+from sqlalchemy import Table, func, make_url, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from backend.persistence._sqlite import configure_sqlite_fk
 from backend.persistence.models import Base
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -65,9 +66,18 @@ def _default_url(name: str) -> str:
 
 
 def resolve_url(name: str) -> str:
-    """Resolve a backend's database URL exactly the way its module would."""
+    """Resolve a backend's database URL exactly the way its module would.
+
+    Raises:
+        ValueError: for an unknown backend name -- and for ``"dynamodb"``,
+            which has no URL (use :func:`get_backend` for that backend).
+    """
     if name not in _VALID_BACKENDS:
         raise ValueError(f"Unknown backend {name!r} (expected one of {_VALID_BACKENDS})")
+    if name == "dynamodb":
+        raise ValueError(
+            'dynamodb has no database URL; use get_backend("dynamodb") instead'
+        )
     _, env_var = _BACKEND_MODULES[name]
     return os.environ.get(env_var) or _default_url(name)
 
@@ -94,8 +104,46 @@ def _normalize_url(url: str) -> str:
     return f"{scheme}:///{Path(database).resolve()}"
 
 
+# Rows written per session.merge() batch before the session is flushed and
+# its identity map evicted (XIN-132: bounds write-side memory).
+_WRITE_FLUSH_EVERY = 1000
+
+
 class SameBackendError(RuntimeError):
     """Raised when source and target resolve to the same underlying store."""
+
+
+def assert_distinct_backends(source: "Backend", target: "Backend") -> None:
+    """Refuse to run a source/target operation against one store.
+
+    Raises:
+        SameBackendError: when both backends resolve to the same underlying
+            store. Shared by :func:`migrate` and ``parity_check._run`` so the
+            refusal (and its message) stays consistent.
+    """
+    if source.identity == target.identity:
+        raise SameBackendError(
+            f"source and target resolve to the same database "
+            f"({source.name} -> {source.identity}); refusing."
+        )
+
+
+def reconcile_tables(
+    source_tables: List[str], target_tables: List[str]
+) -> Tuple[List[str], List[str], List[str]]:
+    """Partition table names into ``(common, source_only, target_only)``.
+
+    ``common`` and ``source_only`` keep source order (which is FK-safe
+    parents-first order for SQLAlchemy backends); ``target_only`` is sorted.
+    Shared by :func:`migrate` (skip source-only tables) and
+    ``parity_check.compare`` (missing-table / target-only-table detection).
+    """
+    target_set = set(target_tables)
+    source_set = set(source_tables)
+    common = [t for t in source_tables if t in target_set]
+    source_only = [t for t in source_tables if t not in target_set]
+    target_only = sorted(set(target_tables) - source_set)
+    return common, source_only, target_only
 
 
 class Backend(abc.ABC):
@@ -138,6 +186,16 @@ class Backend(abc.ABC):
         into ``model_cls(**row)``. A backend that stores values in another
         representation must convert them back to these native types here.
         """
+
+    async def count_rows(self, table_name: str) -> int:
+        """Return the row count of a table, without materializing rows.
+
+        The default implementation counts what :meth:`read_table` returns;
+        backends override this with a count-only read (``SELECT count(*)``,
+        a ``Select="COUNT"`` scan) so callers that only need the count --
+        skip warnings, target-only-table detection -- never load the table.
+        """
+        return len(await self.read_table(table_name))
 
     @abc.abstractmethod
     async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
@@ -182,12 +240,7 @@ class SqlAlchemyBackend(Backend):
         """
         engine: AsyncEngine = create_async_engine(url, echo=False, future=True)
         if url.startswith("sqlite"):
-
-            @event.listens_for(engine.sync_engine, "connect")
-            def _set_sqlite_pragma(dbapi_connection, connection_record):
-                cursor = dbapi_connection.cursor()
-                cursor.execute("PRAGMA foreign_keys=ON")
-                cursor.close()
+            configure_sqlite_fk(engine)
 
         factory = async_sessionmaker(
             bind=engine, class_=AsyncSession, expire_on_commit=False
@@ -228,14 +281,29 @@ class SqlAlchemyBackend(Backend):
             result = await session.execute(select(table))
             return [dict(row._mapping) for row in result]
 
+    async def count_rows(self, table_name: str) -> int:
+        # Count-only read: skipped tables and target-only detection only
+        # need the count, never the row payloads.
+        table = await self._table(table_name)
+        async with self._session_factory() as session:
+            result = await session.execute(select(func.count()).select_from(table))
+            return result.scalar_one()
+
     async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
         if not rows:
             return 0
         model_cls = _TABLE_TO_CLASS[table_name]
         async with self._session_factory() as session:
             # merge() upserts by primary key: re-runs never duplicate rows.
-            for row in rows:
+            for i, row in enumerate(rows, 1):
                 await session.merge(model_cls(**row))
+                if i % _WRITE_FLUSH_EVERY == 0:
+                    # Bound the session identity map: without periodic
+                    # flush/eviction a full-table write (556k episodes)
+                    # accumulates every row in memory -- the write-side OOM
+                    # counterpart of the read-side OOM tracked in XIN-111.
+                    await session.flush()
+                    session.expunge_all()
             await session.commit()
         return len(rows)
 
@@ -295,36 +363,47 @@ async def migrate(
 
     Source tables missing from the target backend are skipped: a warning
     is printed to stderr for each and the table is flagged ``skipped`` in
-    the returned report.
+    the returned report (their source counts come from a count-only read --
+    the rows themselves are never loaded).
     """
-    if source.identity == target.identity:
-        raise SameBackendError(
-            f"source and target resolve to the same database "
-            f"({source.name} -> {source.identity}); refusing to migrate a "
-            f"database into itself."
-        )
+    assert_distinct_backends(source, target)
     if not dry_run:
         await target.init()
     report: List[TableReport] = []
+    common, source_only, _target_only = reconcile_tables(
+        list(source.table_names), list(target.table_names)
+    )
+    # Warn about skipped tables before any reads: the current code used to
+    # read_table() every source table first and only then discover it would
+    # be skipped.
+    for table_name in source_only:
+        print(
+            f"warning: skipping table {table_name!r}: not present in "
+            f"target backend {target.name!r}",
+            file=sys.stderr,
+        )
+    common_set = set(common)
     try:
         for table_name in source.table_names:
+            if table_name not in common_set:
+                report.append(
+                    TableReport(
+                        table=table_name,
+                        source_rows=await source.count_rows(table_name),
+                        copied_rows=0,
+                        skipped=True,
+                    )
+                )
+                continue
             rows = await source.read_table(table_name)
             copied = 0
-            skipped = table_name not in target.table_names
-            if skipped:
-                print(
-                    f"warning: skipping table {table_name!r}: not present in "
-                    f"target backend {target.name!r}",
-                    file=sys.stderr,
-                )
-            elif not dry_run:
+            if not dry_run:
                 copied = await target.write_rows(table_name, rows)
             report.append(
                 TableReport(
                     table=table_name,
                     source_rows=len(rows),
                     copied_rows=copied,
-                    skipped=skipped,
                 )
             )
     finally:
