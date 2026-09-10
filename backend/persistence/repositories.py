@@ -34,6 +34,7 @@ from __future__ import annotations
 import re
 import secrets
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
@@ -340,12 +341,26 @@ class UserRepository(ABC):
         """
 
 
+@dataclass(frozen=True)
+class PlaylistEpisodeEntry:
+    """One episode in a playlist, with its link metadata (Linear: XIN-98).
+
+    The RSS feed generator needs the curator ``position`` order AND the
+    ``added_at`` date per episode; :meth:`PlaylistRepository.list_episodes`
+    returns bare episodes, so this entry type carries the link fields
+    alongside the episode.
+    """
+
+    episode: Episode
+    position: int
+    added_at: datetime
+
+
 class PlaylistRepository(ABC):
     """Persistence operations for :class:`CuratedPlaylist` and playlist links."""
 
     @abstractmethod
-    async def list_by_user(self, user_id: UUID) -> list[CuratedPlaylist]:
-        """Return a user's playlists, ordered by ``created_at`` ascending.
+    async def list_by_user(self, user_id: UUID) -> list[CuratedPlaylist]:        """Return a user's playlists, ordered by ``created_at`` ascending.
 
         Same tie rule as :meth:`FeedRepository.list_by_statuses`.
         """
@@ -377,6 +392,17 @@ class PlaylistRepository(ABC):
 
         Ties on ``position`` are broken by ``episode_id`` ascending so the
         order is fully deterministic on all backends.
+        """
+
+    @abstractmethod
+    async def list_entries(self, playlist_id: UUID) -> list[PlaylistEpisodeEntry]:
+        """Return a playlist's episodes with link metadata (Linear: XIN-98).
+
+        Same ordering contract as :meth:`list_episodes` — ``position``
+        ascending, ties broken by ``episode_id`` ascending. ``added_at`` is
+        the instant the episode was added to the playlist (preserved when an
+        existing link is re-added at a new position); the RSS endpoint uses
+        it as the item ``<pubDate>``.
         """
 
     @abstractmethod

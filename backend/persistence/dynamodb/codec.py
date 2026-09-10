@@ -116,6 +116,8 @@ def apply_defaults(entity: Any) -> None:
     elif isinstance(entity, models.PlaylistEpisode):
         if entity.position is None:
             entity.position = 0
+        if entity.added_at is None:
+            entity.added_at = _now()
 
 
 def _serialize_value(value: Any) -> Any:

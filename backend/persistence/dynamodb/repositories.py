@@ -28,6 +28,7 @@ from backend.persistence.repositories import (
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
+    PlaylistEpisodeEntry,
     PlaylistRepository,
     ProgressRepository,
     SlugConflictError,
@@ -1068,15 +1069,31 @@ class _PlaylistRepository(PlaylistRepository):
     ) -> None:
         """Link an episode into a playlist (upsert on the link key).
 
-        Atomicity: single-item ``PutItem`` — re-adding overwrites the
-        link's ``position`` in one atomic write; no read-before-write, so
-        concurrent adds cannot duplicate the link.
+        Atomicity: single-item ``UpdateItem`` — re-adding overwrites the
+        link's ``position`` in one atomic write, while ``added_at`` is set
+        only on first insert (``if_not_exists``), so re-adding an existing
+        link preserves the original added date (Linear: XIN-98). No
+        read-before-write, so concurrent adds cannot duplicate the link.
         """
         key_attrs = keys.playlist_episode_link_keys(playlist_id, episode_id)
-        item = {name: _s(value) for name, value in key_attrs.items()}
-        item["type"] = _s(codec.TYPE_PLAYLIST_EPISODE_LINK)
-        item["position"] = {"N": str(position)}
-        await self._c.put_item(TableName=self._t, Item=item)
+        await self._c.update_item(
+            TableName=self._t,
+            Key={name: _s(value) for name, value in key_attrs.items()},
+            UpdateExpression=(
+                "SET #typ = :typ, #pos = :p, "
+                "#added = if_not_exists(#added, :now)"
+            ),
+            ExpressionAttributeNames={
+                "#typ": "type",
+                "#pos": "position",
+                "#added": "added_at",
+            },
+            ExpressionAttributeValues={
+                ":typ": _s(codec.TYPE_PLAYLIST_EPISODE_LINK),
+                ":p": {"N": str(position)},
+                ":now": _s(keys.iso_timestamp(_now_utc())),
+            },
+        )
 
     async def list_episodes(
         self, playlist_id: UUID
@@ -1104,6 +1121,56 @@ class _PlaylistRepository(PlaylistRepository):
                 episodes[str(ep_id)] = episode
         ordered = sorted(entries, key=lambda e: (e[0], e[1]))
         return [episodes[str(ep_id)] for _, ep_id in ordered if str(ep_id) in episodes]
+
+    async def list_entries(
+        self, playlist_id: UUID
+    ) -> list[PlaylistEpisodeEntry]:
+        # Same link query as list_episodes, but keep position + added_at
+        # per link so the RSS endpoint can emit the curator order and the
+        # added-date pubDate. Ordering contract matches list_episodes:
+        # (position asc, episode_id asc).
+        link_items = await _query_all(
+            self._c,
+            self._t,
+            KeyConditionExpression="pk = :p AND begins_with(sk, :e)",
+            ExpressionAttributeValues={
+                ":p": _s(f"PL#{playlist_id}"),
+                ":e": _s("PLEP#"),
+            },
+        )
+        parsed: list[tuple[int, UUID, datetime]] = []
+        for link in link_items:
+            ep_id = UUID(link["sk"]["S"].split("PLEP#", 1)[1])
+            position = int(codec.deserialize_plain(link.get("position", {"N": "0"})))
+            raw_added = link.get("added_at", {}).get("S")
+            if raw_added:
+                text = (
+                    raw_added[:-1] + "+00:00"
+                    if raw_added.endswith("Z")
+                    else raw_added
+                )
+                added_at = datetime.fromisoformat(text)
+            else:
+                # Legacy link written before added_at existed (XIN-98). No
+                # playlist link predates the feature in practice; fall back
+                # to now rather than failing the feed render.
+                added_at = _now_utc()
+            parsed.append((position, ep_id, added_at))
+        episodes: dict[str, models.Episode] = {}
+        for _, ep_id, _ in parsed:
+            episode = await self._episode_repo_get(ep_id)
+            if episode is not None:
+                episodes[str(ep_id)] = episode
+        ordered = sorted(parsed, key=lambda e: (e[0], e[1]))
+        return [
+            PlaylistEpisodeEntry(
+                episode=episodes[str(ep_id)],
+                position=position,
+                added_at=added_at,
+            )
+            for position, ep_id, added_at in ordered
+            if str(ep_id) in episodes
+        ]
 
     async def publish(
         self, playlist_id: UUID, visibility: str

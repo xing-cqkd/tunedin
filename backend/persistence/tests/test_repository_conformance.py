@@ -670,6 +670,47 @@ class TestRepositoryConformance:
         rows = await store.playlists.list_episodes(pl.playlist_id)
         assert [e.episode_id for e in rows] == ids
 
+    async def test_playlist_list_entries_carries_position_and_added_at(
+        self, store: Store
+    ):
+        # XIN-98: the RSS endpoint needs curator position order plus the
+        # added-to-playlist date per episode. added_at is set on first add
+        # and preserved when an existing link is re-added at a new position.
+        user = await self._seed_user(store)
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="Entries")
+        )
+        feed = await self._seed_feed(store)
+        e1 = await store.episodes.save(_episode(feed.feed_id, "E1"))
+        e2 = await store.episodes.save(_episode(feed.feed_id, "E2"))
+
+        await store.playlists.add_episode(pl.playlist_id, e1.episode_id, 1)
+        await store.playlists.add_episode(pl.playlist_id, e2.episode_id, 0)
+
+        entries = await store.playlists.list_entries(pl.playlist_id)
+        assert [e.episode.episode_id for e in entries] == [
+            e2.episode_id,
+            e1.episode_id,
+        ]
+        assert [e.position for e in entries] == [0, 1]
+        assert all(e.added_at is not None for e in entries)
+        first_added = {
+            e.episode.episode_id: e.added_at for e in entries
+        }
+
+        # Re-adding updates the position but keeps the original added_at.
+        await store.playlists.add_episode(pl.playlist_id, e2.episode_id, 5)
+        entries = await store.playlists.list_entries(pl.playlist_id)
+        assert [e.episode.episode_id for e in entries] == [
+            e1.episode_id,
+            e2.episode_id,
+        ]
+        assert [e.position for e in entries] == [1, 5]
+        assert (
+            entries[1].added_at.replace(tzinfo=None)
+            == first_added[e2.episode_id].replace(tzinfo=None)
+        )
+
     # ------------------------------------------------------------------
     # Playlist publish state (XIN-97)
     # ------------------------------------------------------------------

@@ -18,7 +18,7 @@ NO commit. The store is the unit of work; callers commit explicitly via
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from uuid import UUID
 
@@ -49,6 +49,7 @@ from backend.persistence.repositories import (
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
+    PlaylistEpisodeEntry,
     PlaylistRepository,
     ProgressRepository,
     SlugConflictError,
@@ -420,6 +421,35 @@ class _PlaylistRepository(PlaylistRepository):
             .order_by(PlaylistEpisode.position.asc(), Episode.episode_id.asc())
         )
         return list(res.scalars().all())
+
+    async def list_entries(
+        self, playlist_id: UUID
+    ) -> list[PlaylistEpisodeEntry]:
+        # Same join as list_episodes, but keep the link row so the RSS
+        # endpoint gets position + added_at per episode. SQLite returns
+        # naive datetimes; normalize to tz-aware UTC at the boundary.
+        res = await self._session.execute(
+            select(Episode, PlaylistEpisode)
+            .join(
+                PlaylistEpisode,
+                PlaylistEpisode.episode_id == Episode.episode_id,
+            )
+            .where(PlaylistEpisode.playlist_id == playlist_id)
+            .order_by(PlaylistEpisode.position.asc(), Episode.episode_id.asc())
+        )
+        entries: list[PlaylistEpisodeEntry] = []
+        for episode, link in res.all():
+            added_at = link.added_at
+            if added_at is not None and added_at.tzinfo is None:
+                added_at = added_at.replace(tzinfo=timezone.utc)
+            entries.append(
+                PlaylistEpisodeEntry(
+                    episode=episode,
+                    position=link.position,
+                    added_at=added_at,
+                )
+            )
+        return entries
 
     async def publish(
         self, playlist_id: UUID, visibility: str

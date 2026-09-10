@@ -1,0 +1,39 @@
+"""TuneIn HTTP API (FastAPI).
+
+XIN-98 introduces the first public surface: published curated-playlist
+feeds at ``/f/<slug>``. XIN-31's open question ("where does the HTTP layer
+live?") is resolved for the feed surface only by this package — FastAPI was
+already a declared dependency in ``backend/requirements.txt``.
+
+FastAPI is imported lazily inside :func:`create_app` so that
+:mod:`backend.api.rss` (pure XML rendering, no web framework) stays
+importable in environments without the web dependencies installed.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+
+def create_app(*, store_factory: Callable[[], Any] | None = None):
+    """Build the FastAPI application.
+
+    ``store_factory`` is a zero-arg callable returning a
+    :class:`~backend.persistence.repositories.Store`. It is called once per
+    request inside ``async with`` (commit on clean exit) and the store is
+    closed afterwards, so factories may hand out a fresh store per request
+    sharing an engine/client, or a caller-owned store. Defaults to
+    ``settings.open_store`` — the configured database backend.
+    """
+    from fastapi import FastAPI
+
+    from backend.api.feeds import router as feeds_router
+
+    app = FastAPI(title="TuneIn API")
+    if store_factory is None:  # lazy: settings mirrors env at import time
+        from settings import open_store
+
+        store_factory = open_store
+    app.state.store_factory = store_factory
+    app.include_router(feeds_router)
+    return app
