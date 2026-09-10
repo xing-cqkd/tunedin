@@ -83,6 +83,10 @@ EXPECTED = {
         "save": _sig(("playlist",)),
         "add_episode": _sig(("playlist_id",), ("episode_id",), ("position",)),
         "list_episodes": _sig(("playlist_id",)),
+        "publish": _sig(("playlist_id",), ("visibility",)),
+        "unpublish": _sig(("playlist_id",)),
+        "rotate_token": _sig(("playlist_id",)),
+        "get_by_slug": _sig(("slug",)),
     },
     "ProgressRepository": {
         "get": _sig(("user_id",), ("episode_id",)),

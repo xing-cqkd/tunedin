@@ -31,8 +31,10 @@ Design notes (per the architect review of the DynamoDB backend plan):
 
 from __future__ import annotations
 
+import re
+import secrets
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -46,6 +48,58 @@ from backend.persistence.models import (
     User,
     UserEpisodeProgress,
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared publish-state helpers (Linear: XIN-97).
+#
+# Value generation and validation for playlist publishing must be identical
+# on every backend, so they live here rather than being duplicated in each
+# concrete repository.
+# ---------------------------------------------------------------------------
+
+VISIBILITY_UNLISTED = "unlisted"
+VISIBILITY_PUBLIC = "public"
+PLAYLIST_VISIBILITIES = (VISIBILITY_UNLISTED, VISIBILITY_PUBLIC)
+
+
+class SlugConflictError(ValueError):
+    """Raised by ``PlaylistRepository.save`` when ``slug`` is taken.
+
+    Raised on ALL backends (SQLAlchemy maps the unique-constraint
+    ``IntegrityError``; DynamoDB maps the failed slug-claim conditional
+    write), so callers can catch one type regardless of backend.
+    """
+
+
+def validate_visibility(visibility: str) -> None:
+    """Raise :class:`ValueError` unless ``visibility`` is a known value."""
+    if visibility not in PLAYLIST_VISIBILITIES:
+        raise ValueError(
+            f"unknown playlist visibility {visibility!r}; "
+            f"expected one of {list(PLAYLIST_VISIBILITIES)}"
+        )
+
+
+def generate_slug(title: Optional[str]) -> str:
+    """Generate a unique-ish URL-safe slug from a playlist title.
+
+    The slugified title is suffixed with 8 random URL-safe characters, so
+    two playlists with the same title still get distinct slugs. Uniqueness
+    is enforced at write time by the repositories.
+    """
+    base = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    base = base[:60] or "playlist"
+    return f"{base}-{secrets.token_urlsafe(6)}"
+
+
+def generate_token() -> str:
+    """Generate a 256-bit URL-safe token for unlisted share URLs."""
+    return secrets.token_urlsafe(32)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class FeedRepository(ABC):
@@ -324,6 +378,41 @@ class PlaylistRepository(ABC):
         Ties on ``position`` are broken by ``episode_id`` ascending so the
         order is fully deterministic on all backends.
         """
+
+    @abstractmethod
+    async def publish(
+        self, playlist_id: UUID, visibility: str
+    ) -> Optional[CuratedPlaylist]:
+        """Publish a playlist with ``visibility`` (``'unlisted'``/``'public'``).
+
+        Assigns a unique URL-safe ``slug`` and a 256-bit ``token`` when the
+        playlist does not have them yet, then persists. Raises
+        :class:`ValueError` for an unknown visibility. Returns ``None``
+        when the playlist id does not exist. (The >=2-episode publish
+        minimum is enforced by a later issue, not here.)
+        """
+
+    @abstractmethod
+    async def unpublish(self, playlist_id: UUID) -> Optional[CuratedPlaylist]:
+        """Return a playlist to ``'unlisted'`` visibility.
+
+        The ``slug`` and ``token`` are preserved so re-publishing keeps
+        stable URLs. Returns ``None`` when the playlist id does not exist.
+        """
+
+    @abstractmethod
+    async def rotate_token(self, playlist_id: UUID) -> Optional[str]:
+        """Replace a playlist's token, invalidating the old one.
+
+        Rotation is a single-field change: the old token value stops
+        resolving immediately. Stamps ``token_revoked_at`` with the
+        rotation time. Returns the new token string, or ``None`` when the
+        playlist id does not exist.
+        """
+
+    @abstractmethod
+    async def get_by_slug(self, slug: str) -> Optional[CuratedPlaylist]:
+        """Return the playlist with the given ``slug``, or ``None``."""
 
 
 class ProgressRepository(ABC):

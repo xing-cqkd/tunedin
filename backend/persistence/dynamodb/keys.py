@@ -19,6 +19,7 @@ Tag                       ``TAG#<tag_id>``          ``META``
 User                      ``USER#<user_id>``        ``META``
 Playlist                  ``USER#<user_id>``        ``PL#<created_ts>#<playlist_id>``
 Playlist-episode link     ``PL#<playlist_id>``      ``PLEP#<episode_id>``
+Slug claim                ``SLUG#<slug>``           ``META``
 User episode progress     ``USER#<user_id>``        ``PROG#<episode_id>``
 Task log                  ``TASK#<task_log_id>``    ``META``
 ========================  ========================  =====================================
@@ -236,6 +237,20 @@ def playlist_episode_link_keys(playlist_id: UUID, episode_id: UUID) -> dict:
     return {
         "pk": f"PL#{uuid_str(playlist_id)}",
         "sk": f"PLEP#{uuid_str(episode_id)}",
+    }
+
+
+def slug_claim_keys(slug: str) -> dict:
+    """Key attributes for a playlist slug-claim item (Linear: XIN-97).
+
+    One claim item per assigned slug; written with a conditional write
+    (``attribute_not_exists(pk)`` or owned by the same playlist), so slug
+    uniqueness is enforced at write time without a GSI. The claim carries
+    the owning ``playlist_id`` so ``get_by_slug`` can resolve it.
+    """
+    return {
+        "pk": f"SLUG#{slug}",
+        "sk": META,
     }
 
 

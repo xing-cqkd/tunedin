@@ -45,6 +45,7 @@ TYPE_TAG_CLAIM = "tag_claim"
 TYPE_USER = "user"
 TYPE_PLAYLIST = "playlist"
 TYPE_PLAYLIST_EPISODE_LINK = "playlist_episode_link"
+TYPE_SLUG_CLAIM = "slug_claim"
 TYPE_PROGRESS = "progress"
 TYPE_TASK_LOG = "task_log"
 
@@ -94,6 +95,8 @@ def apply_defaults(entity: Any) -> None:
     elif isinstance(entity, models.CuratedPlaylist):
         if entity.playlist_id is None:
             entity.playlist_id = uuid4()
+        if entity.visibility is None:
+            entity.visibility = "unlisted"
         if entity.created_at is None:
             entity.created_at = _now()
     elif isinstance(entity, models.TaskLog):

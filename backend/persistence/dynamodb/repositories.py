@@ -24,15 +24,21 @@ from uuid import UUID
 from backend.persistence import models
 from backend.persistence.dynamodb import codec, keys
 from backend.persistence.repositories import (
+    VISIBILITY_UNLISTED,
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
     PlaylistRepository,
     ProgressRepository,
+    SlugConflictError,
     Store,
     TagRepository,
     TaskLogRepository,
     UserRepository,
+    _now_utc,
+    generate_slug,
+    generate_token,
+    validate_visibility,
 )
 
 T = TypeVar("T")
@@ -948,6 +954,21 @@ def _playlist_item(playlist: models.CuratedPlaylist) -> dict:
     return codec.model_to_item(playlist, key_attrs, codec.TYPE_PLAYLIST)
 
 
+def _slug_claim_item(playlist: models.CuratedPlaylist) -> dict:
+    """Build the slug-claim item for a playlist's ``slug``.
+
+    The claim's key (``SLUG#<slug>`` / ``META``) is the write-time
+    uniqueness lock; the ``playlist_id`` attribute lets ``get_by_slug``
+    resolve the owning playlist and lets re-saves of the same playlist
+    pass the claim's condition expression.
+    """
+    key_attrs = keys.slug_claim_keys(playlist.slug)
+    item = {name: _s(value) for name, value in key_attrs.items()}
+    item["type"] = _s(codec.TYPE_SLUG_CLAIM)
+    item["playlist_id"] = _s(str(playlist.playlist_id))
+    return item
+
+
 class _PlaylistRepository(PlaylistRepository):
     def __init__(self, client: Any, table_name: str) -> None:
         self._c = client
@@ -986,13 +1007,60 @@ class _PlaylistRepository(PlaylistRepository):
         return codec.item_to_model(models.CuratedPlaylist, items[0]) if items else None
 
     async def save(self, playlist: models.CuratedPlaylist) -> models.CuratedPlaylist:
-        """Upsert by primary key.
+        """Upsert by primary key, enforcing slug uniqueness at write time.
 
-        Atomicity: single-item ``PutItem`` — atomic by DynamoDB
-        single-item write semantics; last-writer-wins on concurrent
-        saves, mirroring the SQL upsert.
+        Atomicity: when the playlist has a slug, the playlist item and its
+        slug-claim item are written in one ``TransactWriteItems`` call, with
+        ``attribute_not_exists(pk) OR playlist_id = :pid`` on the claim. A
+        slug taken by a *different* playlist cancels the whole write and
+        raises :class:`SlugConflictError`; re-saving the same playlist
+        (idempotent re-write) passes the condition. Slug-less playlists
+        are a single-item ``PutItem``, as before.
+
+        Consistency: a slug *change* deletes the stale claim in a separate
+        ordered write (same pattern as episode guid changes in
+        :meth:`_EpisodeRepository.save`). A crash between the writes can
+        leave a transiently stale claim, which only ever fails dedup CLOSED
+        (a slug treated as taken); the next save of that playlist cleans it
+        up.
         """
-        await self._c.put_item(TableName=self._t, Item=_playlist_item(playlist))
+        is_new = playlist.playlist_id is None
+        codec.apply_defaults(playlist)
+        old = None if is_new else await self.get_by_id(playlist.playlist_id)
+        item = _playlist_item(playlist)
+        if playlist.slug:
+            try:
+                await self._c.transact_write_items(
+                    TransactItems=[
+                        {"Put": {"TableName": self._t, "Item": item}},
+                        {
+                            "Put": {
+                                "TableName": self._t,
+                                "Item": _slug_claim_item(playlist),
+                                "ConditionExpression": (
+                                    "attribute_not_exists(pk)"
+                                    " OR playlist_id = :pid"
+                                ),
+                                "ExpressionAttributeValues": {
+                                    ":pid": _s(str(playlist.playlist_id))
+                                },
+                            }
+                        },
+                    ]
+                )
+            except self._c.exceptions.TransactionCanceledException as exc:
+                if _conditional_check_failed_indices(exc):
+                    raise SlugConflictError(
+                        f"playlist slug {playlist.slug!r} is already taken"
+                    ) from exc
+                raise
+        else:
+            await self._c.put_item(TableName=self._t, Item=item)
+        if old is not None and old.slug and old.slug != playlist.slug:
+            await self._c.delete_item(
+                TableName=self._t,
+                Key=_key(keys.slug_claim_keys(old.slug)["pk"], keys.META),
+            )
         return playlist
 
     async def add_episode(
@@ -1036,6 +1104,51 @@ class _PlaylistRepository(PlaylistRepository):
                 episodes[str(ep_id)] = episode
         ordered = sorted(entries, key=lambda e: (e[0], e[1]))
         return [episodes[str(ep_id)] for _, ep_id in ordered if str(ep_id) in episodes]
+
+    async def publish(
+        self, playlist_id: UUID, visibility: str
+    ) -> Optional[models.CuratedPlaylist]:
+        validate_visibility(visibility)
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        playlist.visibility = visibility
+        if playlist.slug is None:
+            playlist.slug = generate_slug(playlist.title)
+        if playlist.token is None:
+            playlist.token = generate_token()
+        return await self.save(playlist)
+
+    async def unpublish(
+        self, playlist_id: UUID
+    ) -> Optional[models.CuratedPlaylist]:
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        playlist.visibility = VISIBILITY_UNLISTED
+        return await self.save(playlist)
+
+    async def rotate_token(self, playlist_id: UUID) -> Optional[str]:
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        new_token = generate_token()
+        playlist.token = new_token
+        playlist.token_revoked_at = _now_utc()
+        await self.save(playlist)
+        return new_token
+
+    async def get_by_slug(self, slug: str) -> Optional[models.CuratedPlaylist]:
+        resp = await self._c.get_item(
+            TableName=self._t, Key=_key(f"SLUG#{slug}", keys.META)
+        )
+        claim = resp.get("Item")
+        if not claim:
+            return None
+        playlist_id = keys.uuid_from_str(
+            str(codec.deserialize_plain(claim["playlist_id"]))
+        )
+        return await self.get_by_id(playlist_id)
 
     async def _episode_repo_get(self, episode_id: UUID) -> Optional[models.Episode]:
         items = await _query_all(

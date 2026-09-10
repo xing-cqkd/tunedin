@@ -27,6 +27,27 @@ class CuratedPlaylist(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     query_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Publish state (Linear: XIN-97). ``visibility`` is 'unlisted' (default)
+    # or 'public' — validated in ``PlaylistRepository.publish`` on both
+    # backends. ``slug`` is unique and URL-safe; ``token`` is a nullable
+    # 256-bit URL-safe secret for unlisted share URLs. Rotating the token
+    # replaces the value (single-field change kills old URLs) and stamps
+    # ``token_revoked_at``. ``frozen_at`` supports the freeze-version
+    # toggle (set by a later issue).
+    visibility: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unlisted"
+    )
+    slug: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, unique=True
+    )
+    token: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    token_revoked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    frozen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
