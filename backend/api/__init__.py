@@ -27,6 +27,8 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
     """
     from fastapi import FastAPI
 
+    from backend.api.developer import RateLimiter
+    from backend.api.developer import router as developer_router
     from backend.api.feeds import router as feeds_router
 
     app = FastAPI(title="TuneIn API")
@@ -35,5 +37,13 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
 
         store_factory = open_store
     app.state.store_factory = store_factory
+    # Generous per-IP sliding window (XIN-104); tests may replace it with a
+    # tighter limiter via ``app.state.rate_limiter``. The limiter keys on
+    # request.client.host (the direct TCP peer) — deployments behind a
+    # proxy/LB must resolve the real client IP (e.g. honor X-Forwarded-For
+    # only from trusted proxies via middleware), or all clients behind the
+    # proxy share one bucket.
+    app.state.rate_limiter = RateLimiter()
     app.include_router(feeds_router)
+    app.include_router(developer_router)
     return app
