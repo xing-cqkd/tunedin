@@ -56,9 +56,11 @@ if TYPE_CHECKING:  # model classes are attribute bags here; no runtime import
 
 ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 TUNEDIN_NS = "https://tunedin.app/ns/1.0"
+ATOM_NS = "http://www.w3.org/2005/Atom"
 
 ET.register_namespace("itunes", ITUNES_NS)
 ET.register_namespace("tunedin", TUNEDIN_NS)
+ET.register_namespace("atom", ATOM_NS)
 
 _FALLBACK_AUTHOR = "TuneIn curator"
 _FALLBACK_CATEGORY = "Society & Culture"
@@ -121,6 +123,7 @@ def build_rss(
 
     ``entries`` must already be in curator position order (the repository
     guarantees ``position`` ascending, ``episode_id`` ascending on ties).
+    ``feed_url`` is emitted as the channel's ``<atom:link rel="self">``.
     Returns the UTF-8 XML document bytes.
     """
     rss = ET.Element("rss", version="2.0")
@@ -133,6 +136,13 @@ def build_rss(
     )
     ET.SubElement(channel, "title").text = playlist.title
     ET.SubElement(channel, "link").text = page_url
+    # Self link: the canonical feed URL. For unlisted playlists the caller
+    # tokenizes ``feed_url`` with ``?t=`` so podcatchers that follow the
+    # self link stay authenticated.
+    atom_link = ET.SubElement(channel, f"{{{ATOM_NS}}}link")
+    atom_link.set("rel", "self")
+    atom_link.set("type", "application/rss+xml")
+    atom_link.set("href", feed_url)
     description = playlist.description or (
         f"{playlist.title} — a curated podcast feed from TuneIn"
     )
