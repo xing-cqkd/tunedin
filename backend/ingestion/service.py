@@ -1,9 +1,10 @@
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
-from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from urllib.parse import urlparse
 import httpx
+from sqlalchemy.exc import IntegrityError
 
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, Podcast
@@ -21,7 +22,6 @@ logger = logging.getLogger(__name__)
 # eligible for retry after an exponential backoff based on consecutive
 # error_count, and are abandoned after MAX attempts.
 ERROR_RETRY_BASE_BACKOFF_SECONDS = 300  # 5 minutes; doubles per consecutive failure
-ERROR_RETRY_MAX_BACKOFF_SECONDS = 24 * 3600  # 1 day cap
 ERROR_RETRY_MAX_ATTEMPTS = 10  # stop retrying after this many consecutive failures
 
 
@@ -29,22 +29,22 @@ def _error_retry_due(feed: "Feed", now: datetime) -> bool:
     """True if an errored feed's backoff window has elapsed and it may be retried."""
     if feed.error_count >= ERROR_RETRY_MAX_ATTEMPTS:
         return False
-    backoff = min(
-        ERROR_RETRY_BASE_BACKOFF_SECONDS * (2 ** max(feed.error_count - 1, 0)),
-        ERROR_RETRY_MAX_BACKOFF_SECONDS,
-    )
+    # Note: no upper cap on the backoff — max attempts is 10 and
+    # error_count=9 yields 76,800s of backoff, so a 1-day cap would never bind.
+    backoff = ERROR_RETRY_BASE_BACKOFF_SECONDS * (2 ** max(feed.error_count - 1, 0))
     last = feed.last_fetched_at
     if last is not None and last.tzinfo is None:
         last = last.replace(tzinfo=timezone.utc)  # SQLite returns naive datetimes
     return last is None or last <= now - timedelta(seconds=backoff)
 
 
-class IngestionMode(str, Enum):
-    """Modes of podcast data ingestion."""
-    DISCOVER_ONLY = "discover_only"       # Save show/feed metadata immediately without downloading episodes
-    SYNC_EPISODES = "sync_episodes"       # Given a feed/show, fetch and save all new episodes
-    FULL_PIPELINE = "full_pipeline"       # Discover show metadata AND download episodes immediately
-    BATCH_PENDING = "batch_pending"       # Sync all pending/un-synced feeds in database
+def _looks_like_url(value: str) -> bool:
+    """True if the string parses as an absolute http(s) URL."""
+    try:
+        parts = urlparse(value)
+    except Exception:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 class FeedIngestionService:
@@ -67,10 +67,29 @@ class FeedIngestionService:
     # Mode 1: Show Discovery & Registration ("Find All Podcasts & Save Immediately")
     # -------------------------------------------------------------------------
 
-    async def save_podcast(self, store: Store, podcast: Podcast) -> Feed:
+    @staticmethod
+    def _apply_podcast_metadata(feed: Feed, podcast: Podcast) -> Feed:
+        """Overlays discovered show metadata onto an existing Feed (no save)."""
+        if podcast.title:
+            feed.title = podcast.title
+        if podcast.author:
+            feed.author = podcast.author
+        if podcast.description:
+            feed.description = podcast.description
+        if podcast.artwork_url:
+            feed.image_url = podcast.artwork_url
+        if podcast.primary_genre:
+            feed.category = podcast.primary_genre
+        if podcast.language:
+            feed.language = podcast.language
+        if podcast.website_url:
+            feed.website_url = podcast.website_url
+        return feed
+
+    async def _get_or_create_feed(self, store: Store, podcast: Podcast) -> Feed:
         """
-        Immediately saves/upserts a discovered Podcast show into the `feeds` database table.
-        Marks sync_status as 'discovered' if new, ready for downstream episode syncing.
+        Read-then-write upsert of a discovered Podcast into the feeds table,
+        WITHOUT committing. Marks sync_status as 'discovered' if new.
         """
         if not podcast.feed_url:
             raise ValueError("Cannot save podcast without a valid canonical feed_url")
@@ -92,34 +111,49 @@ class FeedIngestionService:
             )
         else:
             # Update show metadata if available
-            if podcast.title:
-                feed.title = podcast.title
-            if podcast.author:
-                feed.author = podcast.author
-            if podcast.description:
-                feed.description = podcast.description
-            if podcast.artwork_url:
-                feed.image_url = podcast.artwork_url
-            if podcast.primary_genre:
-                feed.category = podcast.primary_genre
-            if podcast.language:
-                feed.language = podcast.language
-            if podcast.website_url:
-                feed.website_url = podcast.website_url
+            feed = self._apply_podcast_metadata(feed, podcast)
 
-        feed = await store.feeds.save(feed)
-        await store.commit()
+        return await store.feeds.save(feed)
+
+    async def save_podcast(self, store: Store, podcast: Podcast) -> Feed:
+        """
+        Immediately saves/upserts a discovered Podcast show into the `feeds` database table.
+        Marks sync_status as 'discovered' if new, ready for downstream episode syncing.
+
+        Duplicate-feed race (XIN-127): two writers can both see
+        ``get_by_rss_url -> None`` and both insert, violating the unique
+        ``rss_url`` constraint. On IntegrityError the session is rolled back
+        and the now-existing feed is re-fetched and updated instead of
+        propagating (which would poison the session for the rest of a crawl).
+        """
+        try:
+            feed = await self._get_or_create_feed(store, podcast)
+            await store.commit()
+        except IntegrityError:
+            logger.warning(
+                "Duplicate rss_url race for %s; adopting the existing feed",
+                podcast.feed_url,
+            )
+            await store.rollback()
+            feed = await self._get_or_create_feed(store, podcast)
+            await store.commit()
         return feed
 
     async def save_podcasts(self, store: Store, podcasts: List[Podcast]) -> List[Feed]:
         """
         Immediately persists a batch of discovered podcasts into the `feeds` table.
+
+        Batches the saves and commits once (XIN-129). On an IntegrityError
+        (e.g. a duplicate-feed race mid-batch) rolls back and falls back to
+        per-podcast saves, each with its own duplicate handling (XIN-127).
         """
-        saved_feeds: List[Feed] = []
-        for p in podcasts:
-            if p.feed_url:
-                feed = await self.save_podcast(store, p)
-                saved_feeds.append(feed)
+        candidates = [p for p in podcasts if p.feed_url]
+        try:
+            saved_feeds = [await self._get_or_create_feed(store, p) for p in candidates]
+            await store.commit()
+        except IntegrityError:
+            await store.rollback()
+            saved_feeds = [await self.save_podcast(store, p) for p in candidates]
         return saved_feeds
 
     async def discover_and_save_podcasts(
@@ -189,6 +223,13 @@ class FeedIngestionService:
             except ValueError:
                 feed = await store.feeds.get_by_rss_url(feed_or_id_or_url)
             if not feed:
+                # An invalid identifier (non-UUID, non-URL) must not create a
+                # placeholder Feed row — validate before saving (XIN-128).
+                if not _looks_like_url(feed_or_id_or_url):
+                    raise ValueError(
+                        f"Invalid feed identifier {feed_or_id_or_url!r}: "
+                        "expected a Feed, UUID, or http(s) URL"
+                    )
                 # If it's a URL and doesn't exist yet, create initial feed
                 feed = Feed(
                     rss_url=feed_or_id_or_url,
@@ -398,18 +439,46 @@ class FeedIngestionService:
         total_episodes_saved = 0
         failed_feeds: List[str] = []
 
-        for feed in pending_feeds:
+        # Capture PKs up front and re-fetch each feed inside the loop: a
+        # rollback in one iteration expires every instance in the session, so
+        # holding ORM objects across iterations would trigger implicit IO
+        # (MissingGreenlet) on the next attribute access.
+        pending_ids = [f.feed_id for f in pending_feeds]
+
+        for feed_id in pending_ids:
+            feed = await store.feeds.get_by_id(feed_id)
+            if feed is None:
+                continue
+            # Capture display fields now: sync_podcast_episodes may commit or
+            # leave the session in a failed state, expiring this instance.
+            rss_url = feed.rss_url
             # Per-feed exponential backoff: the SQL pre-filter uses the minimum
             # backoff window, so re-check the exact window for this feed here.
             if feed.sync_status == "error" and not _error_retry_due(feed, now):
                 continue
+            pre_error_count = feed.error_count
             try:
                 _, new_eps = await self.sync_podcast_episodes(store, feed, client=client)
                 total_synced += 1
                 total_episodes_saved += len(new_eps)
             except Exception as e:
-                logger.warning("Failed batch sync for feed %s: %s", feed.rss_url, str(e))
-                failed_feeds.append(str(feed.feed_id))
+                logger.warning("Failed batch sync for feed %s: %s", rss_url, str(e))
+                # XIN-127: a write failure (e.g. a duplicate-episode race in
+                # save_many) must not poison the shared session for the
+                # remaining feeds — roll back before continuing.
+                await store.rollback()
+                feed = await store.feeds.get_by_id(feed_id)
+                if feed is not None and feed.error_count == pre_error_count:
+                    # The fetch-error path inside sync_podcast_episodes marks
+                    # and commits the error state itself (bumping error_count);
+                    # only mark here when it didn't (e.g. a persistence-step
+                    # failure after a successful fetch).
+                    feed.error_count = pre_error_count + 1
+                    feed.sync_status = "error"
+                    feed.last_fetched_at = now
+                    feed = await store.feeds.save(feed)
+                    await store.commit()
+                failed_feeds.append(str(feed_id))
 
         return {
             "total_feeds_processed": len(pending_feeds),

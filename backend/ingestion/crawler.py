@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Set, Tuple, Union
 import httpx
 from backend.persistence.repositories import Store
 
@@ -9,7 +9,6 @@ from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
-from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
 
 logger = logging.getLogger(__name__)
@@ -52,6 +51,62 @@ class PodcastCrawler:
     # Stage 1: Breadth Crawling (Show Discovery & Immediate Persistence)
     # -------------------------------------------------------------------------
 
+    async def _crawl_and_save(
+        self,
+        store: Store,
+        items: Sequence[str],
+        fetch_for_item: Callable[[str, httpx.AsyncClient], Coroutine[Any, Any, List[Podcast]]],
+        progress_label: Callable[[str], str],
+        client: Optional[httpx.AsyncClient] = None,
+        on_progress: Optional[Callable[[str, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Shared crawl loop (XIN-129): for each item (country/topic), fetch
+        podcasts via ``fetch_for_item``, dedup by feed URL within this crawl,
+        persist via the service, report progress, and sleep politely.
+        Per-item failures are logged and the crawl continues.
+        """
+        total_discovered = 0
+        total_saved = 0
+        visited_urls: Set[str] = set()
+
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+            close_client = True
+
+        try:
+            for item in items:
+                try:
+                    podcasts = await fetch_for_item(item, client)
+                    total_discovered += len(podcasts)
+
+                    # Filter duplicates within current crawl session
+                    new_podcasts = [
+                        p for p in podcasts if p.feed_url and p.feed_url not in visited_urls
+                    ]
+                    for p in new_podcasts:
+                        visited_urls.add(p.feed_url)
+
+                    saved_feeds = await self.service.save_podcasts(store, new_podcasts)
+                    total_saved += len(saved_feeds)
+
+                    if on_progress:
+                        on_progress(progress_label(item), len(saved_feeds))
+
+                    await asyncio.sleep(self.request_delay)
+                except Exception as e:
+                    logger.error("Error crawling %s: %s", progress_label(item), str(e))
+        finally:
+            if close_client:
+                await client.aclose()
+
+        return {
+            "total_discovered": total_discovered,
+            "unique_saved": total_saved,
+            "items_crawled": list(items),
+        }
+
     async def crawl_top_charts(
         self,
         store: Store,
@@ -67,49 +122,26 @@ class PodcastCrawler:
         `countries` defaults to ingestion.crawler_countries from settings.yaml.
         """
         country_list = list(countries) if countries else get_crawler_countries()
-        total_discovered = 0
-        total_saved = 0
-        visited_urls: Set[str] = set()
 
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            close_client = True
+        async def _fetch(country: str, http_client: httpx.AsyncClient) -> List[Podcast]:
+            logger.info("Crawling top charts for country: %s...", country.upper())
+            return await self.itunes_client.get_top_podcasts(
+                limit=limit_per_chart,
+                country=country,
+                client=http_client,
+            )
 
-        try:
-            for country in country_list:
-                try:
-                    logger.info("Crawling top charts for country: %s...", country.upper())
-                    podcasts = await self.itunes_client.get_top_podcasts(
-                        limit=limit_per_chart,
-                        country=country,
-                        client=client,
-                    )
-                    total_discovered += len(podcasts)
-
-                    # Filter duplicates within current crawl session
-                    new_podcasts = [p for p in podcasts if p.feed_url and p.feed_url not in visited_urls]
-                    for p in new_podcasts:
-                        visited_urls.add(p.feed_url)
-
-                    saved_feeds = await self.service.save_podcasts(
-                        store, new_podcasts
-                    )
-                    total_saved += len(saved_feeds)
-
-                    if on_progress:
-                        on_progress(f"top_charts_{country}", len(saved_feeds))
-
-                    await asyncio.sleep(self.request_delay)
-                except Exception as e:
-                    logger.error("Error crawling top charts for country %s: %s", country, str(e))
-        finally:
-            if close_client:
-                await client.aclose()
-
+        stats = await self._crawl_and_save(
+            store,
+            country_list,
+            _fetch,
+            lambda c: f"top_charts_{c}",
+            client=client,
+            on_progress=on_progress,
+        )
         return {
-            "total_discovered": total_discovered,
-            "unique_saved": total_saved,
+            "total_discovered": stats["total_discovered"],
+            "unique_saved": stats["unique_saved"],
             "countries_crawled": country_list,
         }
 
@@ -127,51 +159,30 @@ class PodcastCrawler:
         Crawls podcasts across a list of keyword topics, immediately persisting discovered shows.
         Optionally filters for popular/established shows with at least `min_episodes`.
         """
-        total_discovered = 0
-        total_saved = 0
-        visited_urls: Set[str] = set()
+        topic_list = list(topics)
 
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            close_client = True
+        async def _fetch(topic: str, http_client: httpx.AsyncClient) -> List[Podcast]:
+            logger.info("Searching podcasts for topic: '%s'...", topic)
+            return await self.itunes_client.search_podcasts(
+                query=topic,
+                limit=limit_per_topic,
+                country=country,
+                min_episodes=min_episodes,
+                client=http_client,
+            )
 
-        try:
-            for topic in topics:
-                try:
-                    logger.info("Searching podcasts for topic: '%s'...", topic)
-                    podcasts = await self.itunes_client.search_podcasts(
-                        query=topic,
-                        limit=limit_per_topic,
-                        country=country,
-                        min_episodes=min_episodes,
-                        client=client,
-                    )
-                    total_discovered += len(podcasts)
-
-                    new_podcasts = [p for p in podcasts if p.feed_url and p.feed_url not in visited_urls]
-                    for p in new_podcasts:
-                        visited_urls.add(p.feed_url)
-
-                    saved_feeds = await self.service.save_podcasts(
-                        store, new_podcasts
-                    )
-                    total_saved += len(saved_feeds)
-
-                    if on_progress:
-                        on_progress(topic, len(saved_feeds))
-
-                    await asyncio.sleep(self.request_delay)
-                except Exception as e:
-                    logger.error("Error crawling topic '%s': %s", topic, str(e))
-        finally:
-            if close_client:
-                await client.aclose()
-
+        stats = await self._crawl_and_save(
+            store,
+            topic_list,
+            _fetch,
+            lambda t: t,
+            client=client,
+            on_progress=on_progress,
+        )
         return {
-            "total_discovered": total_discovered,
-            "unique_saved": total_saved,
-            "topics_crawled": list(topics),
+            "total_discovered": stats["total_discovered"],
+            "unique_saved": stats["unique_saved"],
+            "topics_crawled": topic_list,
         }
 
     async def crawl_alphabetical_prefixes(
@@ -205,12 +216,18 @@ class PodcastCrawler:
         collection_ids: Sequence[Union[int, str]],
         country: str = "us",
         client: Optional[httpx.AsyncClient] = None,
-    ) -> List[Feed]:
+    ) -> Dict[str, Any]:
         """
         Takes an arbitrary list of Apple Collection IDs, batches them into chunks of 200,
         resolves show details and RSS URLs in single HTTP calls, and saves them immediately.
+
+        Per-chunk failures (429-after-retries, timeouts, ...) are logged and the
+        run continues with the next chunk instead of aborting the whole ID list.
+        Returns the saved feeds plus the ``(start, end)`` index ranges of the
+        chunks that failed, so a caller can retry just those ranges.
         """
         all_saved_feeds: List[Feed] = []
+        failed_chunks: List[Tuple[int, int]] = []
         seen_feed_ids: Set[Any] = set()
         close_client = False
         if client is None:
@@ -221,24 +238,33 @@ class PodcastCrawler:
             # Chunk collection IDs into batches of up to 200
             for i in range(0, len(collection_ids), self.batch_size):
                 chunk = list(collection_ids[i : i + self.batch_size])
-                podcasts = await self.itunes_client.lookup_podcasts_by_ids(
-                    collection_ids=chunk,
-                    country=country,
-                    client=client,
-                )
-                saved_feeds = await self.service.save_podcasts(
-                    store, podcasts
-                )
-                for f in saved_feeds:
-                    if f.feed_id not in seen_feed_ids:
-                        seen_feed_ids.add(f.feed_id)
-                        all_saved_feeds.append(f)
+                try:
+                    podcasts = await self.itunes_client.lookup_podcasts_by_ids(
+                        collection_ids=chunk,
+                        country=country,
+                        client=client,
+                    )
+                    saved_feeds = await self.service.save_podcasts(
+                        store, podcasts
+                    )
+                    for f in saved_feeds:
+                        if f.feed_id not in seen_feed_ids:
+                            seen_feed_ids.add(f.feed_id)
+                            all_saved_feeds.append(f)
+                except Exception as e:
+                    logger.error(
+                        "Error resolving ID chunk [%d:%d]: %s",
+                        i,
+                        i + len(chunk),
+                        str(e),
+                    )
+                    failed_chunks.append((i, i + len(chunk)))
                 await asyncio.sleep(self.request_delay)
         finally:
             if close_client:
                 await client.aclose()
 
-        return all_saved_feeds
+        return {"saved_feeds": all_saved_feeds, "failed_chunks": failed_chunks}
 
     # -------------------------------------------------------------------------
     # Stage 2: Depth Crawling (Concurrent Episode Downloading for LLM)

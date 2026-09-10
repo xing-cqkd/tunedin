@@ -1,12 +1,14 @@
 import calendar
+import logging
 from datetime import datetime, timezone
-import time
 from typing import Any, List, Optional, Set, Tuple
 import feedparser
 import httpx
 from dateutil import parser as date_parser
 
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, ParsedFeedMetadata
+
+logger = logging.getLogger(__name__)
 
 
 class PodcastFeedParser:
@@ -80,6 +82,22 @@ class PodcastFeedParser:
 
         return None
 
+    # Audio file extensions used as a fallback signal when an enclosure's
+    # MIME type is missing or generic (XIN-126).
+    _AUDIO_EXTENSIONS = (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
+
+    @classmethod
+    def _is_audio_enclosure(cls, url: Optional[str], mime_type: Optional[str]) -> bool:
+        """True when an enclosure looks like audio.
+
+        Checks the MIME type first, falling back to the URL's file extension.
+        """
+        if not url:
+            return False
+        if (mime_type or "").startswith("audio/"):
+            return True
+        return url.lower().endswith(cls._AUDIO_EXTENSIONS)
+
     @classmethod
     def extract_audio_enclosure(cls, entry: dict) -> Tuple[Optional[str], Optional[str]]:
         """
@@ -91,19 +109,11 @@ class PodcastFeedParser:
             for enc in enclosures:
                 href = enc.get("href") or enc.get("url")
                 enc_type = enc.get("type", "")
-                if href:
-                    if enc_type.startswith("audio/") or any(
-                        href.lower().endswith(ext)
-                        for ext in (".mp3", ".m4a", ".aac", ".ogg", ".wav", ".opus")
-                    ):
-                        return href, enc_type or "audio/mpeg"
+                if cls._is_audio_enclosure(href, enc_type):
+                    return href, enc_type or "audio/mpeg"
 
-            # If no explicit audio type, check first enclosure if available
-            if enclosures and (enclosures[0].get("href") or enclosures[0].get("url")):
-                return (
-                    enclosures[0].get("href") or enclosures[0].get("url"),
-                    enclosures[0].get("type"),
-                )
+            # No audio-looking enclosure found: return None rather than a
+            # non-audio enclosure (e.g. a PDF transcript) as the audio URL.
 
         # 2. Media RSS tags (media_content)
         media_content = entry.get("media_content", [])
@@ -111,13 +121,7 @@ class PodcastFeedParser:
             for media in media_content:
                 url = media.get("url")
                 m_type = media.get("type", "")
-                if url and (
-                    m_type.startswith("audio/")
-                    or any(
-                        url.lower().endswith(ext)
-                        for ext in (".mp3", ".m4a", ".aac", ".ogg", ".wav")
-                    )
-                ):
+                if cls._is_audio_enclosure(url, m_type):
                     return url, m_type or "audio/mpeg"
 
         # 3. Links with rel=enclosure
@@ -127,7 +131,10 @@ class PodcastFeedParser:
                 if link.get("rel") == "enclosure":
                     href = link.get("href")
                     l_type = link.get("type", "")
-                    if href:
+                    # XIN-126: only audio enclosures — a non-audio enclosure
+                    # (e.g. application/pdf) must not be recorded as the
+                    # audio URL.
+                    if cls._is_audio_enclosure(href, l_type):
                         return href, l_type or "audio/mpeg"
 
         return None, None
@@ -285,6 +292,51 @@ class PodcastFeedParser:
         return None
 
     @classmethod
+    def _as_utc(cls, dt: Optional[datetime]) -> Optional[datetime]:
+        """Normalize an optional datetime to UTC-aware (None stays None)."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @classmethod
+    def _filter_new_episodes(
+        cls,
+        candidates: List[Tuple[str, Optional[datetime], Any]],
+        last_updated_at: Optional[datetime] = None,
+        known_guids: Optional[Set[str]] = None,
+    ) -> List[Tuple[str, Optional[datetime], Any]]:
+        """
+        Shared episode filtering pipeline used by ``parse_xml_content`` and
+        ``parse_json_content``. ``candidates`` is a list of
+        ``(guid, published_at, raw_entry)`` tuples where ``raw_entry`` is the
+        format-specific entry/item dict. Applies, in order: in-batch duplicate
+        dedup, the ``known_guids`` filter, and the incremental
+        ``last_updated_at`` cutoff. Returns the surviving candidates in order.
+        """
+        utc_last_updated_at = cls._as_utc(last_updated_at)
+        seen_in_batch: Set[str] = set()
+        kept: List[Tuple[str, Optional[datetime], Any]] = []
+        for guid, published_at, raw in candidates:
+            # In-batch duplicate deduplication
+            if guid in seen_in_batch:
+                continue
+            seen_in_batch.add(guid)
+
+            # Check known GUIDs filter
+            if known_guids and guid in known_guids:
+                continue
+
+            # Check incremental date filter
+            if utc_last_updated_at and published_at:
+                if published_at <= utc_last_updated_at:
+                    continue
+
+            kept.append((guid, published_at, raw))
+        return kept
+
+    @classmethod
     def parse_xml_content(
         cls,
         content: str | bytes,
@@ -296,20 +348,35 @@ class PodcastFeedParser:
     ) -> FeedParseResult:
         """
         Parses raw XML string or bytes, extracting metadata and filtering for new episodes.
+
+        Raises ValueError when the content does not parse as a usable feed
+        (feedparser's ``bozo`` flag set, or no usable feed title/link) so the
+        caller's fetch-error path marks the feed ``error`` instead of
+        overwriting its title with "Untitled Podcast".
         """
         parsed = feedparser.parse(content)
         feed_dict = parsed.get("feed", {})
 
-        # Ensure last_updated_at is UTC aware if provided
-        utc_last_updated_at: Optional[datetime] = None
-        if last_updated_at:
-            if last_updated_at.tzinfo is None:
-                utc_last_updated_at = last_updated_at.replace(tzinfo=timezone.utc)
-            else:
-                utc_last_updated_at = last_updated_at.astimezone(timezone.utc)
+        # feedparser never raises on malformed XML: an HTML error page, a
+        # truncated download, or an empty 200 body parses to an empty feed.
+        # Refuse to treat that as a successful parse (XIN-126).
+        has_identity = bool(feed_dict.get("title") or feed_dict.get("link"))
+        if parsed.get("bozo") or not has_identity:
+            bozo_exc = parsed.get("bozo_exception")
+            logger.warning(
+                "Rejecting unparsable feed content for %s (bozo=%s, title/link present=%s%s)",
+                rss_url,
+                bool(parsed.get("bozo")),
+                has_identity,
+                f", bozo_exception={bozo_exc!r}" if bozo_exc else "",
+            )
+            raise ValueError(
+                f"Feed content for {rss_url} did not parse as a usable RSS/Atom feed"
+            )
 
-        # 1. Extract Feed Metadata
-        title = feed_dict.get("title", "Untitled Podcast").strip()
+        # 1. Extract Feed Metadata (null-safe: a present-but-null title must
+        # not crash .strip(); XIN-126)
+        title = (feed_dict.get("title") or "Untitled Podcast").strip()
         author = feed_dict.get("author") or feed_dict.get("itunes_author") or feed_dict.get("publisher")
         description = feed_dict.get("subtitle") or feed_dict.get("description") or feed_dict.get("summary")
         link = feed_dict.get("link")
@@ -337,39 +404,28 @@ class PodcastFeedParser:
             last_modified=last_modified,
         )
 
-        # 2. Extract & Filter Episodes
+        # 2. Extract & Filter Episodes (shared pipeline; XIN-129)
         raw_entries = parsed.get("entries", [])
         total_episodes = len(raw_entries)
         new_episodes: List[ParsedEpisode] = []
-        seen_in_batch: Set[str] = set()
 
+        candidates: List[Tuple[str, Optional[datetime], Any]] = []
         for entry in raw_entries:
-            audio_url, enclosure_type = cls.extract_audio_enclosure(entry)
-            
+            audio_url, _ = cls.extract_audio_enclosure(entry)
+
             # Use id/guid, or fallback to audio_url or entry link
             guid = entry.get("id") or entry.get("guid") or audio_url or entry.get("link")
             if not guid:
                 continue
+            candidates.append((guid, cls.parse_published_date(entry), entry))
 
-            # In-batch duplicate deduplication
-            if guid in seen_in_batch:
-                continue
-            seen_in_batch.add(guid)
+        for guid, published_at, entry in cls._filter_new_episodes(
+            candidates, last_updated_at=last_updated_at, known_guids=known_guids
+        ):
+            audio_url, enclosure_type = cls.extract_audio_enclosure(entry)
 
-            # Check known GUIDs filter
-            if known_guids and guid in known_guids:
-                continue
-
-            # Extract Published Date
-            published_at = cls.parse_published_date(entry)
-
-            # Check incremental date filter
-            if utc_last_updated_at and published_at:
-                if published_at <= utc_last_updated_at:
-                    continue
-
-            # Extract Episode Title
-            ep_title = entry.get("title", "Untitled Episode").strip()
+            # Extract Episode Title (null-safe; XIN-126)
+            ep_title = (entry.get("title") or "Untitled Episode").strip()
 
             # Extract Duration
             raw_dur = entry.get("itunes_duration") or entry.get("duration")
@@ -432,6 +488,48 @@ class PodcastFeedParser:
         )
 
     @classmethod
+    def _extract_json_audio(cls, item: dict) -> Tuple[
+        Optional[str], Optional[str], Any, Optional[str]
+    ]:
+        """
+        Extract (audio_url, enclosure_type, raw_duration, transcript_url) from
+        a JSON Feed item, scanning ``attachments`` for audio / transcript
+        entries. Shared by guid-fallback computation and episode building.
+        """
+        audio_url = item.get("audio_url")
+        enclosure_type = item.get("enclosure_type", "audio/mpeg")
+        raw_duration = item.get("duration")
+        transcript_url = item.get("transcript_url")
+
+        attachments = item.get("attachments", [])
+        if isinstance(attachments, list):
+            for att in attachments:
+                m_type = att.get("mime_type", "")
+                u = att.get("url")
+                if u and (m_type.startswith("audio/") or not audio_url):
+                    audio_url = u
+                    enclosure_type = m_type or "audio/mpeg"
+                    if "duration_in_seconds" in att:
+                        raw_duration = att["duration_in_seconds"]
+                elif u and (m_type.startswith("text/vtt") or "transcript" in m_type):
+                    transcript_url = u
+
+        return audio_url, enclosure_type, raw_duration, transcript_url
+
+    @classmethod
+    def _parse_json_published_at(cls, item: dict) -> Optional[datetime]:
+        """Parse a JSON Feed item's published date to UTC-aware datetime."""
+        published_at = None
+        raw_date = item.get("date_published") or item.get("published_at") or item.get("published")
+        if raw_date and isinstance(raw_date, str):
+            try:
+                dt = date_parser.parse(raw_date)
+                published_at = cls._as_utc(dt)
+            except Exception:
+                pass
+        return published_at
+
+    @classmethod
     def parse_json_content(
         cls,
         content: str | bytes | dict,
@@ -454,16 +552,8 @@ class PodcastFeedParser:
         else:
             raise ValueError(f"Unsupported content type for JSON parsing: {type(content)}")
 
-        # Ensure last_updated_at is UTC aware if provided
-        utc_last_updated_at: Optional[datetime] = None
-        if last_updated_at:
-            if last_updated_at.tzinfo is None:
-                utc_last_updated_at = last_updated_at.replace(tzinfo=timezone.utc)
-            else:
-                utc_last_updated_at = last_updated_at.astimezone(timezone.utc)
-
-        # 1. Feed Metadata
-        title = data.get("title", "Untitled Podcast").strip()
+        # 1. Feed Metadata (null-safe; XIN-126)
+        title = (data.get("title") or "Untitled Podcast").strip()
         author = None
         if "author" in data and isinstance(data["author"], dict):
             author = data["author"].get("name")
@@ -489,61 +579,25 @@ class PodcastFeedParser:
             last_modified=last_modified,
         )
 
-        # 2. Episode Items
-        items = data.get("items", [])
+        # 2. Episode Items (null-safe; XIN-126; shared pipeline; XIN-129)
+        items = data.get("items") or []
         total_episodes = len(items)
-        new_episodes: List[ParsedEpisode] = []
-        seen_in_batch: Set[str] = set()
 
+        candidates: List[Tuple[str, Optional[datetime], Any]] = []
         for item in items:
-            audio_url = item.get("audio_url")
-            enclosure_type = item.get("enclosure_type", "audio/mpeg")
-            raw_duration = item.get("duration")
-            transcript_url = item.get("transcript_url")
-
-            # Check JSON Feed attachments
-            attachments = item.get("attachments", [])
-            if isinstance(attachments, list):
-                for att in attachments:
-                    m_type = att.get("mime_type", "")
-                    u = att.get("url")
-                    if u and (m_type.startswith("audio/") or not audio_url):
-                        audio_url = u
-                        enclosure_type = m_type or "audio/mpeg"
-                        if "duration_in_seconds" in att:
-                            raw_duration = att["duration_in_seconds"]
-                    elif u and (m_type.startswith("text/vtt") or "transcript" in m_type):
-                        transcript_url = u
-
+            audio_url, _, _, _ = cls._extract_json_audio(item)
             guid = item.get("id") or item.get("guid") or audio_url or item.get("url")
             if not guid:
                 continue
+            candidates.append((guid, cls._parse_json_published_at(item), item))
 
-            if guid in seen_in_batch:
-                continue
-            seen_in_batch.add(guid)
+        new_episodes: List[ParsedEpisode] = []
+        for guid, published_at, item in cls._filter_new_episodes(
+            candidates, last_updated_at=last_updated_at, known_guids=known_guids
+        ):
+            audio_url, enclosure_type, raw_duration, transcript_url = cls._extract_json_audio(item)
 
-            if known_guids and guid in known_guids:
-                continue
-
-            # Parse published date
-            published_at = None
-            raw_date = item.get("date_published") or item.get("published_at") or item.get("published")
-            if raw_date and isinstance(raw_date, str):
-                try:
-                    dt = date_parser.parse(raw_date)
-                    if dt.tzinfo is None:
-                        published_at = dt.replace(tzinfo=timezone.utc)
-                    else:
-                        published_at = dt.astimezone(timezone.utc)
-                except Exception:
-                    pass
-
-            if utc_last_updated_at and published_at:
-                if published_at <= utc_last_updated_at:
-                    continue
-
-            ep_title = item.get("title", "Untitled Episode").strip()
+            ep_title = (item.get("title") or "Untitled Episode").strip()
             duration_secs = cls.parse_duration(raw_duration)
             summary = item.get("summary") or item.get("content_text") or item.get("content_html")
             ep_link = item.get("url")

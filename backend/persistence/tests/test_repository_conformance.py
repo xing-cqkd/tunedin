@@ -262,9 +262,20 @@ class TestRepositoryConformance:
                 last_fetched_at=cutoff - timedelta(days=30),
             )
         )
+        # NULL last_fetched_at error row -> due (XIN-128: must not be stranded)
+        null_ts = await store.feeds.save(
+            _feed(
+                "https://e.com/nullts.xml",
+                "NullTs",
+                sync_status="error",
+                error_count=1,
+                last_fetched_at=None,
+                created_at=_T0 + timedelta(hours=1),
+            )
+        )
 
         rows = await store.feeds.list_error_due_retry(cutoff, max_attempts=3)
-        assert [f.feed_id for f in rows] == [due.feed_id]
+        assert [f.feed_id for f in rows] == [due.feed_id, null_ts.feed_id]
 
     async def test_feed_counts(self, store: Store):
         assert await store.feeds.count_all() == 0

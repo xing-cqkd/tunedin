@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from uuid import UUID
 
-from sqlalchemy import and_, event, func, select
+from sqlalchemy import and_, event, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -124,14 +124,18 @@ class _FeedRepository(FeedRepository):
     ) -> list[Feed]:
         # Coarse SQL pre-filter from FeedIngestionService.sync_all_pending_feeds
         # (XIN-34). Callers still re-check the exact per-feed backoff window.
+        # Error rows with a NULL last_fetched_at are included (XIN-128): they
+        # can arise from direct inserts/migrations and must not be stranded.
         stmt = (
             select(Feed)
             .where(
                 and_(
                     Feed.sync_status == "error",
                     Feed.error_count < max_attempts,
-                    Feed.last_fetched_at.is_not(None),
-                    Feed.last_fetched_at <= cutoff,
+                    or_(
+                        Feed.last_fetched_at.is_(None),
+                        Feed.last_fetched_at <= cutoff,
+                    ),
                 )
             )
             .order_by(Feed.created_at.asc())

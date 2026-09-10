@@ -200,3 +200,111 @@ class TestITunesSearchClient:
             assert attempts == 2
             assert len(podcasts) == 1
             assert podcasts[0].title == "Recovered Show"
+
+
+    # ------------------------------------------------------------------
+    # XIN-128 / XIN-130: retry branches and edge cases
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_5xx_retry_then_success(self):
+        attempts = 0
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                return httpx.Response(status_code=503, text="unavailable")
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "resultCount": 1,
+                    "results": [
+                        {
+                            "collectionId": 42,
+                            "collectionName": "Recovered",
+                            "feedUrl": "https://recovered.example.com/rss",
+                        }
+                    ],
+                },
+            )
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            search_client = ITunesSearchClient(max_retries=3)
+            podcasts = await search_client.search_podcasts("retry", client=client)
+
+        assert attempts == 3
+        assert len(podcasts) == 1
+        assert podcasts[0].title == "Recovered"
+
+    @pytest.mark.asyncio
+    async def test_connect_error_retry_then_success(self):
+        attempts = 0
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectError("boom", request=request)
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "resultCount": 1,
+                    "results": [
+                        {
+                            "collectionId": 43,
+                            "collectionName": "Reconnected",
+                            "feedUrl": "https://reconnected.example.com/rss",
+                        }
+                    ],
+                },
+            )
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            search_client = ITunesSearchClient(max_retries=2)
+            podcasts = await search_client.search_podcasts("retry", client=client)
+
+        assert attempts == 2
+        assert podcasts[0].title == "Reconnected"
+
+    @pytest.mark.asyncio
+    async def test_retries_exhausted_raises(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=500, text="still down")
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            search_client = ITunesSearchClient(max_retries=1)
+            with pytest.raises(httpx.HTTPStatusError):
+                await search_client.search_podcasts("retry", client=client)
+
+    @pytest.mark.asyncio
+    async def test_timeout_exhausted_raises(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.TimeoutException("timed out", request=request)
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            search_client = ITunesSearchClient(max_retries=0)
+            with pytest.raises(httpx.TimeoutException):
+                await search_client.search_podcasts("retry", client=client)
+
+    @pytest.mark.asyncio
+    async def test_lookup_podcasts_by_ids_empty(self):
+        search_client = ITunesSearchClient()
+        assert await search_client.lookup_podcasts_by_ids([]) == []
+        assert await search_client.lookup_podcasts_by_ids(["  "]) == []
+
+    @pytest.mark.asyncio
+    async def test_get_top_podcasts_empty_chart(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200, json={"feed": {"title": "Top", "results": []}}
+            )
+
+        transport = httpx.MockTransport(mock_handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            search_client = ITunesSearchClient()
+            assert await search_client.get_top_podcasts(limit=5, client=client) == []

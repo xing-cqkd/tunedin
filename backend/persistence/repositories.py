@@ -136,8 +136,10 @@ class FeedRepository(ABC):
         """Return errored feeds that are due for a retry.
 
         Matches feeds with ``sync_status == 'error'``,
-        ``last_fetched_at <= cutoff`` and ``error_count < max_attempts``.
-        Ordered by ``created_at`` ascending (same tie rule as
+        ``error_count < max_attempts`` and (``last_fetched_at`` NULL or
+        ``last_fetched_at <= cutoff``). NULL ``last_fetched_at`` error rows
+        (possible via direct inserts/migrations) are included so they are not
+        stranded forever. Ordered by ``created_at`` ascending (same tie rule as
         :meth:`list_by_statuses`). Callers re-check the per-feed backoff
         window themselves; this method applies only the coarse filter.
         """

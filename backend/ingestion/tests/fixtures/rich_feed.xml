@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+     xmlns:podcast="https://podcastindex.org/namespace/1.0"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/">
+  <channel>
+    <title>Rich Media Podcast</title>
+    <link>https://rich.example.com</link>
+    <language>en-us</language>
+    <itunes:author>Rich Author</itunes:author>
+    <description>A feed exercising transcript, chapters, content HTML, and episode image extraction.</description>
+    <item>
+      <title>Episode With Extras</title>
+      <guid>rich-ep-1</guid>
+      <pubDate>Mon, 05 Jan 2026 10:00:00 GMT</pubDate>
+      <enclosure url="https://rich.example.com/ep1.mp3" length="1000" type="audio/mpeg"/>
+      <description>Plain description</description>
+      <content:encoded><![CDATA[<p>Full <strong>HTML</strong> shownotes</p>]]></content:encoded>
+      <itunes:image href="https://rich.example.com/ep1.jpg"/>
+      <podcast:transcript url="https://rich.example.com/ep1.vtt" type="text/vtt"/>
+      <podcast:chapters url="https://rich.example.com/ep1.json" type="application/json+chapters"/>
+      <itunes:duration>3600</itunes:duration>
+    </item>
+    <item>
+      <title>PDF Only Episode</title>
+      <guid>rich-ep-2</guid>
+      <pubDate>Tue, 06 Jan 2026 10:00:00 GMT</pubDate>
+      <enclosure url="https://rich.example.com/notes.pdf" length="500" type="application/pdf"/>
+      <description>PDF notes only, no audio</description>
+    </item>
+  </channel>
+</rss>

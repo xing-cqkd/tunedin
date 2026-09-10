@@ -387,3 +387,202 @@ class TestIngestionService:
 
             assert len(second_run_eps) == 0
             assert feed2.feed_id == feed.feed_id
+
+
+# ---------------------------------------------------------------------------
+# XIN-126: parser robustness (bozo check, null handling, enclosure filtering)
+# ---------------------------------------------------------------------------
+
+
+class TestParserRobustness:
+    """Malformed feeds must raise ValueError (never silently produce a feed)."""
+
+    def test_malformed_html_raises_value_error(self):
+        with pytest.raises(ValueError):
+            PodcastFeedParser.parse_xml_content(
+                "<html><body>This is not a feed</body></html>",
+                rss_url="https://example.com/feed.xml",
+            )
+
+    def test_empty_content_raises_value_error(self):
+        with pytest.raises(ValueError):
+            PodcastFeedParser.parse_xml_content(
+                "", rss_url="https://example.com/feed.xml"
+            )
+
+    def test_truncated_xml_raises_value_error(self):
+        with pytest.raises(ValueError):
+            PodcastFeedParser.parse_xml_content(
+                '<?xml version="1.0"?><rss version="2.0"><channel><title>Cut',
+                rss_url="https://example.com/feed.xml",
+            )
+
+    def test_feed_without_title_or_link_raises_value_error(self):
+        with pytest.raises(ValueError):
+            PodcastFeedParser.parse_xml_content(
+                '<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>',
+                rss_url="https://example.com/feed.xml",
+            )
+
+    def test_feed_with_link_but_no_title_does_not_raise(self):
+        result = PodcastFeedParser.parse_xml_content(
+            '<?xml version="1.0"?><rss version="2.0">'
+            "<channel><link>https://example.com</link></channel></rss>",
+            rss_url="https://example.com/feed.xml",
+        )
+        assert result.metadata.title == "Untitled Podcast"
+        assert result.episodes == []
+
+    def test_xml_entry_without_title_gets_default(self):
+        result = PodcastFeedParser.parse_xml_content(
+            '<?xml version="1.0"?><rss version="2.0">'
+            "<channel><title>T</title><link>https://example.com</link>"
+            "<item><guid>g1</guid>"
+            '<enclosure url="https://example.com/e.mp3" type="audio/mpeg"/>'
+            "</item></channel></rss>",
+            rss_url="https://example.com/feed.xml",
+        )
+        assert len(result.episodes) == 1
+        assert result.episodes[0].title == "Untitled Episode"
+
+    def test_json_items_null_does_not_crash(self):
+        result = PodcastFeedParser.parse_json_content(
+            {"title": "JSON Cast", "items": None},
+            rss_url="https://example.com/feed.json",
+        )
+        assert result.metadata.title == "JSON Cast"
+        assert result.episodes == []
+
+    def test_json_null_feed_title_does_not_crash(self):
+        result = PodcastFeedParser.parse_json_content(
+            {"title": None, "items": []},
+            rss_url="https://example.com/feed.json",
+        )
+        assert result.metadata.title == "Untitled Podcast"
+
+    def test_json_null_episode_title_does_not_crash(self):
+        result = PodcastFeedParser.parse_json_content(
+            {
+                "title": "JSON Cast",
+                "items": [
+                    {
+                        "id": "ep-1",
+                        "title": None,
+                        "attachments": [
+                            {"url": "https://example.com/ep1.mp3", "mime_type": "audio/mpeg"}
+                        ],
+                    }
+                ],
+            },
+            rss_url="https://example.com/feed.json",
+        )
+        assert len(result.episodes) == 1
+        assert result.episodes[0].title == "Untitled Episode"
+
+    def test_pdf_only_enclosure_has_no_audio_url(self, rich_feed_xml: str):
+        """XIN-126: a PDF enclosure must not be recorded as the audio URL."""
+        result = PodcastFeedParser.parse_xml_content(
+            rich_feed_xml, rss_url="https://rich.example.com/feed.xml"
+        )
+        pdf_ep = next(e for e in result.episodes if e.title == "PDF Only Episode")
+        assert pdf_ep.audio_url == ""
+        assert pdf_ep.enclosure_type is None
+
+        audio_ep = next(e for e in result.episodes if e.title == "Episode With Extras")
+        assert audio_ep.audio_url == "https://rich.example.com/ep1.mp3"
+        assert audio_ep.enclosure_type == "audio/mpeg"
+
+    def test_rich_feed_extracts_transcript_chapters_content_image(
+        self, rich_feed_xml: str
+    ):
+        result = PodcastFeedParser.parse_xml_content(
+            rich_feed_xml, rss_url="https://rich.example.com/feed.xml"
+        )
+        ep = next(e for e in result.episodes if e.title == "Episode With Extras")
+        assert ep.transcript_url == "https://rich.example.com/ep1.vtt"
+        assert ep.chapters_url == "https://rich.example.com/ep1.json"
+        assert "<strong>HTML</strong>" in (ep.content_html or "")
+        assert ep.image_url == "https://rich.example.com/ep1.jpg"
+
+    def test_parse_published_date_unparseable_returns_none(self):
+        assert (
+            PodcastFeedParser.parse_published_date({"published": "not a date"})
+            is None
+        )
+
+    def test_parse_published_date_naive_string_assumes_utc(self):
+        dt = PodcastFeedParser.parse_published_date(
+            {"published": "2026-01-05 10:00:00"}
+        )
+        assert dt is not None
+        assert dt.tzinfo == timezone.utc
+
+
+@pytest.fixture
+def rich_feed_xml() -> str:
+    with open(FIXTURES_DIR / "rich_feed.xml", "r", encoding="utf-8") as f:
+        return f.read()
+
+
+class TestFetchAndParseErrors:
+    """HTTP/network failures must surface as exceptions (XIN-126)."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_404_raises(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=404, text="not found")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await PodcastFeedParser.fetch_and_parse(
+                    "https://example.com/feed.xml", client=client
+                )
+
+    @pytest.mark.asyncio
+    async def test_fetch_500_raises(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=500, text="boom")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await PodcastFeedParser.fetch_and_parse(
+                    "https://example.com/feed.xml", client=client
+                )
+
+    @pytest.mark.asyncio
+    async def test_fetch_network_error_raises(self):
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            with pytest.raises(httpx.ConnectError):
+                await PodcastFeedParser.fetch_and_parse(
+                    "https://example.com/feed.xml", client=client
+                )
+
+    @pytest.mark.asyncio
+    async def test_fetch_sends_conditional_headers(self, sample_feed_xml: str):
+        seen = {}
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            seen["if-none-match"] = request.headers.get("If-None-Match")
+            seen["if-modified-since"] = request.headers.get("If-Modified-Since")
+            return httpx.Response(status_code=200, text=sample_feed_xml)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            await PodcastFeedParser.fetch_and_parse(
+                "https://example.com/feed.xml",
+                etag='"etag-1"',
+                last_modified="Mon, 24 Jan 2026 12:00:00 GMT",
+                client=client,
+            )
+        assert seen["if-none-match"] == '"etag-1"'
+        assert seen["if-modified-since"] == "Mon, 24 Jan 2026 12:00:00 GMT"

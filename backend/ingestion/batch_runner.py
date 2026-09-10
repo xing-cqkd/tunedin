@@ -178,17 +178,9 @@ async def run_batch_ingest(
                     logger.warning(last_error_msg)
                     logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL: {show_label} ({str(err)[:40]})")
 
-                # Live checkpoint progress after each podcast
-                await write_progress_file(
-                    batch_num=batch_idx,
-                    total_batches=max_batches,
-                    batch_synced_shows=batch_synced,
-                    batch_new_episodes=batch_episodes,
-                    recent_logs=logs,
-                    last_error=last_error_msg,
-                )
-
-            # 3. Checkpoint progress after batch
+            # 3. Checkpoint progress after batch (XIN-129: the per-feed write
+            # ran 5 count queries + rewrote the markdown file after EVERY
+            # feed; batch-boundary writes are sufficient).
             await write_progress_file(
                 batch_num=batch_idx,
                 total_batches=max_batches,

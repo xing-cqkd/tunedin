@@ -5,7 +5,6 @@ import sys
 from typing import List, Optional
 
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
-from backend.ingestion.service import FeedIngestionService
 from settings import describe_database, get_crawler_countries, init_db, session_scope
 
 logging.basicConfig(
@@ -71,10 +70,7 @@ async def run_crawl(
             print(f"✅ Top Charts Harvest complete: {chart_stats['unique_saved']} unique shows saved.")
 
         if mode in ("topics", "all"):
-            t_list = topics or [
-                "Artificial Intelligence", "Neuroscience", "Venture Capital",
-                "Software Engineering", "Physics", "Philosophy"
-            ]
+            t_list = topics or DEFAULT_TOPICS
             print(f"\n🚀 Harvesting Topic Taxonomy ({len(t_list)} topics, limit {limit} per topic, min_episodes={min_episodes})...")
             topic_stats = await crawler.crawl_topics(
                 store=store,
