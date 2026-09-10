@@ -19,11 +19,15 @@ webhooks (see the spec's "Polling contract, no webhooks (v1)" decision):
     ``since``), ``removed``, ``reordered``, the full ordered ``items``
     snapshot, and ``last_modified`` (use as the next ``since``).
 
-Caching contract (all three endpoints): strong ETag over the response body
-plus ``Last-Modified``; ``If-None-Match`` / ``If-Modified-Since`` yield 304
-on the GETs. ``Cache-Control: public, max-age=900`` documents the 15-minute
-TTL — clients should poll no more often than that. (The POST sets the same
-headers on its response but is never answered 304: it always mutates.)
+Caching contract: strong ETag over the response body plus
+``Last-Modified``; ``If-None-Match`` / ``If-Modified-Since`` yield 304
+on the GETs. The GETs send ``<scope>, max-age=900`` (15-minute TTL —
+clients should poll no more often than that), where the scope is
+``private`` for unlisted playlists — their metadata embeds the ``?t=``
+capability token in ``feed_url`` / ``landing_url`` — and ``public``
+otherwise. The POST sends ``no-store``: it always mutates, so a shared
+cache may never serve a stale pre-rotation response. (The POST is never
+answered 304: it always mutates.)
 
 Changelog design choice (documented honestly, per the issue):
 ``removed`` and ``reordered`` are *reserved* and always ``[]`` in v1. The
@@ -37,7 +41,11 @@ the documented TTL") is met through it.
 
 Rate limiting: generous per-IP sliding window (default 600 requests per 15
 minutes — far above any sane polling cadence), 429 with ``Retry-After``
-when exceeded. The limiter is in-memory and therefore single-process; a
+when exceeded. The limiter keys on ``request.client.host``, which is the
+direct TCP peer: deployments behind a proxy or load balancer must resolve
+the real client IP (e.g. honor ``X-Forwarded-For`` only from trusted
+proxies via middleware) or every client behind the proxy shares one
+bucket. The limiter is in-memory and therefore single-process; a
 Redis-backed limiter is the follow-up when this API runs on more than one
 process. There is deliberately no podcatcher User-Agent allowlist.
 """
@@ -54,6 +62,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
+from backend.api._etag import parse_if_none_match
 from backend.api.feeds import get_store, playlist_last_modified
 from backend.api.rss import ensure_aware
 from backend.persistence.models import CuratedPlaylist
@@ -74,12 +83,22 @@ class RateLimiter:
         self._hits: dict[str, deque[float]] = {}
 
     def check(self, ip: str) -> float | None:
-        """Record a hit; return seconds until retry when over the limit."""
+        """Record a hit; return seconds until retry when over the limit.
+
+        Sync and await-free, so no two calls can interleave on a single
+        event loop: no locking is needed.
+        """
         now = time.monotonic()
         cutoff = now - self.window_seconds
         hits = self._hits.setdefault(ip, deque())
         while hits and hits[0] <= cutoff:
             hits.popleft()
+        if not hits:
+            # Evict fully-expired buckets so _hits doesn't accumulate one
+            # key per distinct IP ever seen (eviction is lazy: other IPs'
+            # entries are dropped when they next call check()).
+            del self._hits[ip]
+            hits = self._hits[ip] = deque()
         if len(hits) >= self.limit:
             return max(0.0, hits[0] + self.window_seconds - now)
         hits.append(now)
@@ -90,6 +109,8 @@ async def rate_limited(request: Request):
     """FastAPI dependency: 429 + Retry-After when the IP is over the limit."""
     limiter: RateLimiter = request.app.state.rate_limiter
     client = request.client
+    # Direct TCP peer; behind a proxy/LB deployments must resolve the real
+    # client IP instead (see the module docstring and create_app).
     ip = client.host if client else "unknown"
     retry_after = limiter.check(ip)
     if retry_after is not None:
@@ -143,23 +164,39 @@ def _landing_url(base: str, playlist: CuratedPlaylist) -> str:
     return url
 
 
+def _cache_scope(playlist: CuratedPlaylist) -> str:
+    """Shared-cache scope for JSON responses about a playlist.
+
+    Mirrors ``feeds.py``: unlisted playlists' metadata embeds the ``?t=``
+    capability token in ``feed_url`` / ``landing_url``, so those responses
+    must be ``private``; public playlists' are ``public``.
+    """
+    return "public" if playlist.visibility == "public" else "private"
+
+
 def _json_response(
-    *, request: Request, payload: dict, last_modified: datetime
+    *,
+    request: Request,
+    payload: dict,
+    last_modified: datetime,
+    cache_control: str = "public, max-age=900",
 ) -> Response:
-    """JSON body with ETag / Last-Modified / 15-min Cache-Control.
+    """JSON body with ETag / Last-Modified / Cache-Control.
 
     ``If-None-Match`` wins over ``If-Modified-Since``; a malformed
     ``If-Modified-Since`` is ignored and the body is served.
+    ``cache_control`` lets endpoints override the default 15-minute
+    ``public`` TTL (e.g. the rotate-token POST sends ``no-store``).
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     etag = '"' + hashlib.sha256(body).hexdigest() + '"'
     headers = {
         "ETag": etag,
         "Last-Modified": format_datetime(ensure_aware(last_modified)),
-        "Cache-Control": "public, max-age=900",
+        "Cache-Control": cache_control,
     }
     inm = request.headers.get("if-none-match")
-    if inm is not None and (inm.strip() == "*" or etag in _etag_set(inm)):
+    if inm is not None and (inm.strip() == "*" or etag in parse_if_none_match(inm)):
         return Response(status_code=304, headers=headers)
     ims = request.headers.get("if-modified-since")
     if ims:
@@ -173,10 +210,6 @@ def _json_response(
     return Response(
         content=body, media_type="application/json", headers=headers
     )
-
-
-def _etag_set(value: str) -> set[str]:
-    return {part.strip() for part in value.split(",") if part.strip()}
 
 
 def _parse_since(value: str) -> datetime:
@@ -217,7 +250,10 @@ async def feed_metadata(
         "last_modified": last_modified.isoformat(),
     }
     return _json_response(
-        request=request, payload=payload, last_modified=last_modified
+        request=request,
+        payload=payload,
+        last_modified=last_modified,
+        cache_control=f"{_cache_scope(playlist)}, max-age=900",
     )
 
 
@@ -229,8 +265,10 @@ async def rotate_feed_token(
 ):
     """Rotate the unlisted token; returns the new subscribable URLs.
 
-    Always mutates, so the response is never 304 — but it still carries
-    ETag / Last-Modified / Cache-Control like the rest of the contract.
+    Always mutates, so the response is never 304 — and it is
+    ``Cache-Control: no-store`` so no shared cache can serve a stale
+    pre-rotation response (stricter than the ``private`` scope the GETs
+    use for unlisted playlists).
     """
     playlist = await _published_playlist(store, playlist_id)
     new_token = await store.playlists.rotate_token(playlist.playlist_id)
@@ -248,7 +286,10 @@ async def rotate_feed_token(
         "token_revoked_at": last_modified.isoformat(),
     }
     return _json_response(
-        request=request, payload=payload, last_modified=last_modified
+        request=request,
+        payload=payload,
+        last_modified=last_modified,
+        cache_control="no-store",
     )
 
 
@@ -264,11 +305,19 @@ async def feed_changes(
     ``added`` holds episodes with ``added_at`` after ``since``.
     ``removed`` / ``reordered`` are reserved (always ``[]`` in v1 — see the
     module docstring); clients detect reorders by diffing ``items``.
+
+    Like ``feed_metadata``, a token rotation advances ``last_modified``
+    so both endpoints agree on what "changed" means. This is safe for
+    since-chaining: ``added`` is filtered on ``added_at > since``, so a
+    rotation instant never swallows an episode from the changelog.
     """
     playlist = await _published_playlist(store, playlist_id)
     since_dt = _parse_since(since)
     entries = await store.playlists.list_entries(playlist.playlist_id)
     last_modified = playlist_last_modified(playlist, entries)
+    revoked_at = ensure_aware(playlist.token_revoked_at)
+    if revoked_at is not None and revoked_at > last_modified:
+        last_modified = revoked_at
 
     def _entry(e) -> dict:
         return {
@@ -293,5 +342,8 @@ async def feed_changes(
         "items": items,
     }
     return _json_response(
-        request=request, payload=payload, last_modified=last_modified
+        request=request,
+        payload=payload,
+        last_modified=last_modified,
+        cache_control=f"{_cache_scope(playlist)}, max-age=900",
     )

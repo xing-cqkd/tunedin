@@ -294,9 +294,12 @@ def test_changes_detects_add(api_client):
     assert body["reordered"] == []
 
     # A later add is detected on the next poll; nothing else changes.
+    # position=-1 keeps the ordering deterministic: both backends order by
+    # (position ASC, episode_id ASC) and episode_ids are random UUIDs, so
+    # two entries at position 0 would make items[0] a coin flip.
     ep3 = _run(
         _add_episode(
-            factory, seed["feed_id"], "Ep Three", 0, pl.playlist_id
+            factory, seed["feed_id"], "Ep Three", -1, pl.playlist_id
         )
     )
     second = client.get(base, params={"since": body["last_modified"]})

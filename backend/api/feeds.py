@@ -39,6 +39,7 @@ from email.utils import format_datetime, parsedate_to_datetime
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from backend.api.rss import build_rss, ensure_aware, rfc2822
+from backend.api._etag import parse_if_none_match
 from backend.persistence.models import CuratedPlaylist
 from backend.persistence.repositories import Store
 
@@ -169,7 +170,7 @@ def _rss_response(
 
     # Conditional requests: If-None-Match wins over If-Modified-Since.
     inm = request.headers.get("if-none-match")
-    if inm is not None and (inm.strip() == "*" or etag in _parse_if_none_match(inm)):
+    if inm is not None and (inm.strip() == "*" or etag in parse_if_none_match(inm)):
         return Response(status_code=304, headers=headers)
     ims = request.headers.get("if-modified-since")
     if ims:
@@ -185,19 +186,6 @@ def _rss_response(
         media_type="application/rss+xml; charset=utf-8",
         headers=headers,
     )
-
-
-def _parse_if_none_match(value: str) -> set[str]:
-    """Parse an ``If-None-Match`` header into comparable tags, stripping the
-    ``W/`` weak-validator prefix so a weak validator still matches."""
-    tags = set()
-    for part in value.split(","):
-        part = part.strip()
-        if part.startswith("W/"):
-            part = part[2:].strip()
-        if part:
-            tags.add(part)
-    return tags
 
 
 def _base(request: Request) -> str:
