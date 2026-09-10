@@ -49,11 +49,11 @@ bucket. The limiter is in-memory and therefore single-process; a
 Redis-backed limiter is the follow-up when this API runs on more than one
 process. There is deliberately no podcatcher User-Agent allowlist.
 
-PRODUCT DECISION NEEDED (XIN-118): the limiter is wired only into the
-developer router (``/api/v1/...``); the public feed routes
-(``/f/<slug>``, ``/f/<slug>/feed.xml``) re-render full RSS with no
-throttle. Either wire the limiter into the feeds router or decide
-explicitly to leave public feeds unlimited — not implemented here.
+XIN-118 (decided 2026-09-09): the limiter is also wired into the
+public feeds router (``/f/<slug>``, ``/f/<slug>/feed.xml``) via
+``include_router(dependencies=[Depends(rate_limited)])`` — the same
+600 req / 15 min in-memory budget is shared with the developer routes,
+since public feed rendering is unauthenticated and database-backed.
 """
 
 from __future__ import annotations

@@ -31,20 +31,24 @@ def parse_if_none_match(value: str) -> set[str]:
 
 
 def check_conditional(
-    request: Request, *, etag: str, last_modified
+    request: Request,
+    *,
+    etag: str,
+    last_modified,
+    headers: dict | None = None,
 ) -> Response | None:
     """Evaluate conditional headers; return a 304 Response when not modified.
 
     ``If-None-Match`` wins: when it is present but matches nothing,
     ``If-Modified-Since`` is ignored entirely (RFC 9110 13.1.4). A
     malformed ``If-Modified-Since`` is ignored and the body is served
-    (returns ``None``). The returned 304 carries the same ETag /
-    Last-Modified headers as the 200 would.
+    (returns ``None``). The returned 304 carries the caller's response
+    headers (ETag / Last-Modified / Cache-Control / Vary), so validators
+    and cache directives match the 200.
     """
-    headers = {
-        "ETag": etag,
-        "Last-Modified": format_datetime(ensure_aware(last_modified)),
-    }
+    headers = dict(headers) if headers else {}
+    headers.setdefault("ETag", etag)
+    headers.setdefault("Last-Modified", format_datetime(ensure_aware(last_modified)))
     inm = request.headers.get("if-none-match")
     if inm is not None:
         if inm.strip() == "*" or etag in parse_if_none_match(inm):

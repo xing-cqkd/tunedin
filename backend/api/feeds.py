@@ -109,6 +109,23 @@ def _not_found_html(slug: str) -> str:
     )
 
 
+def _html_stub(*, title: str, feed_url: str) -> str:
+    """Minimal landing-page stub. The full page + subscribe UX is XIN-99;
+    this only guarantees the title and the RSS autodiscovery link."""
+    safe_title = html.escape(title)
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{safe_title} — TuneIn</title>"
+        f"<link rel='alternate' type='application/rss+xml' title='{safe_title}' href='{html.escape(feed_url)}'>"
+        "</head><body>"
+        f"<h1>{safe_title}</h1>"
+        "<p>A curated podcast feed. The full landing page is coming soon — "
+        "subscribe with the RSS link below.</p>"
+        f"<p><a href='{html.escape(feed_url)}'>RSS feed</a></p>"
+        "</body></html>"
+    )
+
+
 def _token_matches(provided: str | None, expected: str | None) -> bool:
     """Constant-time token compare that never raises on exotic input.
 
