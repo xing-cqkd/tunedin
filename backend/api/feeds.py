@@ -16,10 +16,12 @@ Auth model (from the XIN-97 publish state):
 
 Caching: strong ETag over the rendered feed bytes plus ``Last-Modified``
 from the newest playlist content; ``If-None-Match`` / ``If-Modified-Since``
-yield 304. ``Cache-Control: public, max-age=900`` keeps CDN caches at or
-under the 15-minute polling contract. (Unlisted feeds are safe to cache
-publicly: the token is part of the URL, so each token is a distinct cache
-key.)
+yield 304. ``Cache-Control: public, max-age=900`` for public feeds keeps
+CDN caches at or under the 15-minute polling contract. Unlisted
+(token-gated) feeds emit ``Cache-Control: private, max-age=900`` instead:
+a CDN that drops the query string from its cache key must never serve a
+cached 200 to a missing/invalid-token request (which must be a 410), so
+unlisted responses are never stored in shared caches.
 """
 
 from __future__ import annotations
@@ -52,7 +54,10 @@ _PODCATCHER_UA = re.compile(
     re.IGNORECASE,
 )
 
-_RSS_ACCEPT = ("application/rss+xml", "application/xml", "text/xml")
+# Only the explicit RSS MIME type counts: real browsers send
+# ``Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8``
+# and must land on the HTML page, not the feed.
+_RSS_ACCEPT = ("application/rss+xml",)
 
 
 def _wants_rss(request: Request) -> bool:
@@ -153,10 +158,14 @@ def _rss_response(
         instants.append(created)
     last_modified = max(instants) if instants else datetime.now().astimezone()
 
+    # Unlisted (token-gated) feeds must not be stored by shared caches: a
+    # CDN that drops the query string from its cache key could otherwise
+    # serve a cached 200 to an invalid-token request (which must be 410).
+    cache_scope = "private" if playlist.visibility != "public" else "public"
     headers = {
         "ETag": etag,
         "Last-Modified": format_datetime(last_modified),
-        "Cache-Control": "public, max-age=900",
+        "Cache-Control": f"{cache_scope}, max-age=900",
     }
 
     # Conditional requests: If-None-Match wins over If-Modified-Since.
@@ -180,7 +189,16 @@ def _rss_response(
 
 
 def _parse_if_none_match(value: str) -> set[str]:
-    return {part.strip() for part in value.split(",") if part.strip()}
+    """Parse an ``If-None-Match`` header into comparable tags, stripping the
+    ``W/`` weak-validator prefix so a weak validator still matches."""
+    tags = set()
+    for part in value.split(","):
+        part = part.strip()
+        if part.startswith("W/"):
+            part = part[2:].strip()
+        if part:
+            tags.add(part)
+    return tags
 
 
 def _base(request: Request) -> str:

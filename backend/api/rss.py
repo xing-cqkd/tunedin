@@ -6,6 +6,14 @@ fails to render for missing metadata):
     this falls back to the static string ``"TuneIn curator"`` rather than
     leaking the curator's email local-part into a shareable feed. A future
     ``User.display_name`` column is the real fix (noted for XIN-99).
+  * ``itunes:category`` (channel): static ``"Society & Culture"`` —
+    playlists carry no category metadata, so every feed gets this
+    documented default rather than omitting a tag Apple Podcasts
+    effectively requires.
+  * ``itunes:owner`` (channel): static ``TuneIn`` /
+    ``noreply@tunedin.app`` — same rationale as ``itunes:author``: the
+    ``User`` model has no owner identity, so a dedicated non-reply address
+    is used rather than leaking the curator's contact info.
   * ``itunes:summary`` (channel): playlist description, else playlist title.
   * ``itunes:image`` (channel): first entry episode with an ``image_url``;
     omitted entirely when no episode has artwork.
@@ -53,6 +61,9 @@ ET.register_namespace("itunes", ITUNES_NS)
 ET.register_namespace("tunedin", TUNEDIN_NS)
 
 _FALLBACK_AUTHOR = "TuneIn curator"
+_FALLBACK_CATEGORY = "Society & Culture"
+_FALLBACK_OWNER_NAME = "TuneIn"
+_FALLBACK_OWNER_EMAIL = "noreply@tunedin.app"
 
 _AUDIO_TYPES = {
     ".mp3": "audio/mpeg",
@@ -114,6 +125,12 @@ def build_rss(
     """
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
+    # Channel-level date fallback for items with no added_at (should not
+    # happen, but the feed must never 500 on missing metadata).
+    channel_date = (
+        ensure_aware(getattr(playlist, "created_at", None))
+        or datetime.now(timezone.utc)
+    )
     ET.SubElement(channel, "title").text = playlist.title
     ET.SubElement(channel, "link").text = page_url
     description = playlist.description or (
@@ -124,6 +141,12 @@ def build_rss(
 
     # iTunes channel tags (fallbacks documented in the module docstring).
     ET.SubElement(channel, f"{{{ITUNES_NS}}}author").text = _FALLBACK_AUTHOR
+    ET.SubElement(
+        channel, f"{{{ITUNES_NS}}}category", text=_FALLBACK_CATEGORY
+    )
+    owner = ET.SubElement(channel, f"{{{ITUNES_NS}}}owner")
+    ET.SubElement(owner, f"{{{ITUNES_NS}}}name").text = _FALLBACK_OWNER_NAME
+    ET.SubElement(owner, f"{{{ITUNES_NS}}}email").text = _FALLBACK_OWNER_EMAIL
     ET.SubElement(channel, f"{{{ITUNES_NS}}}summary").text = (
         playlist.description or playlist.title
     )
@@ -156,7 +179,9 @@ def build_rss(
         ET.SubElement(item, "description").text = item_description
         # pubDate = added-to-playlist date: curator adds surface as "new"
         # in podcatchers even for old episodes.
-        ET.SubElement(item, "pubDate").text = rfc2822(entry.added_at)
+        ET.SubElement(item, "pubDate").text = rfc2822(
+            entry.added_at or channel_date
+        )
         guid = ET.SubElement(item, "guid", isPermaLink="false")
         guid.text = f"tunedin:{playlist.playlist_id}:{episode.episode_id}"
         if episode.guid:

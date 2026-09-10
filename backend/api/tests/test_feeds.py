@@ -250,6 +250,33 @@ def test_content_negotiation(api_client):
     assert 'rel="alternate"' in browser.text or "rel='alternate'" in browser.text
     assert "application/rss+xml" in browser.text
 
+    # Realistic browser Accept headers include application/xml at q=0.9 —
+    # those clients must still land on the HTML page, not the feed.
+    real_browser = client.get(
+        url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        },
+    )
+    assert real_browser.status_code == 200
+    assert real_browser.headers["content-type"].startswith("text/html")
+    assert "application/rss+xml" not in real_browser.headers["content-type"]
+
+
+def test_feed_page_token_gating(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+    browser_ua = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+
+    revoked = client.get(f"/f/{pl.slug}?t=wrong-token", headers=browser_ua)
+    assert revoked.status_code == 410
+    assert revoked.headers["content-type"].startswith("text/html")
+    assert "revoked by the curator" in revoked.text
+
+    unknown = client.get("/f/no-such-slug", headers=browser_ua)
+    assert unknown.status_code == 404
+
 
 def test_unlisted_token_gating(api_client):
     client, seed = api_client
@@ -327,6 +354,33 @@ def test_etag_and_conditional_requests(api_client):
     )
     assert ims.status_code == 304
 
+    # Non-matching validators must NOT yield 304 — serve the feed.
+    wrong_etag = client.get(url, headers={"If-None-Match": '"no-such-etag"'})
+    assert wrong_etag.status_code == 200
+    stale_ims = client.get(
+        url, headers={"If-Modified-Since": "Wed, 01 Jan 2020 00:00:00 GMT"}
+    )
+    assert stale_ims.status_code == 200
+
+
+def test_cache_control_privacy_for_unlisted_feeds(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+
+    # Unlisted (token-gated) feeds must be private: a shared cache must
+    # never serve a cached 200 to an invalid-token request (410).
+    unlisted = _rss(client, pl.slug, token=pl.token)
+    cc = unlisted.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "private"
+    assert "max-age=900" in cc
+
+    # Public feeds stay publicly cacheable.
+    _run(_make_public(client, seed))
+    public = _rss(client, pl.slug)
+    cc = public.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "public"
+    assert "private" not in cc
+
 
 def test_itunes_tags_and_fallbacks(api_client):
     client, seed = api_client
@@ -337,6 +391,13 @@ def test_itunes_tags_and_fallbacks(api_client):
 
     # Channel fallbacks (documented in backend/api/rss.py).
     assert channel.find("itunes:author", ns).text == "TuneIn curator"
+    category = channel.find("itunes:category", ns)
+    assert category is not None
+    assert category.attrib["text"] == "Society & Culture"
+    owner = channel.find("itunes:owner", ns)
+    assert owner is not None
+    assert owner.find("itunes:name", ns).text == "TuneIn"
+    assert owner.find("itunes:email", ns).text == "noreply@tunedin.app"
     assert channel.find("itunes:summary", ns).text == "A test mix"
     # ep2 is explicit -> channel-level "yes".
     assert channel.find("itunes:explicit", ns).text == "yes"
