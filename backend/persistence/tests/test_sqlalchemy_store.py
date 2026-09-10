@@ -28,7 +28,7 @@ from backend.persistence.models import (
     User,
     UserEpisodeProgress,
 )
-from backend.persistence.repositories import SlugConflictError
+from backend.persistence.repositories import MissingParentError, SlugConflictError
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 from backend.persistence.validation import ItemTooLargeError
 
@@ -395,6 +395,33 @@ async def test_playlist_crud_and_episode_links(store):
     eps = await store.playlists.list_episodes(pl.playlist_id)
     assert [e.episode_id for e in eps] == [e1.episode_id, e2.episode_id]
     assert e3.episode_id not in {e.episode_id for e in eps}
+
+
+@pytest.mark.asyncio
+async def test_add_episode_missing_parents_raises_missing_parent_error(store):
+    """XIN-124 (Chester's call): FK parity — the FK IntegrityError maps to
+    the backend-agnostic MissingParentError (DynamoDB raises the same
+    type by checking parent existence before writing)."""
+    user = await store.users.save(User(email="fk@example.com"))
+    feed = await make_feed(store)
+    ep = await make_episode(store, feed)
+    pl = await store.playlists.save(
+        CuratedPlaylist(user_id=user.user_id, title="FK list")
+    )
+    await store.commit()
+
+    # Missing playlist.
+    with pytest.raises(MissingParentError):
+        await store.playlists.add_episode(uuid.uuid4(), ep.episode_id, 0)
+    await store.rollback()
+    # Missing episode.
+    with pytest.raises(MissingParentError):
+        await store.playlists.add_episode(pl.playlist_id, uuid.uuid4(), 0)
+    await store.rollback()
+    # Both missing.
+    with pytest.raises(MissingParentError):
+        await store.playlists.add_episode(uuid.uuid4(), uuid.uuid4(), 0)
+    await store.rollback()
 
 
 # ---------------------------------------------------------------------------

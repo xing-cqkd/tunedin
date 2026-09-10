@@ -51,6 +51,7 @@ from backend.persistence.repositories import (
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
+    MissingParentError,
     PlaylistEpisodeEntry,
     PlaylistRepository,
     ProgressRepository,
@@ -564,7 +565,19 @@ class _PlaylistRepository(PlaylistRepository):
             )
         else:
             link.position = position
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # FK parity with DynamoDB (Linear: XIN-124 — Chester's call):
+            # surface the backend-agnostic MissingParentError when a
+            # parent is missing. Only foreign-key violations map — any
+            # other integrity error re-raises untouched.
+            if "foreign key" in str(exc.orig).lower():
+                raise MissingParentError(
+                    f"playlist {playlist_id} or episode {episode_id} "
+                    "does not exist"
+                ) from exc
+            raise
 
     async def list_episodes(self, playlist_id: UUID) -> list[Episode]:
         res = await self._session.execute(

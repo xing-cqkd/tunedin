@@ -73,6 +73,17 @@ class SlugConflictError(ValueError):
     """
 
 
+class MissingParentError(ValueError):
+    """Raised by ``PlaylistRepository.add_episode`` when the playlist or
+    episode does not exist.
+
+    Raised on ALL backends (SQLAlchemy maps the foreign-key
+    ``IntegrityError``; DynamoDB checks parent existence before writing),
+    so callers can catch one type regardless of backend (Linear: XIN-124 —
+    Chester's call: enforce FK parity rather than pinning the divergence).
+    """
+
+
 def validate_visibility(visibility: str) -> None:
     """Raise :class:`ValueError` unless ``visibility`` is a known value."""
     if visibility not in PLAYLIST_VISIBILITIES:
