@@ -68,14 +68,6 @@ async def create_all_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-get_db = session_scope
-"""Alias kept for the conventional FastAPI dependency name.
-
-Identical to :func:`session_scope`; nothing in the codebase currently uses
-it (the configured-backend dependency lives in ``settings.get_db``), but the
-name is kept so external FastAPI ``Depends(get_db)`` usage keeps working.
-"""
-
 @asynccontextmanager
 async def session_scope() -> AsyncGenerator[AsyncSession, None]:
     """Async context manager yielding a session on the app database."""
@@ -84,3 +76,12 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
             yield session
         finally:
             await session.close()
+
+
+get_db = session_scope
+"""Alias kept for the conventional FastAPI dependency name.
+
+Identical to :func:`session_scope`; nothing in the codebase currently uses
+it (the configured-backend dependency lives in ``settings.get_db``), but the
+name is kept so external FastAPI ``Depends(get_db)`` usage keeps working.
+"""

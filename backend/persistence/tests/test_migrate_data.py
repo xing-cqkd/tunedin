@@ -428,7 +428,7 @@ def test_reconcile_tables_identical_sets():
 
 
 @pytest.mark.asyncio
-async def test_migrate_same_backend_error_message_names_both(tmp_path):
+async def test_migrate_same_backend_error_message_names_both(tmp_path, monkeypatch):
     url = _url(tmp_path / "same.db")
     with pytest.raises(SameBackendError, match="refusing"):
         await migrate(
