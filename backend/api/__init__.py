@@ -25,9 +25,9 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
     sharing an engine/client, or a caller-owned store. Defaults to
     ``settings.open_store`` — the configured database backend.
     """
-    from fastapi import FastAPI
+    from fastapi import Depends, FastAPI
 
-    from backend.api.developer import RateLimiter
+    from backend.api.developer import RateLimiter, rate_limited
     from backend.api.developer import router as developer_router
     from backend.api.feeds import router as feeds_router
 
@@ -44,6 +44,15 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
     # only from trusted proxies via middleware), or all clients behind the
     # proxy share one bucket.
     app.state.rate_limiter = RateLimiter()
-    app.include_router(feeds_router)
+    app.include_router(
+        feeds_router,
+        # XIN-118 (Chester's call): the public /f/<slug> endpoints render
+        # full RSS from the database with no authentication, so they share
+        # the developer API's generous per-IP limiter instead of staying
+        # unlimited. Legitimate podcatchers poll at most every ~15 minutes
+        # — far under 600/15min — and conditional requests keep repeat
+        # polls cheap.
+        dependencies=[Depends(rate_limited)],
+    )
     app.include_router(developer_router)
     return app

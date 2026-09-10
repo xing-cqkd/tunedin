@@ -655,3 +655,21 @@ def test_itunes_explicit_none_means_no():
     channel = _parse(body).find("channel")
     assert channel.find("itunes:explicit", ns).text == "no"
     assert channel.findall("item")[0].find("itunes:explicit", ns).text == "no"
+
+
+def test_public_feed_endpoints_share_rate_limiter(api_client):
+    """XIN-118 (Chester's call): the public /f/<slug> endpoints are covered
+    by the same per-IP rate limiter as the developer API."""
+    from backend.api.developer import RateLimiter
+
+    client, seed = api_client
+    pl = seed["playlist"]
+    client.app.state.rate_limiter = RateLimiter(limit=1, window_seconds=60)
+    headers = {"Accept": "application/rss+xml"}
+    url = f"/f/{pl.slug}/feed.xml?t={pl.token}"
+    assert client.get(url, headers=headers).status_code == 200
+    limited = client.get(url, headers=headers)
+    assert limited.status_code == 429
+    assert limited.headers["retry-after"] == str(
+        limited.json()["detail"]["retry_after"]
+    )
