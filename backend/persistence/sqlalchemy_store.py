@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 from uuid import UUID
 
 from sqlalchemy import and_, event, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -44,15 +45,21 @@ from backend.persistence.models import (
     UserEpisodeProgress,
 )
 from backend.persistence.repositories import (
+    VISIBILITY_UNLISTED,
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
     PlaylistRepository,
     ProgressRepository,
+    SlugConflictError,
     Store,
     TagRepository,
     TaskLogRepository,
     UserRepository,
+    _now_utc,
+    generate_slug,
+    generate_token,
+    validate_visibility,
 )
 
 SessionFactory = Callable[[], AsyncSession]
@@ -366,7 +373,18 @@ class _PlaylistRepository(PlaylistRepository):
     async def save(self, playlist: CuratedPlaylist) -> CuratedPlaylist:
         _guard_item_size(playlist)
         self._session.add(playlist)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as exc:
+            # The session is unusable after a failed flush; roll back so
+            # the unit of work can continue, then surface slug conflicts
+            # as the backend-agnostic SlugConflictError.
+            await self._session.rollback()
+            if "slug" in str(exc.orig).lower():
+                raise SlugConflictError(
+                    f"playlist slug {playlist.slug!r} is already taken"
+                ) from exc
+            raise
         return playlist
 
     async def add_episode(
@@ -402,6 +420,43 @@ class _PlaylistRepository(PlaylistRepository):
             .order_by(PlaylistEpisode.position.asc(), Episode.episode_id.asc())
         )
         return list(res.scalars().all())
+
+    async def publish(
+        self, playlist_id: UUID, visibility: str
+    ) -> Optional[CuratedPlaylist]:
+        validate_visibility(visibility)
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        playlist.visibility = visibility
+        if playlist.slug is None:
+            playlist.slug = generate_slug(playlist.title)
+        if playlist.token is None:
+            playlist.token = generate_token()
+        return await self.save(playlist)
+
+    async def unpublish(self, playlist_id: UUID) -> Optional[CuratedPlaylist]:
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        playlist.visibility = VISIBILITY_UNLISTED
+        return await self.save(playlist)
+
+    async def rotate_token(self, playlist_id: UUID) -> Optional[str]:
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        new_token = generate_token()
+        playlist.token = new_token
+        playlist.token_revoked_at = _now_utc()
+        await self.save(playlist)
+        return new_token
+
+    async def get_by_slug(self, slug: str) -> Optional[CuratedPlaylist]:
+        res = await self._session.execute(
+            select(CuratedPlaylist).where(CuratedPlaylist.slug == slug)
+        )
+        return res.scalar_one_or_none()
 
 
 class _ProgressRepository(ProgressRepository):

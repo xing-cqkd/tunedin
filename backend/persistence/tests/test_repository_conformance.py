@@ -27,6 +27,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
+import re
+
 import boto3
 import pytest
 from moto import mock_aws
@@ -47,7 +49,7 @@ from backend.persistence.models import (
     User,
     UserEpisodeProgress,
 )
-from backend.persistence.repositories import Store
+from backend.persistence.repositories import SlugConflictError, Store
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 from backend.persistence.dynamodb.store import DynamoDBStore
 
@@ -667,6 +669,102 @@ class TestRepositoryConformance:
 
         rows = await store.playlists.list_episodes(pl.playlist_id)
         assert [e.episode_id for e in rows] == ids
+
+    # ------------------------------------------------------------------
+    # Playlist publish state (XIN-97)
+    # ------------------------------------------------------------------
+
+    async def test_playlist_publish_assigns_slug_and_token(self, store: Store):
+        user = await self._seed_user(store)
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="My Mix")
+        )
+        assert pl.visibility == "unlisted"
+        assert pl.slug is None
+        assert pl.token is None
+
+        published = await store.playlists.publish(pl.playlist_id, "public")
+        assert published is not None
+        assert published.visibility == "public"
+        assert published.slug
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", published.slug)
+        assert published.token
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", published.token)
+        assert len(published.token) == 43  # secrets.token_urlsafe(32)
+
+        by_slug = await store.playlists.get_by_slug(published.slug)
+        assert by_slug is not None and by_slug.playlist_id == pl.playlist_id
+        assert await store.playlists.get_by_slug("no-such-slug") is None
+
+        # Re-publishing keeps the assigned slug and token (stable URLs).
+        again = await store.playlists.publish(pl.playlist_id, "unlisted")
+        assert again.slug == published.slug
+        assert again.token == published.token
+        assert again.visibility == "unlisted"
+
+    async def test_playlist_publish_validation_and_missing(self, store: Store):
+        user = await self._seed_user(store)
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="V")
+        )
+        with pytest.raises(ValueError):
+            await store.playlists.publish(pl.playlist_id, "bogus")
+        # Unknown ids resolve to None, like get_by_id.
+        assert await store.playlists.publish(uuid4(), "public") is None
+        assert await store.playlists.unpublish(uuid4()) is None
+        assert await store.playlists.rotate_token(uuid4()) is None
+
+    async def test_playlist_unpublish_keeps_slug_and_token(self, store: Store):
+        user = await self._seed_user(store)
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="Mix")
+        )
+        published = await store.playlists.publish(pl.playlist_id, "public")
+        unpublished = await store.playlists.unpublish(pl.playlist_id)
+        assert unpublished is not None
+        assert unpublished.visibility == "unlisted"
+        assert unpublished.slug == published.slug
+        assert unpublished.token == published.token
+
+    async def test_playlist_rotate_token(self, store: Store):
+        user = await self._seed_user(store)
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="Mix")
+        )
+        published = await store.playlists.publish(pl.playlist_id, "unlisted")
+        old_token = published.token
+
+        new_token = await store.playlists.rotate_token(pl.playlist_id)
+        assert new_token
+        assert new_token != old_token
+
+        fetched = await store.playlists.get_by_id(pl.playlist_id)
+        assert fetched.token == new_token
+        assert fetched.token_revoked_at is not None
+
+        # The slug still resolves after rotation (single-field change).
+        assert (
+            await store.playlists.get_by_slug(fetched.slug)
+        ).playlist_id == pl.playlist_id
+
+    async def test_playlist_slug_uniqueness(self, store: Store):
+        user = await self._seed_user(store)
+        a = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="A", slug="taken")
+        )
+        b = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="B")
+        )
+        b.slug = "taken"
+        with pytest.raises(SlugConflictError):
+            await store.playlists.save(b)
+
+        # Idempotent re-save of the owning playlist is fine.
+        a.title = "A2"
+        await store.playlists.save(a)
+        assert (await store.playlists.get_by_slug("taken")).playlist_id == (
+            a.playlist_id
+        )
 
     # ------------------------------------------------------------------
     # Progress repository
