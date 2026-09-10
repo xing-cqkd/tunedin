@@ -5,17 +5,22 @@ SQLAlchemyStore.from_url(), covering the main read/write paths plus the
 unit-of-work (commit/rollback) semantics.
 """
 
+import asyncio
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from backend.persistence import sqlalchemy_store as sa_module
 from backend.persistence.models import (
     Base,
     CuratedPlaylist,
     Episode,
+    EpisodeTag,
     Feed,
     Insight,
     Tag,
@@ -23,7 +28,9 @@ from backend.persistence.models import (
     User,
     UserEpisodeProgress,
 )
+from backend.persistence.repositories import SlugConflictError
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
+from backend.persistence.validation import ItemTooLargeError
 
 NOW = datetime.now(timezone.utc)
 
@@ -497,3 +504,342 @@ async def test_store_context_manager(tmp_path):
     # exception exit rolled back
     async with SQLAlchemyStore.from_url(url) as s4:
         assert await s4.feeds.count_all() == 1
+
+
+# ---------------------------------------------------------------------------
+# XIN-119: SAVEPOINT-scoped transaction handling
+# ---------------------------------------------------------------------------
+
+
+async def test_playlist_slug_conflict_preserves_unit_of_work(store):
+    """A slug conflict rolls back only its SAVEPOINT (XIN-119).
+
+    The caller's other flushed-but-uncommitted writes (feed, episode)
+    survive the conflict, and the session stays usable afterwards.
+    """
+    user = await store.users.save(User(email=f"u-{uuid.uuid4().hex}@e.com"))
+    taken = f"slug-{uuid.uuid4().hex[:8]}"
+    await store.playlists.save(
+        CuratedPlaylist(user_id=user.user_id, title="First", slug=taken)
+    )
+    # Other writes staged in the same unit of work, flushed but uncommitted.
+    feed = await make_feed(store)
+    episode = await make_episode(store, feed)
+
+    with pytest.raises(SlugConflictError) as excinfo:
+        await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="Clash", slug=taken)
+        )
+    # The slug was captured before any rollback expired the instance.
+    assert taken in str(excinfo.value)
+
+    # The rest of the unit of work survived the savepoint rollback ...
+    assert await store.feeds.get_by_id(feed.feed_id) is not None
+    assert await store.episodes.get_by_id(episode.episode_id) is not None
+    # ... and the session is still usable: everything commits cleanly.
+    await store.commit()
+    assert await store.feeds.get_by_id(feed.feed_id) is not None
+    assert await store.episodes.get_by_id(episode.episode_id) is not None
+
+
+def _run_race(winner_target, loser_target):
+    """Run two racy threads; fail loudly on deadlock or thread errors."""
+    failures: list[BaseException] = []
+    def _wrap(target):
+        def _run():
+            try:
+                target()
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                failures.append(exc)
+        return _run
+
+    threads = [
+        threading.Thread(target=_wrap(winner_target)),
+        threading.Thread(target=_wrap(loser_target)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in threads), "race threads deadlocked"
+    assert not failures, f"race thread failures: {failures!r}"
+
+
+async def _row_count(url: str, model, *filters) -> int:
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                select(func.count()).select_from(model).where(*filters)
+            )
+            return res.scalar_one()
+    finally:
+        await engine.dispose()
+
+
+def test_tag_get_or_create_concurrent_race_returns_winner(tmp_path):
+    """Two threads, two sessions, one file DB (XIN-119).
+
+    Thread B SELECT-misses the tag while A's insert is uncommitted, then
+    flushes after A commits: B's flush hits the partial unique index, B
+    rolls back to its savepoint and returns A's row instead of raising.
+    Afterwards exactly one tag is visible.
+    """
+    url = f"sqlite+aiosqlite:///{tmp_path}/tag_race.db"
+
+    async def _create_tables():
+        engine = create_async_engine(url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
+
+    asyncio.run(_create_tables())
+
+    b_selected = threading.Event()
+    a_committed = threading.Event()
+    outcome: dict[str, uuid.UUID] = {}
+
+    def _winner():
+        async def _go():
+            store = SQLAlchemyStore.from_url(url)
+            try:
+                tag = await store.tags.get_or_create("race-tag", None)
+                outcome["a_tag_id"] = tag.tag_id
+                assert b_selected.wait(timeout=30), "B never SELECT-missed"
+                await store.commit()
+            finally:
+                await store.close()
+            a_committed.set()
+
+        asyncio.run(_go())
+
+    def _loser():
+        async def _go():
+            store = SQLAlchemyStore.from_url(url)
+            try:
+                # Pause between the SELECT-miss and the insert, forcing B
+                # deterministically down the loser's race path.
+                orig = store.tags.get_by_name_category
+                first = True
+
+                async def _select_then_wait(name, category):
+                    nonlocal first
+                    tag = await orig(name, category)
+                    if first and tag is None:
+                        first = False
+                        b_selected.set()
+                        assert a_committed.wait(timeout=30), (
+                            "A never committed"
+                        )
+                    return tag
+
+                store.tags.get_by_name_category = _select_then_wait  # type: ignore[method-assign]
+                tag = await store.tags.get_or_create("race-tag", None)
+                outcome["b_tag_id"] = tag.tag_id
+            finally:
+                await store.close()
+
+        asyncio.run(_go())
+
+    _run_race(_winner, _loser)
+    # Both threads converged on the same row; only one tag exists.
+    assert outcome["a_tag_id"] == outcome["b_tag_id"]
+    assert (
+        asyncio.run(_row_count(url, Tag, Tag.name == "race-tag")) == 1
+    )
+
+
+def test_add_episode_tag_concurrent_race_is_noop(tmp_path):
+    """Same setup as the tag race, but for episode-tag links (XIN-119).
+
+    B's existence-check misses while A's link is uncommitted; after A
+    commits, B's insert hits the link PK and B treats the duplicate as the
+    protocol-promised no-op. Exactly one link row exists afterwards.
+    """
+    url = f"sqlite+aiosqlite:///{tmp_path}/link_race.db"
+
+    async def _seed():
+        engine = create_async_engine(url)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        await engine.dispose()
+        store = SQLAlchemyStore.from_url(url)
+        try:
+            feed = await store.feeds.save(
+                Feed(
+                    rss_url="https://example.com/race.xml",
+                    title="Race",
+                    sync_status="pending",
+                )
+            )
+            episode = await store.episodes.save(
+                Episode(
+                    feed_id=feed.feed_id,
+                    guid="race-guid",
+                    title="Race episode",
+                    audio_url="https://example.com/race.mp3",
+                )
+            )
+            tag = await store.tags.get_or_create("link-race-tag", None)
+            await store.commit()
+            return episode.episode_id, tag.tag_id
+        finally:
+            await store.close()
+
+    episode_id, tag_id = asyncio.run(_seed())
+
+    a_flushed = threading.Event()
+    b_checked = threading.Event()
+    a_committed = threading.Event()
+
+    def _winner():
+        async def _go():
+            store = SQLAlchemyStore.from_url(url)
+            try:
+                # Check misses (no link yet) -> insert+flush, uncommitted.
+                await store.tags.add_episode_tag(episode_id, tag_id)
+                a_flushed.set()
+                assert b_checked.wait(timeout=30), "B never checked"
+                await store.commit()
+            finally:
+                await store.close()
+            a_committed.set()
+
+        asyncio.run(_go())
+
+    def _loser():
+        async def _go():
+            store = SQLAlchemyStore.from_url(url)
+            try:
+                assert a_flushed.wait(timeout=30), "A never flushed"
+                # Pause between the existence-check (miss) and the insert,
+                # forcing B deterministically down the loser's race path.
+                orig_execute = store._session.execute
+                first = True
+
+                async def _execute_then_wait(statement, *args, **kwargs):
+                    nonlocal first
+                    result = await orig_execute(statement, *args, **kwargs)
+                    if first:
+                        first = False
+                        b_checked.set()
+                        assert a_committed.wait(timeout=30), (
+                            "A never committed"
+                        )
+                    return result
+
+                store._session.execute = _execute_then_wait  # type: ignore[method-assign]
+                # Must not raise: the duplicate add is a no-op.
+                await store.tags.add_episode_tag(episode_id, tag_id)
+            finally:
+                await store.close()
+
+        asyncio.run(_go())
+
+    _run_race(_winner, _loser)
+    assert (
+        asyncio.run(
+            _row_count(
+                url,
+                EpisodeTag,
+                EpisodeTag.episode_id == episode_id,
+                EpisodeTag.tag_id == tag_id,
+            )
+        )
+        == 1
+    )
+
+
+# ---------------------------------------------------------------------------
+# XIN-120: upsert/dedup semantics
+# ---------------------------------------------------------------------------
+
+
+async def test_episode_save_upserts_by_primary_key(store):
+    """save() is an upsert by PK: re-saving an existing id updates (XIN-120)."""
+    feed = await make_feed(store)
+    ep = await make_episode(store, feed, title="v1")
+    resaved = await store.episodes.save(
+        Episode(
+            episode_id=ep.episode_id,
+            feed_id=feed.feed_id,
+            guid=ep.guid,
+            title="v2",
+            audio_url=ep.audio_url,
+        )
+    )
+    assert resaved.episode_id == ep.episode_id
+    fetched = await store.episodes.get_by_id(ep.episode_id)
+    assert fetched is not None
+    assert fetched.title == "v2"
+    # Still exactly one row for the episode.
+    assert await store.episodes.list_guids_by_feed(feed.feed_id) == {ep.guid}
+
+
+# ---------------------------------------------------------------------------
+# XIN-122: item-size guard coverage
+# ---------------------------------------------------------------------------
+
+
+async def test_episode_save_many_enforces_item_size_guard(store):
+    """save_many guards every item before writing (XIN-122)."""
+    feed = await make_feed(store)
+    good = Episode(
+        feed_id=feed.feed_id,
+        guid="good",
+        title="Good",
+        audio_url="https://example.com/a.mp3",
+    )
+    bad = Episode(
+        feed_id=feed.feed_id,
+        guid="bad",
+        title="Bad",
+        audio_url="https://example.com/a.mp3",
+        transcript="x" * (500 * 1024),  # over the 400 KiB per-item limit
+    )
+    with pytest.raises(ItemTooLargeError):
+        await store.episodes.save_many([good, bad])
+    # The guard fires before any write: nothing from the batch persisted.
+    assert "good" not in await store.episodes.list_guids_by_feed(feed.feed_id)
+
+
+async def test_feed_update_status_enforces_item_size_guard(store):
+    """update_status guards the new status value (XIN-122)."""
+    feed = await make_feed(store)
+    with pytest.raises(ItemTooLargeError):
+        await store.feeds.update_status(feed.feed_id, "x" * (500 * 1024))
+
+
+async def test_publish_and_add_episode_tag_skip_item_size_guard(
+    store, monkeypatch
+):
+    """progress.save() guards; publish/add_episode_tag never do (XIN-122)."""
+    calls: list[str] = []
+    orig = sa_module._guard_item_size
+
+    def _spy(entity):
+        calls.append(type(entity).__name__)
+        return orig(entity)
+
+    feed = await make_feed(store)
+    episode = await make_episode(store, feed)
+    user = await store.users.save(User(email=f"u-{uuid.uuid4().hex}@e.com"))
+    playlist = await store.playlists.save(
+        CuratedPlaylist(user_id=user.user_id, title="P")
+    )
+    tag = await store.tags.get_or_create("spy-tag", None)
+
+    monkeypatch.setattr(sa_module, "_guard_item_size", _spy)
+
+    # save() paths DO guard ...
+    await store.progress.save(
+        UserEpisodeProgress(user_id=user.user_id, episode_id=episode.episode_id)
+    )
+    assert calls == ["UserEpisodeProgress"]
+
+    # ... but publish/unpublish/rotate_token/add_episode_tag never do.
+    await store.playlists.publish(playlist.playlist_id, "public")
+    await store.playlists.unpublish(playlist.playlist_id)
+    await store.playlists.rotate_token(playlist.playlist_id)
+    await store.tags.add_episode_tag(episode.episode_id, tag.tag_id)
+    assert calls == ["UserEpisodeProgress"]

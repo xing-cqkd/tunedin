@@ -83,6 +83,7 @@ EXPECTED = {
         "save": _sig(("playlist",)),
         "add_episode": _sig(("playlist_id",), ("episode_id",), ("position",)),
         "list_episodes": _sig(("playlist_id",)),
+        "list_entries": _sig(("playlist_id",)),
         "publish": _sig(("playlist_id",), ("visibility",)),
         "unpublish": _sig(("playlist_id",)),
         "rotate_token": _sig(("playlist_id",)),
@@ -241,7 +242,7 @@ def _make_store_stub():
         self.rolled_back += 1
 
     async def _close(self):
-        return None
+        self.closed += 1
 
     def _sync_init(self):
         self._repos = {
@@ -250,6 +251,7 @@ def _make_store_stub():
         }
         self.committed = 0
         self.rolled_back = 0
+        self.closed = 0
 
     namespace = {
         "__init__": _sync_init,
@@ -291,3 +293,23 @@ async def test_store_context_manager_rolls_back_on_exception():
             raise Boom()
     assert getattr(store, "committed", 0) == 0
     assert getattr(store, "rolled_back", 0) == 1
+
+
+async def test_store_context_manager_does_not_close_store():
+    # XIN-122: __aexit__ commits/rolls back but never closes the session;
+    # callers must still call close(). The store stays usable across
+    # several `async with` blocks.
+    store = _make_store_stub()()
+    async with store:
+        pass
+    assert store.committed == 1
+    assert store.closed == 0
+
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        async with store:
+            raise Boom()
+    assert store.rolled_back == 1
+    assert store.closed == 0

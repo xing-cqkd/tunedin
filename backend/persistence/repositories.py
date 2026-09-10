@@ -146,9 +146,10 @@ class FeedRepository(ABC):
     async def save(self, feed: Feed) -> Feed:
         """Persist a new or existing feed (upsert by primary key).
 
-        On SQL backends this adds + flushes without committing; on
-        write-through backends the write is immediate. Returns the persisted
-        entity with its primary key and server-side defaults populated.
+        On SQL backends this merges (upsert) + flushes without committing;
+        on write-through backends the write is immediate. Returns the
+        persisted entity with its primary key and server-side defaults
+        populated.
         """
 
     @abstractmethod
@@ -231,12 +232,13 @@ class EpisodeRepository(ABC):
     async def save_many(self, episodes: list[Episode]) -> list[Episode]:
         """Persist a batch of episodes as one write unit.
 
-        Returns the persisted entities in input order. On SQL backends this
-        is a single flushed batch inside the unit of work; on DynamoDB it is
-        the transactional guid-dedup write (marker items + conditional puts),
-        with conflicting duplicates dropped and reported via the return
-        value (the returned list contains only the episodes that were
-        actually persisted).
+        Returns the persisted entities in input order. On SQL backends each
+        row is upserted inside its own SAVEPOINT, so one conflicting
+        duplicate drops only that row instead of aborting the batch; on
+        DynamoDB it is the transactional guid-dedup write (marker items +
+        conditional puts). On both backends, conflicting duplicates are
+        dropped and reported via the return value (the returned list
+        contains only the episodes that were actually persisted).
         """
 
     @abstractmethod
@@ -576,6 +578,11 @@ class Store(ABC):
 
         Commits when the block exits cleanly, rolls back when it exits with
         an exception. Does not suppress exceptions (returns ``None``).
+
+        The store is NOT closed here: callers must still ``await
+        store.close()``. A store may be reused across several ``async
+        with`` blocks, so closing on exit would wrongly make it single-use
+        (XIN-122).
         """
         if exc_type is None:
             await self.commit()

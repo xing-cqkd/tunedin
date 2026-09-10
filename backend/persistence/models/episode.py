@@ -40,7 +40,12 @@ class Episode(Base):
     transcript_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     chapters_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
-    episode_type: Mapped[Optional[str]] = mapped_column(String(50), default="full", nullable=True)  # full, trailer, bonus
+    # Never null: the write path coerces an unset/None value to "full"
+    # (parity with the DynamoDB backend's codec.apply_defaults), matching
+    # migration 742ddc0a7799 (XIN-122).
+    episode_type: Mapped[str] = mapped_column(
+        String(50), default="full", server_default="full", nullable=False
+    )  # full, trailer, bonus
     episode_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     season_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     explicit: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)

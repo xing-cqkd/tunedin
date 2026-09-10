@@ -11,15 +11,17 @@ Query logic is ported verbatim from the existing call sites
 ``cli.py``) — those call sites are untouched; this module only centralizes
 their queries behind the repository interface for the DynamoDB effort.
 
-Write semantics: ``save()`` = ``session.add()`` + ``await session.flush()`` —
-NO commit. The store is the unit of work; callers commit explicitly via
-``await store.commit()``.
+Write semantics: ``save()`` = upsert-by-primary-key (``session.merge()``,
+matching DynamoDB's ``PutItem``) + ``await session.flush()`` — NO commit.
+The store is the unit of work; callers commit explicitly via
+``await store.commit()``. ``save()`` returns the managed (merged)
+instance, which is the one carrying populated PKs/defaults.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 from uuid import UUID
 
 from sqlalchemy import and_, event, func, select
@@ -88,21 +90,104 @@ def _guard_item_size(entity: Any) -> None:
     )
 
 
+_T = TypeVar("_T")
+
+
+def _apply_write_defaults(entity: Any) -> None:
+    """Coerce write-path defaults the DB schema requires (XIN-122).
+
+    Mirrors ``dynamodb.codec.apply_defaults``: ``Episode.episode_type`` is
+    NOT NULL with default ``"full"``, so an unset/None value is coerced
+    before the flush instead of relying on the column default.
+    """
+    if isinstance(entity, Episode) and entity.episode_type is None:
+        entity.episode_type = "full"
+
+
+async def _persist(session: AsyncSession, entity: Any) -> Any:
+    """Shared merge + flush for every repository ``save()`` (XIN-120/122).
+
+    Uses ``session.merge()`` — a true upsert by primary key, matching
+    DynamoDB's ``PutItem`` (verified: unset Python-side defaults still fire
+    on merge, and a detached instance carrying an existing PK updates the
+    row instead of raising ``IntegrityError``). Never commits — the store
+    is the unit of work. Returns the managed (merged) instance, which is
+    the one carrying populated PKs/defaults.
+
+    The item-size guard is deliberately NOT applied here: it stays at the
+    public write entry points (``save()``/``save_many()``/
+    ``update_status()``), so ``publish``/``add_episode_tag`` never trigger
+    it (XIN-122).
+    """
+    _apply_write_defaults(entity)
+    managed = await session.merge(entity)
+    await session.flush()
+    return managed
+
+
+async def _get_by_unique(
+    session: AsyncSession, model: type[_T], column: Any, value: Any
+) -> Optional[_T]:
+    """Single-row lookup by a unique column (XIN-122).
+
+    Collapses the near-identical ``get_by_id`` / ``get_by_email`` /
+    ``get_by_rss_url`` / ``get_by_slug`` bodies.
+    """
+    res = await session.execute(select(model).where(column == value))
+    return res.scalar_one_or_none()
+
+
+def _constraint_name(orig: Any) -> Optional[str]:
+    """Violated-constraint name from a DBAPI error, when exposed.
+
+    psycopg 2/3 surface it as ``orig.diag.constraint_name``; asyncpg as
+    ``orig.constraint_name``; sqlite3 does not expose it at all (callers
+    fall back to matching the table/column in the message text).
+    """
+    diag = getattr(orig, "diag", None)
+    name = getattr(diag, "constraint_name", None)
+    return name or getattr(orig, "constraint_name", None)
+
+
+def _matches_unique_violation(exc: IntegrityError, constraint: str, column: str) -> bool:
+    """True when ``exc`` is the named unique-constraint violation (XIN-119).
+
+    Matches the constraint name explicitly where the driver exposes it;
+    on sqlite3 (which reports only ``table.column``) falls back to the
+    message text.
+    """
+    name = _constraint_name(exc.orig)
+    if name is not None:
+        return name == constraint
+    text = str(exc.orig).lower()
+    return constraint in text or (
+        "unique constraint failed" in text and column in text
+    )
+
+
+def _is_slug_conflict(exc: IntegrityError) -> bool:
+    """True when ``exc`` is the ``uq_curated_playlists_slug`` violation."""
+    return _matches_unique_violation(
+        exc, "uq_curated_playlists_slug", "curated_playlists.slug"
+    )
+
+
+def _is_episode_guid_conflict(exc: IntegrityError) -> bool:
+    """True when ``exc`` is the ``uq_episode_feed_guid`` violation."""
+    return _matches_unique_violation(
+        exc, "uq_episode_feed_guid", "episodes.guid"
+    )
+
+
 class _FeedRepository(FeedRepository):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
     async def get_by_id(self, feed_id: UUID) -> Optional[Feed]:
-        res = await self._session.execute(
-            select(Feed).where(Feed.feed_id == feed_id)
-        )
-        return res.scalar_one_or_none()
+        return await _get_by_unique(self._session, Feed, Feed.feed_id, feed_id)
 
     async def get_by_rss_url(self, rss_url: str) -> Optional[Feed]:
-        res = await self._session.execute(
-            select(Feed).where(Feed.rss_url == rss_url)
-        )
-        return res.scalar_one_or_none()
+        return await _get_by_unique(self._session, Feed, Feed.rss_url, rss_url)
 
     async def list_by_statuses(
         self, statuses: list[str], *, limit: Optional[int] = None
@@ -141,9 +226,7 @@ class _FeedRepository(FeedRepository):
 
     async def save(self, feed: Feed) -> Feed:
         _guard_item_size(feed)
-        self._session.add(feed)
-        await self._session.flush()
-        return feed
+        return await _persist(self._session, feed)
 
     async def count_by_status(self, status: str) -> int:
         res = await self._session.execute(
@@ -176,10 +259,9 @@ class _EpisodeRepository(EpisodeRepository):
         self._session = session
 
     async def get_by_id(self, episode_id: UUID) -> Optional[Episode]:
-        res = await self._session.execute(
-            select(Episode).where(Episode.episode_id == episode_id)
+        return await _get_by_unique(
+            self._session, Episode, Episode.episode_id, episode_id
         )
-        return res.scalar_one_or_none()
 
     async def list_guids_by_feed(self, feed_id: UUID) -> set[str]:
         # From FeedIngestionService.sync_podcast_episodes (guid dedup step).
@@ -215,16 +297,42 @@ class _EpisodeRepository(EpisodeRepository):
 
     async def save(self, episode: Episode) -> Episode:
         _guard_item_size(episode)
-        self._session.add(episode)
-        await self._session.flush()
-        return episode
+        return await _persist(self._session, episode)
 
     async def save_many(self, episodes: list[Episode]) -> list[Episode]:
+        # Protocol: conflicting duplicates are dropped and reported via
+        # the return value, which contains only the episodes that were
+        # actually persisted, in input order — mirroring the DynamoDB
+        # transactional guid-dedup write (XIN-120).
+        if not episodes:
+            return []
+        # Within-batch dedup first: keep the first episode per
+        # (feed_id, guid), like the DynamoDB backend. Null-guid episodes
+        # cannot be deduped and are always kept.
+        seen: set[tuple[str, str]] = set()
+        candidates: list[Episode] = []
         for episode in episodes:
+            if episode.guid:
+                key = (str(episode.feed_id), episode.guid)
+                if key in seen:
+                    continue
+                seen.add(key)
+            candidates.append(episode)
+        persisted: list[Episode] = []
+        for episode in candidates:
             _guard_item_size(episode)
-            self._session.add(episode)
-        await self._session.flush()
-        return episodes
+            try:
+                # Per-row SAVEPOINT: a (feed_id, guid) conflict with an
+                # already-stored episode drops only that row — one
+                # duplicate guid no longer aborts the whole sync batch.
+                async with self._session.begin_nested():
+                    persisted.append(
+                        await _persist(self._session, episode)
+                    )
+            except IntegrityError as exc:
+                if not _is_episode_guid_conflict(exc):
+                    raise
+        return persisted
 
     async def mark_processed(
         self, episode_id: UUID, processed: bool = True
@@ -265,16 +373,19 @@ class _InsightRepository(InsightRepository):
 
     async def save(self, insight: Insight) -> Insight:
         _guard_item_size(insight)
-        self._session.add(insight)
-        await self._session.flush()
-        return insight
+        return await _persist(self._session, insight)
 
     async def save_many(self, insights: list[Insight]) -> list[Insight]:
+        # Plain per-row upserts (DynamoDB's batch-put is PutItem per item);
+        # insights carry no non-PK unique constraints, so no savepoint or
+        # dedup is needed.
+        persisted: list[Insight] = []
         for insight in insights:
             _guard_item_size(insight)
-            self._session.add(insight)
-        await self._session.flush()
-        return insights
+            persisted.append(
+                await _persist(self._session, insight)
+            )
+        return persisted
 
 
 class _TagRepository(TagRepository):
@@ -298,11 +409,21 @@ class _TagRepository(TagRepository):
             return tag
         tag = Tag(name=name, category=category)
         _guard_item_size(tag)
-        self._session.add(tag)
-        # The uq_tag_name_category constraint is the concurrency backstop: a
-        # concurrent insert raises IntegrityError on flush, per the ABC
-        # contract.
-        await self._session.flush()
+        try:
+            async with self._session.begin_nested():
+                self._session.add(tag)
+                await self._session.flush()
+        except IntegrityError:
+            # Lost a check-then-insert race with a concurrent transaction:
+            # roll back only to the savepoint (the rest of the unit of
+            # work survives) and return the row the winner committed, per
+            # the ABC's "at most one tag visible afterwards" contract.
+            # (The partial unique indexes from XIN-121 are the backstop —
+            # including for NULL categories.)
+            existing = await self.get_by_name_category(name, category)
+            if existing is None:
+                raise
+            return existing
         return tag
 
     async def add_episode_tag(self, episode_id: UUID, tag_id: UUID) -> None:
@@ -313,10 +434,25 @@ class _TagRepository(TagRepository):
             )
         )
         if res.scalar_one_or_none() is None:
-            self._session.add(
-                EpisodeTag(episode_id=episode_id, tag_id=tag_id)
-            )
-            await self._session.flush()
+            try:
+                async with self._session.begin_nested():
+                    self._session.add(
+                        EpisodeTag(episode_id=episode_id, tag_id=tag_id)
+                    )
+                    await self._session.flush()
+            except IntegrityError:
+                # Check-then-insert race: re-check after the savepoint
+                # rollback. If the link exists now, the duplicate add is
+                # the protocol-promised no-op; otherwise this was a
+                # different integrity failure — re-raise it.
+                res = await self._session.execute(
+                    select(EpisodeTag).where(
+                        EpisodeTag.episode_id == episode_id,
+                        EpisodeTag.tag_id == tag_id,
+                    )
+                )
+                if res.scalar_one_or_none() is None:
+                    raise
 
     async def list_tags_for_episode(self, episode_id: UUID) -> list[Tag]:
         res = await self._session.execute(
@@ -333,22 +469,14 @@ class _UserRepository(UserRepository):
         self._session = session
 
     async def get_by_id(self, user_id: UUID) -> Optional[User]:
-        res = await self._session.execute(
-            select(User).where(User.user_id == user_id)
-        )
-        return res.scalar_one_or_none()
+        return await _get_by_unique(self._session, User, User.user_id, user_id)
 
     async def get_by_email(self, email: str) -> Optional[User]:
-        res = await self._session.execute(
-            select(User).where(User.email == email)
-        )
-        return res.scalar_one_or_none()
+        return await _get_by_unique(self._session, User, User.email, email)
 
     async def save(self, user: User) -> User:
         _guard_item_size(user)
-        self._session.add(user)
-        await self._session.flush()
-        return user
+        return await _persist(self._session, user)
 
 
 class _PlaylistRepository(PlaylistRepository):
@@ -364,29 +492,57 @@ class _PlaylistRepository(PlaylistRepository):
         return list(res.scalars().all())
 
     async def get_by_id(self, playlist_id: UUID) -> Optional[CuratedPlaylist]:
-        res = await self._session.execute(
-            select(CuratedPlaylist).where(
-                CuratedPlaylist.playlist_id == playlist_id
-            )
+        return await _get_by_unique(
+            self._session, CuratedPlaylist, CuratedPlaylist.playlist_id, playlist_id
         )
-        return res.scalar_one_or_none()
+
+    async def get_by_slug(self, slug: str) -> Optional[CuratedPlaylist]:
+        return await _get_by_unique(
+            self._session, CuratedPlaylist, CuratedPlaylist.slug, slug
+        )
 
     async def save(self, playlist: CuratedPlaylist) -> CuratedPlaylist:
         _guard_item_size(playlist)
-        self._session.add(playlist)
+        return await self._save_playlist(playlist)
+
+    async def _save_playlist(self, playlist: CuratedPlaylist) -> CuratedPlaylist:
+        # The unguarded playlist write: SAVEPOINT-scoped slug-conflict
+        # handling shared by save() and the _mutate_playlist helpers.
+        # The slug is captured BEFORE any rollback can expire the
+        # instance (XIN-119).
+        slug = playlist.slug
         try:
-            await self._session.flush()
+            # Only the playlist flush rolls back on conflict — every other
+            # flushed-but-uncommitted write in the caller's unit of work
+            # (episodes, tags, progress) survives (XIN-119).
+            async with self._session.begin_nested():
+                return await _persist(self._session, playlist)
         except IntegrityError as exc:
-            # The session is unusable after a failed flush; roll back so
-            # the unit of work can continue, then surface slug conflicts
-            # as the backend-agnostic SlugConflictError.
-            await self._session.rollback()
-            if "slug" in str(exc.orig).lower():
+            if _is_slug_conflict(exc):
                 raise SlugConflictError(
-                    f"playlist slug {playlist.slug!r} is already taken"
+                    f"playlist slug {slug!r} is already taken"
                 ) from exc
             raise
-        return playlist
+
+    async def _mutate_playlist(
+        self,
+        playlist_id: UUID,
+        mutate: Callable[[CuratedPlaylist], None],
+    ) -> Optional[CuratedPlaylist]:
+        """Load-mutate-save skeleton shared by publish/unpublish/rotate_token.
+
+        Returns the saved playlist, or ``None`` when the id does not
+        exist. Goes through the unguarded ``_save_playlist`` (not the
+        public ``save()``): these operations only touch small fixed-size
+        fields, and the entity was size-checked when first saved — so
+        ``publish`` (like ``add_episode_tag``) never triggers the
+        item-size guard (XIN-122).
+        """
+        playlist = await self.get_by_id(playlist_id)
+        if playlist is None:
+            return None
+        mutate(playlist)
+        return await self._save_playlist(playlist)
 
     async def add_episode(
         self, playlist_id: UUID, episode_id: UUID, position: int
@@ -455,38 +611,30 @@ class _PlaylistRepository(PlaylistRepository):
         self, playlist_id: UUID, visibility: str
     ) -> Optional[CuratedPlaylist]:
         validate_visibility(visibility)
-        playlist = await self.get_by_id(playlist_id)
-        if playlist is None:
-            return None
-        playlist.visibility = visibility
-        if playlist.slug is None:
-            playlist.slug = generate_slug(playlist.title)
-        if playlist.token is None:
-            playlist.token = generate_token()
-        return await self.save(playlist)
+
+        def _apply(playlist: CuratedPlaylist) -> None:
+            playlist.visibility = visibility
+            if playlist.slug is None:
+                playlist.slug = generate_slug(playlist.title)
+            if playlist.token is None:
+                playlist.token = generate_token()
+
+        return await self._mutate_playlist(playlist_id, _apply)
 
     async def unpublish(self, playlist_id: UUID) -> Optional[CuratedPlaylist]:
-        playlist = await self.get_by_id(playlist_id)
-        if playlist is None:
-            return None
-        playlist.visibility = VISIBILITY_UNLISTED
-        return await self.save(playlist)
+        return await self._mutate_playlist(
+            playlist_id, lambda p: setattr(p, "visibility", VISIBILITY_UNLISTED)
+        )
 
     async def rotate_token(self, playlist_id: UUID) -> Optional[str]:
-        playlist = await self.get_by_id(playlist_id)
-        if playlist is None:
-            return None
         new_token = generate_token()
-        playlist.token = new_token
-        playlist.token_revoked_at = _now_utc()
-        await self.save(playlist)
-        return new_token
 
-    async def get_by_slug(self, slug: str) -> Optional[CuratedPlaylist]:
-        res = await self._session.execute(
-            select(CuratedPlaylist).where(CuratedPlaylist.slug == slug)
-        )
-        return res.scalar_one_or_none()
+        def _rotate(playlist: CuratedPlaylist) -> None:
+            playlist.token = new_token
+            playlist.token_revoked_at = _now_utc()
+
+        saved = await self._mutate_playlist(playlist_id, _rotate)
+        return new_token if saved is not None else None
 
 
 class _ProgressRepository(ProgressRepository):
@@ -505,14 +653,10 @@ class _ProgressRepository(ProgressRepository):
         return res.scalar_one_or_none()
 
     async def save(self, progress: UserEpisodeProgress) -> UserEpisodeProgress:
-        # Genuine upsert by the composite primary key: add()+flush() would
-        # raise IntegrityError when a second instance with the same
-        # (user_id, episode_id) is saved in one unit of work, but the ABC
-        # contract for save() is "upsert by primary key".
+        # Genuine upsert by the composite primary key: the ABC contract for
+        # save() is "upsert by primary key".
         _guard_item_size(progress)
-        merged = await self._session.merge(progress)
-        await self._session.flush()
-        return merged
+        return await _persist(self._session, progress)
 
 
 class _TaskLogRepository(TaskLogRepository):
@@ -521,9 +665,7 @@ class _TaskLogRepository(TaskLogRepository):
 
     async def save(self, task_log: TaskLog) -> TaskLog:
         _guard_item_size(task_log)
-        self._session.add(task_log)
-        await self._session.flush()
-        return task_log
+        return await _persist(self._session, task_log)
 
     async def list_by_type_status(
         self,
