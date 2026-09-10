@@ -28,6 +28,7 @@ from backend.persistence.repositories import (
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
+    MissingParentError,
     PlaylistEpisodeEntry,
     PlaylistRepository,
     ProgressRepository,
@@ -457,6 +458,23 @@ async def _get_episode_by_id(
         },
     )
     return codec.item_to_model(models.Episode, items[0]) if items else None
+
+
+async def _playlist_exists(
+    client: Any, table_name: str, playlist_id: UUID
+) -> bool:
+    """Point lookup for a playlist through gsi1 (``PL#<id>`` / META)."""
+    items = await _query_all(
+        client,
+        table_name,
+        IndexName="gsi1",
+        KeyConditionExpression="gsi1pk = :p AND gsi1sk = :s",
+        ExpressionAttributeValues={
+            ":p": _s(f"PL#{playlist_id}"),
+            ":s": _s(keys.META),
+        },
+    )
+    return bool(items)
 
 
 def _guid_marker_item(episode: models.Episode) -> dict:
@@ -1392,12 +1410,27 @@ class _PlaylistRepository(PlaylistRepository):
     ) -> None:
         """Link an episode into a playlist (upsert on the link key).
 
+        FK parity with the SQL backend (Linear: XIN-124 — Chester's call):
+        the playlist and the episode must both exist, otherwise
+        :class:`MissingParentError` is raised instead of silently creating
+        an orphaned link. Two point reads (gsi1) gate the write; the link
+        write itself stays a single atomic ``UpdateItem``.
+
         Atomicity: single-item ``UpdateItem`` — re-adding overwrites the
         link's ``position`` in one atomic write, while ``added_at`` is set
         only on first insert (``if_not_exists``), so re-adding an existing
         link preserves the original added date (Linear: XIN-98). No
-        read-before-write, so concurrent adds cannot duplicate the link.
+        read-before-write on the link itself, so concurrent adds cannot
+        duplicate it.
         """
+        if not await _playlist_exists(self._c, self._t, playlist_id):
+            raise MissingParentError(
+                f"playlist {playlist_id} does not exist"
+            )
+        if await _get_episode_by_id(self._c, self._t, episode_id) is None:
+            raise MissingParentError(
+                f"episode {episode_id} does not exist"
+            )
         key_attrs = keys.playlist_episode_link_keys(playlist_id, episode_id)
         await self._c.update_item(
             TableName=self._t,

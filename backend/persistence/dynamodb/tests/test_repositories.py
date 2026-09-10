@@ -11,7 +11,6 @@ from uuid import uuid4
 import boto3
 import pytest
 from moto import mock_aws
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from backend.persistence.dynamodb import keys
@@ -23,7 +22,7 @@ from backend.persistence.dynamodb.store import DynamoDBStore
 from backend.persistence.dynamodb.table import ensure_table
 from backend.persistence.dynamodb.testing import AsyncBoto3Client
 from backend.persistence.models import Base, CuratedPlaylist, Episode, Feed, User
-from backend.persistence.repositories import SlugConflictError
+from backend.persistence.repositories import MissingParentError, SlugConflictError
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
 
 
@@ -543,35 +542,56 @@ def _feed_with_url(url: str) -> Feed:
     )
 
 
-class TestAddEpisodeFkParityPinned:
-    """XIN-124 NOTE — pinned, do NOT change without Chester's explicit call.
+class TestAddEpisodeFkParity:
+    """XIN-124 — Chester's call: enforce FK parity across backends.
 
-    ``add_episode`` for a nonexistent playlist/episode creates the link
-    silently on DynamoDB (no FK enforcement) but raises the SQL foreign-key
-    ``IntegrityError`` on SQL. These tests pin the current behavior on each
-    backend; enforcing FKs on DynamoDB (or relaxing SQL) is a product
-    decision, not a cleanup task.
+    ``add_episode`` with a nonexistent playlist or episode raises
+    ``MissingParentError`` on ALL backends (SQLAlchemy maps the FK
+    ``IntegrityError``; DynamoDB checks parent existence before writing),
+    so callers catch one type regardless of backend. No orphaned link is
+    created on either backend.
     """
 
-    async def test_dynamodb_add_episode_without_parents_creates_link(self, store):
+    async def test_dynamodb_add_episode_without_parents_raises(self, store):
         missing_pl, missing_ep = uuid4(), uuid4()
-        # No raise: DynamoDB does not enforce the FKs.
-        await store.playlists.add_episode(missing_pl, missing_ep, 0)
-
-        # The link item was actually created...
-        link = await _raw_item(
-            store._playlists._c,
-            store.table_name,
-            f"PL#{missing_pl}",
-            f"PLEP#{missing_ep}",
+        with pytest.raises(MissingParentError):
+            await store.playlists.add_episode(missing_pl, missing_ep, 0)
+        # No orphaned link was created.
+        assert (
+            await _raw_item(
+                store._playlists._c,
+                store.table_name,
+                f"PL#{missing_pl}",
+                f"PLEP#{missing_ep}",
+            )
+            is None
         )
-        assert link is not None
-        # ...but it is invisible to reads: the episode does not exist, so
-        # it filters out of both list methods.
-        assert await store.playlists.list_episodes(missing_pl) == []
-        assert await store.playlists.list_entries(missing_pl) == []
 
-    async def test_sql_add_episode_without_parents_raises_integrity_error(
+    async def test_dynamodb_add_episode_missing_episode_only_raises(
+        self, store
+    ):
+        user = await store.users.save(User(email=f"{uuid4().hex}@x.com"))
+        pl = await store.playlists.save(
+            CuratedPlaylist(user_id=user.user_id, title="P")
+        )
+        with pytest.raises(MissingParentError):
+            await store.playlists.add_episode(pl.playlist_id, uuid4(), 0)
+
+    async def test_dynamodb_add_episode_missing_playlist_only_raises(
+        self, store
+    ):
+        feed = await store.feeds.save(_feed())
+        ep = await store.episodes.save(
+            Episode(
+                feed_id=feed.feed_id,
+                title="E",
+                audio_url="https://example.com/e.mp3",
+            )
+        )
+        with pytest.raises(MissingParentError):
+            await store.playlists.add_episode(uuid4(), ep.episode_id, 0)
+
+    async def test_sql_add_episode_without_parents_raises_missing_parent(
         self, tmp_path
     ):
         # Production SQL wiring (SQLAlchemyStore.from_url enables the
@@ -583,9 +603,7 @@ class TestAddEpisodeFkParityPinned:
         await engine.dispose()
         sql = SQLAlchemyStore.from_url(url)
         try:
-            # NOTE: the store's add_episode only session.add()s — the FK
-            # violation surfaces at flush time, so the pin covers both.
-            with pytest.raises(IntegrityError):
+            with pytest.raises(MissingParentError):
                 await sql.playlists.add_episode(uuid4(), uuid4(), 0)
                 await sql.commit()
         finally:
