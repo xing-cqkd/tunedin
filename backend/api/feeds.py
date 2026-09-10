@@ -21,7 +21,10 @@ CDN caches at or under the 15-minute polling contract. Unlisted
 (token-gated) feeds emit ``Cache-Control: private, max-age=900`` instead:
 a CDN that drops the query string from its cache key must never serve a
 cached 200 to a missing/invalid-token request (which must be a 410), so
-unlisted responses are never stored in shared caches.
+unlisted responses are never stored in shared caches. The HTML landing
+page on ``/f/<slug>`` applies the same Cache-Control scoping, and for
+unlisted playlists its autodiscovery/subscribe link carries the token
+(``?t=<token>``) so the page itself is usable without re-authenticating.
 """
 
 from __future__ import annotations
@@ -250,7 +253,15 @@ async def feed_page(
             page_url=page_url,
             feed_url=feed_url,
         )
+    # HTML stub branch — the same CDN cache-poisoning threat model as the
+    # RSS path applies (an unlisted stub could be served as 200 to an
+    # invalid-token request that must be 410), so identical Cache-Control
+    # scoping, and the token-gated autodiscovery URL carries ?t=.
+    cache_scope = "private" if resolved.visibility != "public" else "public"
+    if resolved.visibility != "public":
+        feed_url = f"{feed_url}?t={t}"
     return Response(
         content=_html_stub(title=resolved.title, feed_url=feed_url),
         media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": f"{cache_scope}, max-age=900"},
     )

@@ -10,6 +10,7 @@ so no event-loop nesting is involved.
 from __future__ import annotations
 
 import asyncio
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -26,10 +27,11 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from backend.api import create_app
-from backend.api.rss import ITUNES_NS, TUNEDIN_NS
+from backend.api.rss import ITUNES_NS, TUNEDIN_NS, build_rss, ensure_aware, rfc2822
 from backend.persistence.dynamodb.store import DynamoDBStore
 from backend.persistence.dynamodb.table import ensure_table
 from backend.persistence.dynamodb.testing import AsyncBoto3Client
+from backend.persistence.repositories import PlaylistEpisodeEntry
 from backend.persistence.models import (
     Base,
     CuratedPlaylist,
@@ -418,3 +420,96 @@ def test_itunes_tags_and_fallbacks(api_client):
     # ep2 (index 0): no duration -> tag omitted; explicit True -> "yes".
     assert items[0].find("itunes:duration", ns) is None
     assert items[0].find("itunes:explicit", ns).text == "yes"
+
+
+def _browser_page(client, slug, token=None):
+    url = f"/f/{slug}"
+    if token:
+        url += f"?t={token}"
+    return client.get(
+        url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+    )
+
+
+def test_html_stub_cache_control_scoping(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+
+    # Unlisted (token-gated) stub must be private: a shared cache must
+    # never serve a cached 200 to an invalid-token request (410).
+    unlisted = _browser_page(client, pl.slug, token=pl.token)
+    assert unlisted.status_code == 200
+    cc = unlisted.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "private"
+    assert "max-age=900" in cc
+
+    # Public stubs stay publicly cacheable.
+    _run(_make_public(client, seed))
+    public = _browser_page(client, pl.slug)
+    assert public.status_code == 200
+    cc = public.headers["cache-control"]
+    assert cc.split(",")[0].strip() == "public"
+    assert "private" not in cc
+
+
+def test_weak_etag_if_none_match(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+    url = f"/f/{pl.slug}/feed.xml?t={pl.token}"
+
+    etag = client.get(url).headers["etag"]
+    assert etag.startswith('"') and etag.endswith('"')
+
+    # A weak validator for the same opaque tag must still yield 304 —
+    # proves the W/ stripping in _parse_if_none_match.
+    weak = client.get(url, headers={"If-None-Match": f"W/{etag}"})
+    assert weak.status_code == 304
+
+
+def test_pubdate_falls_back_to_channel_date(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+    entry = seed["entries"][seed["ep1"].episode_id]
+    entry_no_date = PlaylistEpisodeEntry(
+        episode=entry.episode, position=entry.position, added_at=None
+    )
+
+    # Must render without raising; the item gets the channel date instead.
+    body = build_rss(
+        pl,
+        [entry_no_date],
+        page_url=f"http://testserver/f/{pl.slug}",
+        feed_url=f"http://testserver/f/{pl.slug}/feed.xml",
+    )
+    items = _parse(body).find("channel").findall("item")
+    assert len(items) == 1
+    pub_date = items[0].find("pubDate").text
+    assert pub_date is not None
+    channel_date = ensure_aware(pl.created_at)
+    assert pub_date == rfc2822(channel_date)
+
+
+def test_html_stub_autodiscovery_token(api_client):
+    client, seed = api_client
+    pl = seed["playlist"]
+
+    def alternate_href(resp):
+        m = re.search(
+            r"<link rel='alternate'[^>]*href='([^']+)'", resp.text
+        )
+        assert m, "no rel=alternate autodiscovery link in stub"
+        return m.group(1)
+
+    # Unlisted: the stub's autodiscovery link must carry the token so the
+    # browser user can subscribe without hitting a 410.
+    unlisted = _browser_page(client, pl.slug, token=pl.token)
+    assert unlisted.status_code == 200
+    assert f"?t={pl.token}" in alternate_href(unlisted)
+
+    # Public: no token is needed, so the bare URL stays clean.
+    _run(_make_public(client, seed))
+    public = _browser_page(client, pl.slug)
+    assert public.status_code == 200
+    href = alternate_href(public)
+    assert "?t=" not in href
+    assert href.endswith(f"/f/{pl.slug}/feed.xml")
