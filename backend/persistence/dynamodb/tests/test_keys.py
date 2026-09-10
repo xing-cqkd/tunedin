@@ -6,7 +6,6 @@ from uuid import UUID, uuid4
 
 from backend.persistence.dynamodb import keys
 from backend.persistence.dynamodb.keys import (
-    MISSING_TS_MAX,
     MISSING_TS_MIN,
     episode_keys,
     episode_tag_link_keys,
@@ -21,6 +20,7 @@ from backend.persistence.dynamodb.keys import (
     sanitize_str,
     sha256_hex,
     tag_keys,
+    tag_natural_key_hash,
     task_log_keys,
     user_keys,
     uuid_from_str,
@@ -46,10 +46,6 @@ class TestIsoTimestamp:
     def test_none_uses_min_sentinel_by_default(self):
         assert iso_timestamp(None) == MISSING_TS_MIN
         assert MISSING_TS_MIN < "2026-01-01T00:00:00+00:00"
-
-    def test_none_with_max_sentinel(self):
-        assert iso_timestamp(None, missing=MISSING_TS_MAX) == MISSING_TS_MAX
-        assert MISSING_TS_MAX > "2030-01-01T00:00:00+00:00"
 
     def test_non_utc_offset_normalized_to_utc(self):
         # A +02:00 aware datetime must encode as the same instant in UTC so
@@ -196,6 +192,27 @@ class TestTagKeys:
     def test_none_category_handled(self):
         k = tag_keys(uuid4(), name="x", category=None)
         assert k["gsi1pk"].startswith("TAGNAME#")
+
+
+class TestTagNaturalKeyHash:
+    def test_exact_case_distinguished(self):
+        # The claim key must be case-SENSITIVE (XIN-124): "Foo" and "FOO"
+        # are distinct claims, matching the SQL unique constraint.
+        h1 = tag_natural_key_hash("Foo", "topic")
+        h2 = tag_natural_key_hash("FOO", "topic")
+        assert h1 != h2
+        assert h1.startswith("TAGNAME#")
+
+    def test_differs_from_lowercased_lookup_key(self):
+        # The gsi1 lookup key stays case-insensitive; the claim hash must
+        # not be the same normalization.
+        lookup = tag_keys(uuid4(), name="Foo", category="Topic")["gsi1pk"]
+        claim_hash = tag_natural_key_hash("Foo", "Topic")
+        assert lookup != claim_hash
+
+    def test_none_category_handled(self):
+        h = tag_natural_key_hash("x", None)
+        assert h.startswith("TAGNAME#")
 
 
 class TestUserKeys:

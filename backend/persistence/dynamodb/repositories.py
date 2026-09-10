@@ -63,6 +63,46 @@ def _chunks(items: list[T], size: int) -> Iterable[list[T]]:
         yield items[i : i + size]
 
 
+# DynamoDB allows at most 100 items in one TransactWriteItems call.
+_TRANSACT_ITEM_LIMIT = 100
+
+
+def _save_many_op_chunks(
+    candidates: list[tuple[int, models.Episode]],
+    old_guids: dict[tuple[str, str], str],
+) -> Iterable[list[tuple[int, models.Episode]]]:
+    """Split candidates into chunks bounded by the transact-item limit.
+
+    A candidate costs one transact item for the episode put, plus one
+    for the guid-marker put (guid episodes only), plus one more for the
+    stale-marker delete when the episode's guid changed. Fixed
+    episode-count chunking is unsafe here: 50 guid-changing episodes
+    would need 150 items. Greedy packing keeps every chunk at or under
+    the 100-item limit; the retry loop inside ``save_many`` only ever
+    shrinks ``remaining``, so a retried chunk stays within budget too.
+    """
+    chunk: list[tuple[int, models.Episode]] = []
+    cost = 0
+    for candidate in candidates:
+        _, episode = candidate
+        item_cost = 1
+        if episode.guid:
+            item_cost += 1
+            prev = old_guids.get(
+                (str(episode.feed_id), str(episode.episode_id))
+            )
+            if prev is not None and prev != episode.guid:
+                item_cost += 1
+        if chunk and cost + item_cost > _TRANSACT_ITEM_LIMIT:
+            yield chunk
+            chunk = []
+            cost = 0
+        chunk.append(candidate)
+        cost += item_cost
+    if chunk:
+        yield chunk
+
+
 async def _query_all(client: Any, table_name: str, **kwargs: Any) -> list[dict]:
     """Run a Query to exhaustion, returning every matching item."""
     items: list[dict] = []
@@ -187,6 +227,24 @@ def _feed_item(feed: models.Feed) -> dict:
     return codec.model_to_item(feed, key_attrs, codec.TYPE_FEED)
 
 
+def _rss_url_claim_item(feed: models.Feed) -> dict:
+    """Build the rss_url-claim item for a feed (Linear: XIN-124).
+
+    The claim's key (``RSSURLCLAIM#<sha256(rss_url)>`` / ``META``) is the
+    write-time uniqueness lock for ``Feed.rss_url`` — the DynamoDB
+    analogue of the SQL ``unique=True`` constraint. The ``feed_id``
+    attribute lets re-saves of the same feed pass the claim's condition
+    expression. Claim items accumulate (never deleted except when a
+    feed's own rss_url changes); see the tag-claim tradeoff comment in
+    :meth:`_TagRepository._get_or_create`.
+    """
+    key_attrs = keys.rss_url_claim_keys(feed.rss_url)
+    item = {name: _s(value) for name, value in key_attrs.items()}
+    item["type"] = _s(codec.TYPE_RSS_URL_CLAIM)
+    item["feed_id"] = _s(str(feed.feed_id))
+    return item
+
+
 class _FeedRepository(FeedRepository):
     def __init__(self, client: Any, table_name: str) -> None:
         self._c = client
@@ -263,15 +321,62 @@ class _FeedRepository(FeedRepository):
         return [codec.item_to_model(models.Feed, i) for i in items]
 
     async def save(self, feed: models.Feed) -> models.Feed:
-        """Upsert by primary key.
+        """Upsert by primary key, enforcing rss_url uniqueness at write time.
 
-        Atomicity: single-item ``PutItem`` — atomic by DynamoDB single-item
-        write semantics. Concurrent saves of the same feed are
-        last-writer-wins, mirroring the SQL upsert for a fully-loaded
-        entity. A changed ``sync_status`` rewrites the gsi2 keys in the
-        same write, so the status indexes can never go stale.
+        Atomicity: the feed item and its rss_url-claim item are written in
+        one ``TransactWriteItems`` call, with
+        ``attribute_not_exists(pk) OR feed_id = :fid`` on the claim. An
+        rss_url taken by a *different* feed cancels the whole write and
+        raises :class:`ValueError` (SQL raises ``IntegrityError`` on the
+        unique constraint instead — the error types differ but both
+        reject the duplicate). Re-saving the same feed (idempotent
+        re-write) passes the condition. When the rss_url itself changed,
+        the stale claim is deleted in the SAME transaction, so a crash
+        can never leave the old URL claimed forever (Linear: XIN-123).
+
+        Consistency: the old-row lookup goes through :meth:`get_by_id`,
+        a main-table ``GetItem`` (strongly consistent) — no staleness
+        window on the stale-claim cleanup, unlike the slug-claim path
+        which reads through gsi1.
         """
-        await self._c.put_item(TableName=self._t, Item=_feed_item(feed))
+        is_new = feed.feed_id is None
+        codec.apply_defaults(feed)
+        old = None if is_new else await self.get_by_id(feed.feed_id)
+        transact_items = [
+            {"Put": {"TableName": self._t, "Item": _feed_item(feed)}},
+            {
+                "Put": {
+                    "TableName": self._t,
+                    "Item": _rss_url_claim_item(feed),
+                    "ConditionExpression": (
+                        "attribute_not_exists(pk) OR feed_id = :fid"
+                    ),
+                    "ExpressionAttributeValues": {
+                        ":fid": _s(str(feed.feed_id))
+                    },
+                }
+            },
+        ]
+        if old is not None and old.rss_url and old.rss_url != feed.rss_url:
+            transact_items.append(
+                {
+                    "Delete": {
+                        "TableName": self._t,
+                        "Key": _key(
+                            keys.rss_url_claim_keys(old.rss_url)["pk"],
+                            keys.META,
+                        ),
+                    }
+                }
+            )
+        try:
+            await self._c.transact_write_items(TransactItems=transact_items)
+        except self._c.exceptions.TransactionCanceledException as exc:
+            if _conditional_check_failed_indices(exc):
+                raise ValueError(
+                    f"feed rss_url {feed.rss_url!r} is already taken"
+                ) from exc
+            raise
         return feed
 
     async def count_by_status(self, status: str) -> int:
@@ -331,6 +436,29 @@ def _episode_item(episode: models.Episode) -> dict:
     return codec.model_to_item(episode, key_attrs, codec.TYPE_EPISODE)
 
 
+async def _get_episode_by_id(
+    client: Any, table_name: str, episode_id: UUID
+) -> Optional[models.Episode]:
+    """Fetch one episode by id through the gsi1 point lookup.
+
+    Module-level so both :meth:`_EpisodeRepository.get_by_id` and the
+    playlist link resolvers share the single implementation (Linear:
+    XIN-125) — batch this one place later (backlog XIN-107) and the N+1
+    in ``list_episodes``/``list_entries`` is fixed everywhere at once.
+    """
+    items = await _query_all(
+        client,
+        table_name,
+        IndexName="gsi1",
+        KeyConditionExpression="gsi1pk = :p AND gsi1sk = :s",
+        ExpressionAttributeValues={
+            ":p": _s(f"EP#{episode_id}"),
+            ":s": _s(keys.META),
+        },
+    )
+    return codec.item_to_model(models.Episode, items[0]) if items else None
+
+
 def _guid_marker_item(episode: models.Episode) -> dict:
     key_attrs = keys.guid_marker_keys(episode.feed_id, episode.guid)
     item = {name: _s(value) for name, value in key_attrs.items()}
@@ -345,17 +473,7 @@ class _EpisodeRepository(EpisodeRepository):
         self._t = table_name
 
     async def get_by_id(self, episode_id: UUID) -> Optional[models.Episode]:
-        items = await _query_all(
-            self._c,
-            self._t,
-            IndexName="gsi1",
-            KeyConditionExpression="gsi1pk = :p AND gsi1sk = :s",
-            ExpressionAttributeValues={
-                ":p": _s(f"EP#{episode_id}"),
-                ":s": _s(keys.META),
-            },
-        )
-        return codec.item_to_model(models.Episode, items[0]) if items else None
+        return await _get_episode_by_id(self._c, self._t, episode_id)
 
     async def list_guids_by_feed(self, feed_id: UUID) -> set[str]:
         # Union of guid attributes on episode items (written by save()) and
@@ -445,46 +563,98 @@ class _EpisodeRepository(EpisodeRepository):
     async def save(self, episode: models.Episode) -> models.Episode:
         """Upsert by primary key; maintains the guid-dedup marker.
 
-        Atomicity: ordered-writes — the episode put, the marker put, and
-        (when the guid changed) the stale-marker delete are separate
-        single-item writes, each atomic on its own. A crash between them
-        can leave a transiently stale marker, which only ever fails
-        dedup CLOSED (a guid treated as taken); the next save of that
-        episode cleans it up. The transactional cross-episode dedup
-        guarantee lives in :meth:`save_many`, which is what the sync
-        pipeline uses; concurrent ``save()`` calls racing on the same
-        guid are last-writer-wins.
+        Atomicity: one ``TransactWriteItems`` call holding the episode
+        put, the guid-marker put (when the episode has a guid), and the
+        stale-marker delete (when the guid changed) — a crash can never
+        leave a stale marker claimed forever (Linear: XIN-123). The
+        transactional cross-episode dedup guarantee lives in
+        :meth:`save_many`, which is what the sync pipeline uses;
+        concurrent ``save()`` calls racing on the same guid are
+        last-writer-wins.
 
         Consistency: the old-guid lookup goes through :meth:`get_by_id`,
         which reads gsi1 — eventually consistent on real AWS, so a read
         immediately after a prior write can see stale data (e.g. miss an
         episode that was just saved and skip the stale-marker cleanup).
-        The cleanup is self-healing: the next save sees the current row
-        and removes the stale marker then.
+        Residual staleness window: a gsi1-stale ``old`` can only ever
+        skip a cleanup or delete an already-dangling claim — the delete
+        is idempotent, and the marker for the *current* guid is always
+        written, so dedup for the live guid is never poisoned.
         """
         is_new = episode.episode_id is None
         codec.apply_defaults(episode)
         old = None if is_new else await self.get_by_id(episode.episode_id)
-        await self._c.put_item(TableName=self._t, Item=_episode_item(episode))
+        transact_items: list[dict] = [
+            {"Put": {"TableName": self._t, "Item": _episode_item(episode)}}
+        ]
         if episode.guid:
-            await self._c.put_item(
-                TableName=self._t, Item=_guid_marker_item(episode)
+            transact_items.append(
+                {
+                    "Put": {
+                        "TableName": self._t,
+                        "Item": _guid_marker_item(episode),
+                    }
+                }
             )
         if old is not None and old.guid and old.guid != episode.guid:
-            await self._c.delete_item(
-                TableName=self._t,
-                Key=_key(f"FEED#{old.feed_id}", f"GUID#{old.guid}"),
+            transact_items.append(
+                {
+                    "Delete": {
+                        "TableName": self._t,
+                        "Key": _key(
+                            f"FEED#{old.feed_id}", f"GUID#{old.guid}"
+                        ),
+                    }
+                }
             )
+        await self._c.transact_write_items(TransactItems=transact_items)
         return episode
+
+    async def _old_guids_for_chunk(
+        self, candidates: list[tuple[int, models.Episode]]
+    ) -> dict[tuple[str, str], str]:
+        """Map (feed_id, episode_id) -> currently-claimed guid.
+
+        Read from the guid-marker items (one ``begins_with(GUID#)`` query
+        per feed), so :meth:`save_many` can delete the stale marker when
+        a re-saved episode's guid changed — in the same transaction that
+        writes the new marker (Linear: XIN-123 §3). A guid change that
+        this pre-read misses (marker written concurrently after the
+        read) leaves a dangling marker, which the next ``save()`` of
+        that episode removes; markers are never read for anything but
+        dedup, so a dangling one only ever fails dedup CLOSED.
+        """
+        feed_ids = {str(episode.feed_id) for _, episode in candidates}
+        old_guids: dict[tuple[str, str], str] = {}
+        for feed_id in feed_ids:
+            marker_items = await _query_all(
+                self._c,
+                self._t,
+                KeyConditionExpression="pk = :p AND begins_with(sk, :g)",
+                ExpressionAttributeValues={
+                    ":p": _s(f"FEED#{feed_id}"),
+                    ":g": _s("GUID#"),
+                },
+                ProjectionExpression="sk, episode_id",
+            )
+            for marker in marker_items:
+                guid = marker["sk"]["S"].split("GUID#", 1)[1]
+                raw_ep_id = marker.get("episode_id")
+                if guid and raw_ep_id is not None:
+                    old_guids[(feed_id, codec.deserialize_plain(raw_ep_id))] = (
+                        guid
+                    )
+        return old_guids
 
     async def save_many(
         self, episodes: list[models.Episode]
     ) -> list[models.Episode]:
         """Persist a batch of episodes with guid-dedup.
 
-        Atomicity: ``TransactWriteItems`` per chunk of at most 50 episodes
-        (each guid episode contributes a marker put + an episode put, so a
-        chunk is at most 100 transact items). Each marker carries
+        Atomicity: ``TransactWriteItems`` per chunk, where chunks are
+        packed against the DynamoDB 100-item transaction limit (a guid
+        episode costs a marker put + an episode put, plus an optional
+        stale-marker delete on guid change). Each marker carries
         ``attribute_not_exists(pk)``, so a duplicate guid for the same feed
         cancels only its own episode — conflicting duplicates are dropped
         and reported by omission from the return value (input order is
@@ -493,15 +663,29 @@ class _EpisodeRepository(EpisodeRepository):
         back earlier chunks; the return value is the record of what
         persisted. Null-guid episodes skip markers (they cannot be
         deduped) and are plain transactional puts.
+
+        Guid changes: when a candidate re-saves an existing episode under
+        a new guid, the old guid's marker is deleted in the SAME
+        transaction that writes the new one (Linear: XIN-123 §3) — the
+        old guid would otherwise stay claimed forever and poison future
+        dedup. Id-less episodes get their ids assigned up front
+        (:func:`codec.apply_defaults` runs before any marker is built),
+        so the persisted marker's ``episode_id`` is the real id and an
+        idempotent re-write of the batch resolves its own markers
+        (Linear: XIN-124).
         """
         if not episodes:
             return []
-        # Within-batch dedup first: one TransactWriteItems call cannot
+        # Assign ids/defaults BEFORE any item is built: the guid-dedup
+        # marker embeds episode_id, and without this an id-less episode's
+        # marker would carry the literal string "None" (XIN-124).
+        # Within-batch dedup second: one TransactWriteItems call cannot
         # contain two operations on the same marker item, so keep only the
         # first episode per (feed_id, guid).
         seen: set[tuple[str, str]] = set()
         candidates: list[tuple[int, models.Episode]] = []
         for index, episode in enumerate(episodes):
+            codec.apply_defaults(episode)
             dedup_key = (
                 (str(episode.feed_id), episode.guid) if episode.guid else None
             )
@@ -512,7 +696,15 @@ class _EpisodeRepository(EpisodeRepository):
             candidates.append((index, episode))
 
         persisted: set[int] = set()
-        for chunk in _chunks(candidates, 50):
+        # The stale-marker pre-read is one begins_with(GUID#) query per
+        # feed over all candidates (not per chunk) — the chunker needs
+        # the guid-change costs up front. Skipped entirely when no
+        # candidate has a guid (nothing can need a stale-marker delete).
+        if any(episode.guid for _, episode in candidates):
+            old_guids = await self._old_guids_for_chunk(candidates)
+        else:
+            old_guids = {}
+        for chunk in _save_many_op_chunks(candidates, old_guids):
             remaining = list(chunk)
             while remaining:
                 transact_items: list[dict] = []
@@ -529,6 +721,24 @@ class _EpisodeRepository(EpisodeRepository):
                             }
                         )
                         owners.append(index)
+                        prev_guid = old_guids.get(
+                            (str(episode.feed_id), str(episode.episode_id))
+                        )
+                        if prev_guid is not None and prev_guid != episode.guid:
+                            # Guid change on a re-saved episode: release
+                            # the old guid in the same transaction.
+                            transact_items.append(
+                                {
+                                    "Delete": {
+                                        "TableName": self._t,
+                                        "Key": _key(
+                                            f"FEED#{episode.feed_id}",
+                                            f"GUID#{prev_guid}",
+                                        ),
+                                    }
+                                }
+                            )
+                            owners.append(index)
                     transact_items.append(
                         {"Put": {"TableName": self._t, "Item": _episode_item(episode)}}
                     )
@@ -567,14 +777,17 @@ class _EpisodeRepository(EpisodeRepository):
         Returns True when the candidate was (re-)persisted: the winning
         marker belongs to the same episode, so this is an idempotent
         re-write rather than a duplicate. Also cleans up a stale marker
-        when the episode's guid itself changed.
+        when the episode's guid itself changed — the episode rewrite and
+        the stale-marker delete go in one ``TransactWriteItems`` call so
+        a crash cannot strand the old guid claimed (Linear: XIN-123).
 
         Consistency: the marker read is a main-table ``GetItem``
         (strongly consistent), but the old-episode read goes through
         :meth:`get_by_id`, which queries gsi1 — eventually consistent on
         real AWS, so a read immediately after a prior write can see stale
-        data. A stale ``old`` only skips a stale-marker cleanup, which
-        the next save of the episode performs (self-healing).
+        data. A stale ``old`` only skips a stale-marker cleanup; the
+        cleanup is idempotent and the next save of the episode retries
+        it.
         """
         resp = await self._c.get_item(
             TableName=self._t,
@@ -588,12 +801,19 @@ class _EpisodeRepository(EpisodeRepository):
         ):
             return False
         old = await self.get_by_id(episode.episode_id)
-        await self._c.put_item(TableName=self._t, Item=_episode_item(episode))
+        transact_items: list[dict] = [
+            {"Put": {"TableName": self._t, "Item": _episode_item(episode)}}
+        ]
         if old is not None and old.guid and old.guid != episode.guid:
-            await self._c.delete_item(
-                TableName=self._t,
-                Key=_key(f"FEED#{old.feed_id}", f"GUID#{old.guid}"),
+            transact_items.append(
+                {
+                    "Delete": {
+                        "TableName": self._t,
+                        "Key": _key(f"FEED#{old.feed_id}", f"GUID#{old.guid}"),
+                    }
+                }
             )
+        await self._c.transact_write_items(TransactItems=transact_items)
         return True
 
     async def mark_processed(
@@ -725,10 +945,27 @@ def _tag_natural_key(name: str, category: Optional[str]) -> str:
     """The gsi1 partition key for a (name, category) pair.
 
     Derived from :func:`keys.tag_keys` (not reimplemented) so the hash
-    normalization can never drift from the key schema.
+    normalization can never drift from the key schema. This is the
+    case-INSENSITIVE lookup key — it deliberately differs from the
+    exact-case claim key built by :func:`keys.tag_natural_key_hash`
+    (Linear: XIN-124): lookup finds candidates, the exact (name,
+    category) re-check in :meth:`_TagRepository.get_by_name_category`
+    picks the SQL-semantics match.
     """
     probe = keys.tag_keys(UUID(int=0), name=name, category=category)
     return probe["gsi1pk"]
+
+
+def _tag_claim_pk(name: str, category: Optional[str]) -> str:
+    """The claim-item partition key for a (name, category) pair.
+
+    Hashes the exact-case pair (via :func:`keys.tag_natural_key_hash`),
+    so ``"Foo"`` and ``"FOO"`` are distinct claims — matching the SQL
+    case-sensitive unique constraint (Linear: XIN-124).
+    """
+    return keys.tag_natural_key_hash(name, category).replace(
+        "TAGNAME#", "TAGCLAIM#", 1
+    )
 
 
 def _tag_item(tag: models.Tag) -> dict:
@@ -793,9 +1030,16 @@ class _TagRepository(TagRepository):
             return existing
         tag = models.Tag(name=name, category=category)
         codec.apply_defaults(tag)
-        claim_pk = _tag_natural_key(name, category).replace(
-            "TAGNAME#", "TAGCLAIM#", 1
-        )
+        # Deliberate tradeoff: claim items accumulate forever and are
+        # never garbage-collected. The claim is the write-time uniqueness
+        # lock that the whole get_or_create race protocol relies on (a
+        # later creator must observe the earlier winner's claim even
+        # across crashes, and the stale-claim recovery path must be able
+        # to distinguish "winner crashed" from "never claimed"), so a
+        # naive GC that deleted claims would re-open the duplicate-tag
+        # race. Claims are tiny (one item per natural key) — do NOT add
+        # naive GC here.
+        claim_pk = _tag_claim_pk(name, category)
         claim_item = {
             "pk": _s(claim_pk),
             "sk": _s(keys.META),
@@ -897,6 +1141,24 @@ def _user_item(user: models.User) -> dict:
     return codec.model_to_item(user, key_attrs, codec.TYPE_USER)
 
 
+def _email_claim_item(user: models.User) -> dict:
+    """Build the email-claim item for a user (Linear: XIN-124).
+
+    The claim's key (``EMAILCLAIM#<sha256(email)>`` / ``META``) is the
+    write-time uniqueness lock for ``User.email`` — the DynamoDB analogue
+    of the SQL ``unique=True`` constraint. The ``user_id`` attribute lets
+    re-saves of the same user pass the claim's condition expression.
+    Claim items accumulate (never deleted except when a user's own email
+    changes); see the tag-claim tradeoff comment in
+    :meth:`_TagRepository._get_or_create`.
+    """
+    key_attrs = keys.email_claim_keys(user.email)
+    item = {name: _s(value) for name, value in key_attrs.items()}
+    item["type"] = _s(codec.TYPE_EMAIL_CLAIM)
+    item["user_id"] = _s(str(user.user_id))
+    return item
+
+
 class _UserRepository(UserRepository):
     def __init__(self, client: Any, table_name: str) -> None:
         self._c = client
@@ -930,13 +1192,62 @@ class _UserRepository(UserRepository):
         return None
 
     async def save(self, user: models.User) -> models.User:
-        """Upsert by primary key.
+        """Upsert by primary key, enforcing email uniqueness at write time.
 
-        Atomicity: single-item ``PutItem`` — atomic by DynamoDB
-        single-item write semantics; last-writer-wins on concurrent
-        saves, mirroring the SQL upsert.
+        Atomicity: the user item and its email-claim item are written in
+        one ``TransactWriteItems`` call, with
+        ``attribute_not_exists(pk) OR user_id = :uid`` on the claim. An
+        email taken by a *different* user cancels the whole write and
+        raises :class:`ValueError` (SQL raises ``IntegrityError`` on the
+        unique constraint instead — the error types differ but both
+        reject the duplicate). Re-saving the same user (idempotent
+        re-write) passes the condition. When the email itself changed,
+        the stale claim is deleted in the SAME transaction, so a crash
+        can never leave the old address claimed forever (Linear: XIN-123).
+
+        Consistency: the old-row lookup goes through :meth:`get_by_id`,
+        a main-table ``GetItem`` (strongly consistent) — no staleness
+        window on the stale-claim cleanup, unlike the slug-claim path
+        which reads through gsi1.
         """
-        await self._c.put_item(TableName=self._t, Item=_user_item(user))
+        is_new = user.user_id is None
+        codec.apply_defaults(user)
+        old = None if is_new else await self.get_by_id(user.user_id)
+        transact_items = [
+            {"Put": {"TableName": self._t, "Item": _user_item(user)}},
+            {
+                "Put": {
+                    "TableName": self._t,
+                    "Item": _email_claim_item(user),
+                    "ConditionExpression": (
+                        "attribute_not_exists(pk) OR user_id = :uid"
+                    ),
+                    "ExpressionAttributeValues": {
+                        ":uid": _s(str(user.user_id))
+                    },
+                }
+            },
+        ]
+        if old is not None and old.email and old.email != user.email:
+            transact_items.append(
+                {
+                    "Delete": {
+                        "TableName": self._t,
+                        "Key": _key(
+                            keys.email_claim_keys(old.email)["pk"],
+                            keys.META,
+                        ),
+                    }
+                }
+            )
+        try:
+            await self._c.transact_write_items(TransactItems=transact_items)
+        except self._c.exceptions.TransactionCanceledException as exc:
+            if _conditional_check_failed_indices(exc):
+                raise ValueError(
+                    f"user email {user.email!r} is already taken"
+                ) from exc
+            raise
         return user
 
 
@@ -1010,44 +1321,61 @@ class _PlaylistRepository(PlaylistRepository):
     async def save(self, playlist: models.CuratedPlaylist) -> models.CuratedPlaylist:
         """Upsert by primary key, enforcing slug uniqueness at write time.
 
-        Atomicity: when the playlist has a slug, the playlist item and its
-        slug-claim item are written in one ``TransactWriteItems`` call, with
-        ``attribute_not_exists(pk) OR playlist_id = :pid`` on the claim. A
-        slug taken by a *different* playlist cancels the whole write and
-        raises :class:`SlugConflictError`; re-saving the same playlist
+        Atomicity: when the playlist has a slug, the playlist item, its
+        slug-claim item, and (on a slug change) the stale-claim delete go
+        in one ``TransactWriteItems`` call — different items are allowed
+        in one transaction, so a crash can never leave the old slug
+        claimed forever (Linear: XIN-123). The claim carries
+        ``attribute_not_exists(pk) OR playlist_id = :pid``: a slug taken
+        by a *different* playlist cancels the whole write and raises
+        :class:`SlugConflictError`; re-saving the same playlist
         (idempotent re-write) passes the condition. Slug-less playlists
         are a single-item ``PutItem``, as before.
 
-        Consistency: a slug *change* deletes the stale claim in a separate
-        ordered write (same pattern as episode guid changes in
-        :meth:`_EpisodeRepository.save`). A crash between the writes can
-        leave a transiently stale claim, which only ever fails dedup CLOSED
-        (a slug treated as taken); the next save of that playlist cleans it
-        up.
+        Consistency: the old-row lookup goes through :meth:`get_by_id`,
+        which reads gsi1 — eventually consistent on real AWS. Residual
+        staleness window: if gsi1 returns a stale ``old`` that misses a
+        very recent slug change on this same playlist, the true stale
+        claim is not included in this transaction and stays claimed.
+        The stale-claim delete is idempotent, so a stale ``old`` can
+        only ever delete an already-dangling claim — never a live one.
         """
         is_new = playlist.playlist_id is None
         codec.apply_defaults(playlist)
         old = None if is_new else await self.get_by_id(playlist.playlist_id)
         item = _playlist_item(playlist)
         if playlist.slug:
+            transact_items: list[dict] = [
+                {"Put": {"TableName": self._t, "Item": item}},
+                {
+                    "Put": {
+                        "TableName": self._t,
+                        "Item": _slug_claim_item(playlist),
+                        "ConditionExpression": (
+                            "attribute_not_exists(pk)"
+                            " OR playlist_id = :pid"
+                        ),
+                        "ExpressionAttributeValues": {
+                            ":pid": _s(str(playlist.playlist_id))
+                        },
+                    }
+                },
+            ]
+            if old is not None and old.slug and old.slug != playlist.slug:
+                transact_items.append(
+                    {
+                        "Delete": {
+                            "TableName": self._t,
+                            "Key": _key(
+                                keys.slug_claim_keys(old.slug)["pk"],
+                                keys.META,
+                            ),
+                        }
+                    }
+                )
             try:
                 await self._c.transact_write_items(
-                    TransactItems=[
-                        {"Put": {"TableName": self._t, "Item": item}},
-                        {
-                            "Put": {
-                                "TableName": self._t,
-                                "Item": _slug_claim_item(playlist),
-                                "ConditionExpression": (
-                                    "attribute_not_exists(pk)"
-                                    " OR playlist_id = :pid"
-                                ),
-                                "ExpressionAttributeValues": {
-                                    ":pid": _s(str(playlist.playlist_id))
-                                },
-                            }
-                        },
-                    ]
+                    TransactItems=transact_items
                 )
             except self._c.exceptions.TransactionCanceledException as exc:
                 if _conditional_check_failed_indices(exc):
@@ -1057,11 +1385,6 @@ class _PlaylistRepository(PlaylistRepository):
                 raise
         else:
             await self._c.put_item(TableName=self._t, Item=item)
-        if old is not None and old.slug and old.slug != playlist.slug:
-            await self._c.delete_item(
-                TableName=self._t,
-                Key=_key(keys.slug_claim_keys(old.slug)["pk"], keys.META),
-            )
         return playlist
 
     async def add_episode(
@@ -1095,73 +1418,75 @@ class _PlaylistRepository(PlaylistRepository):
             },
         )
 
+    async def _ordered_link_entries(
+        self, playlist_id: UUID
+    ) -> tuple[list[tuple[int, UUID, datetime]], dict[str, models.Episode]]:
+        """Shared link query for ``list_episodes``/``list_entries``.
+
+        Returns ``(ordered, episodes)``: ``ordered`` is the
+        ``(position, episode_id, added_at)`` rows sorted by
+        ``(position, episode_id)`` ascending (ties on position break by
+        episode_id, fully deterministic on all backends), and
+        ``episodes`` maps ``str(episode_id)`` to the episode for links
+        whose episode still exists. Links to deleted episodes are
+        dropped here, so both public methods project from the same
+        resolved rows (Linear: XIN-125).
+
+        ``added_at`` fallback: a link item predating the XIN-98
+        ``added_at`` attribute has none; fall back to the episode's
+        ``published_at`` (deterministic), then to now (Linear: XIN-124).
+        """
+        link_items = await _query_all(
+            self._c,
+            self._t,
+            KeyConditionExpression="pk = :p AND begins_with(sk, :e)",
+            ExpressionAttributeValues={
+                ":p": _s(f"PL#{playlist_id}"),
+                ":e": _s("PLEP#"),
+            },
+        )
+        parsed: list[tuple[int, UUID, Optional[datetime]]] = []
+        for link in link_items:
+            ep_id = UUID(link["sk"]["S"].split("PLEP#", 1)[1])
+            position = int(
+                codec.deserialize_plain(link.get("position", {"N": "0"}))
+            )
+            raw_added = link.get("added_at", {}).get("S")
+            added_at = (
+                codec._parse_datetime(raw_added) if raw_added else None
+            )
+            parsed.append((position, ep_id, added_at))
+        episodes: dict[str, models.Episode] = {}
+        for _, ep_id, _ in parsed:
+            episode = await _get_episode_by_id(self._c, self._t, ep_id)
+            if episode is not None:
+                episodes[str(ep_id)] = episode
+        ordered: list[tuple[int, UUID, datetime]] = []
+        for position, ep_id, added_at in sorted(
+            parsed, key=lambda e: (e[0], e[1])
+        ):
+            if str(ep_id) not in episodes:
+                continue
+            if added_at is None:
+                added_at = episodes[str(ep_id)].published_at or _now_utc()
+            ordered.append((position, ep_id, added_at))
+        return ordered, episodes
+
     async def list_episodes(
         self, playlist_id: UUID
     ) -> list[models.Episode]:
         # Order by (position, episode_id): ties on position are broken by
         # episode_id ascending, fully deterministic on all backends.
-        link_items = await _query_all(
-            self._c,
-            self._t,
-            KeyConditionExpression="pk = :p AND begins_with(sk, :e)",
-            ExpressionAttributeValues={
-                ":p": _s(f"PL#{playlist_id}"),
-                ":e": _s("PLEP#"),
-            },
-        )
-        entries: list[tuple[int, UUID]] = []
-        for link in link_items:
-            ep_id = UUID(link["sk"]["S"].split("PLEP#", 1)[1])
-            position = int(codec.deserialize_plain(link.get("position", {"N": "0"})))
-            entries.append((position, ep_id))
-        episodes: dict[str, models.Episode] = {}
-        for _, ep_id in entries:
-            episode = await self._episode_repo_get(ep_id)
-            if episode is not None:
-                episodes[str(ep_id)] = episode
-        ordered = sorted(entries, key=lambda e: (e[0], e[1]))
-        return [episodes[str(ep_id)] for _, ep_id in ordered if str(ep_id) in episodes]
+        ordered, episodes = await self._ordered_link_entries(playlist_id)
+        return [episodes[str(ep_id)] for _, ep_id, _ in ordered]
 
     async def list_entries(
         self, playlist_id: UUID
     ) -> list[PlaylistEpisodeEntry]:
-        # Same link query as list_episodes, but keep position + added_at
+        # Same resolved rows as list_episodes, but keep position + added_at
         # per link so the RSS endpoint can emit the curator order and the
-        # added-date pubDate. Ordering contract matches list_episodes:
-        # (position asc, episode_id asc).
-        link_items = await _query_all(
-            self._c,
-            self._t,
-            KeyConditionExpression="pk = :p AND begins_with(sk, :e)",
-            ExpressionAttributeValues={
-                ":p": _s(f"PL#{playlist_id}"),
-                ":e": _s("PLEP#"),
-            },
-        )
-        parsed: list[tuple[int, UUID, datetime]] = []
-        for link in link_items:
-            ep_id = UUID(link["sk"]["S"].split("PLEP#", 1)[1])
-            position = int(codec.deserialize_plain(link.get("position", {"N": "0"})))
-            raw_added = link.get("added_at", {}).get("S")
-            if raw_added:
-                text = (
-                    raw_added[:-1] + "+00:00"
-                    if raw_added.endswith("Z")
-                    else raw_added
-                )
-                added_at = datetime.fromisoformat(text)
-            else:
-                # Legacy link written before added_at existed (XIN-98). No
-                # playlist link predates the feature in practice; fall back
-                # to now rather than failing the feed render.
-                added_at = _now_utc()
-            parsed.append((position, ep_id, added_at))
-        episodes: dict[str, models.Episode] = {}
-        for _, ep_id, _ in parsed:
-            episode = await self._episode_repo_get(ep_id)
-            if episode is not None:
-                episodes[str(ep_id)] = episode
-        ordered = sorted(parsed, key=lambda e: (e[0], e[1]))
+        # added-date pubDate.
+        ordered, episodes = await self._ordered_link_entries(playlist_id)
         return [
             PlaylistEpisodeEntry(
                 episode=episodes[str(ep_id)],
@@ -1169,7 +1494,6 @@ class _PlaylistRepository(PlaylistRepository):
                 added_at=added_at,
             )
             for position, ep_id, added_at in ordered
-            if str(ep_id) in episodes
         ]
 
     async def publish(
@@ -1212,23 +1536,27 @@ class _PlaylistRepository(PlaylistRepository):
         claim = resp.get("Item")
         if not claim:
             return None
+        # A malformed claim (no playlist_id) resolves to None, not
+        # KeyError (Linear: XIN-124).
+        raw_pid = claim.get("playlist_id")
+        if raw_pid is None:
+            return None
         playlist_id = keys.uuid_from_str(
-            str(codec.deserialize_plain(claim["playlist_id"]))
+            str(codec.deserialize_plain(raw_pid))
         )
-        return await self.get_by_id(playlist_id)
+        playlist = await self.get_by_id(playlist_id)
+        # Defense-in-depth (Linear: XIN-123 §4): the claim may be skewed
+        # relative to the playlist row (e.g. a stale claim that survived
+        # a crash). Never return a playlist whose slug differs from the
+        # requested one — SQL's WHERE slug = ? cannot do this.
+        if playlist is None or playlist.slug != slug:
+            return None
+        return playlist
 
     async def _episode_repo_get(self, episode_id: UUID) -> Optional[models.Episode]:
-        items = await _query_all(
-            self._c,
-            self._t,
-            IndexName="gsi1",
-            KeyConditionExpression="gsi1pk = :p AND gsi1sk = :s",
-            ExpressionAttributeValues={
-                ":p": _s(f"EP#{episode_id}"),
-                ":s": _s(keys.META),
-            },
-        )
-        return codec.item_to_model(models.Episode, items[0]) if items else None
+        # Thin wrapper kept for the XIN-107 batching seam; the query
+        # itself lives in the shared _get_episode_by_id (XIN-125).
+        return await _get_episode_by_id(self._c, self._t, episode_id)
 
 
 # ---------------------------------------------------------------------------

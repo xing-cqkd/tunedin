@@ -21,6 +21,12 @@ state, rebuilt on write or on demand):
 * ``tag_claim`` items — transient winners of the ``get_or_create`` tag
   race. They are short-lived coordination state, not data; future
   ``get_or_create`` calls recreate them as needed.
+* ``slug_claim`` / ``rss_url_claim`` / ``email_claim`` items — the
+  write-time uniqueness locks for playlist slugs, feed rss_urls, and
+  user emails. They carry no data beyond the natural key -> id mapping
+  and are recreated on the next repository ``save()`` (the claim
+  condition ``attribute_not_exists(pk) OR <id> = :id`` passes when the
+  claim is absent), so a migration never needs to copy them.
 
 Migration writes are plain idempotent puts keyed by (pk, sk) — the same
 item key the repositories use — so re-running a migration overwrites the
@@ -227,6 +233,12 @@ def _playlist_episode_link_item(row: Dict[str, Any]) -> dict:
     }
     item["type"] = _s(codec.TYPE_PLAYLIST_EPISODE_LINK)
     item["position"] = {"N": str(row.get("position") or 0)}
+    # Round-trip added_at (Linear: XIN-124): without it, DynamoDB
+    # list_entries synthesizes _now_utc() per read and every migrated
+    # entry gets a nondeterministic RSS <pubDate>.
+    added_at = row.get("added_at")
+    if added_at is not None:
+        item["added_at"] = _s(keys.iso_timestamp(added_at))
     return item
 
 
@@ -308,6 +320,13 @@ def _playlist_episode_link_row(item: dict) -> Dict[str, Any]:
     }
     raw_position = item.get("position")
     row["position"] = int(codec.deserialize_plain(raw_position)) if raw_position else 0
+    # Round-trip added_at both directions (Linear: XIN-124). Legacy items
+    # predate the attribute — leave the key absent so the SQL column
+    # default (now()) fills it on insert; an explicit None would violate
+    # the NOT NULL constraint.
+    raw_added = item.get("added_at", {}).get("S")
+    if raw_added:
+        row["added_at"] = codec._parse_datetime(raw_added)
     return row
 
 
