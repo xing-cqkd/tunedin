@@ -10,7 +10,7 @@ from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.parser import PodcastFeedParser
 from backend.ingestion.service import FeedIngestionService, _error_retry_due
-from backend.ingestion.task_queue.local import LocalQueueDriver
+from backend.ingestion.task_queue.local import LocalInMemoryDriver
 from backend.persistence.models.base import Base
 from backend.persistence.models.feed import Feed
 from backend.persistence.repositories import Store
@@ -882,7 +882,7 @@ class TestQueueBranches:
     async def test_auto_queue_enqueues_tasks(
         self, in_memory_store, sample_feed_xml: str
     ):
-        driver = LocalQueueDriver()
+        driver = LocalInMemoryDriver()
         service = FeedIngestionService(queue_driver=driver)
         feed = await service.save_podcast(
             in_memory_store,
@@ -901,7 +901,7 @@ class TestQueueBranches:
     async def test_auto_queue_zero_enqueues_nothing(
         self, in_memory_store, sample_feed_xml: str
     ):
-        driver = LocalQueueDriver()
+        driver = LocalInMemoryDriver()
         service = FeedIngestionService(queue_driver=driver)
         feed = await service.save_podcast(
             in_memory_store,

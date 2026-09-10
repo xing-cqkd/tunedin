@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+import sys
+import types
 import pytest
 from unittest.mock import AsyncMock, patch
 from backend.ingestion.task_queue import (
@@ -207,8 +209,24 @@ async def test_process_all_skips_delayed_tasks():
 
 
 @pytest.mark.asyncio
-async def test_gcp_enqueue_with_mock_client():
+async def test_gcp_enqueue_with_mock_client(monkeypatch):
     from backend.ingestion.task_queue.gcp import GCPCloudTasksDriver
+
+    # google-cloud-tasks/protobuf is not a project dependency; the driver
+    # imports timestamp_pb2 lazily only when a delay is requested. Stub the
+    # module so this test runs in clean test envs too.
+    try:
+        import google.protobuf.timestamp_pb2  # noqa: F401
+    except ImportError:
+        stub_pb2 = types.ModuleType("google.protobuf.timestamp_pb2")
+
+        class _StubTimestamp:
+            def FromDatetime(self, dt):
+                self._dt = dt
+
+        stub_pb2.Timestamp = _StubTimestamp
+        monkeypatch.setitem(sys.modules, "google.protobuf", types.ModuleType("google.protobuf"))
+        monkeypatch.setitem(sys.modules, "google.protobuf.timestamp_pb2", stub_pb2)
 
     class FakeTasksClient:
         def __init__(self):
