@@ -50,6 +50,7 @@ Evaluate the metadata across these 9 distinct search facets:
    - Skill level: "beginner 101", "introductory guide", "practitioner level", "masterclass", "executive strategy".
    - Target profession/persona: "solo founders", "engineering managers", "parents of teens", "pre-med students".
    - GROUNDING LEASH: only emit a persona tag when the notes give direct evidence for it (the show says who it's for, or the content is profession-specific). Never infer demographics from tone or guess.
+   - TECHNICAL DENSITY (every episode): judge from the notes' own language -- the notes ARE a sample of the content. Emit one: "beginner friendly" (plain language, concepts explained, no assumed background), "general audience" (some domain terms but explained in context), "practitioner level" (assumes working knowledge, jargon unexplained), "expert level" (dense unexplained jargon, academic or specialist framing). This is what powers "explain it like I'm new" queries. The notes' language is direct evidence, so this does not violate the leash above; when notes are too thin to judge (<~500 chars), default to "general audience" only if nothing suggests otherwise.
 
 5. Functional Modality & Artifacts (How it is delivered)
    - Format: "interview", "debate", "case study", "ama / mailbag", "live audit / teardown", "solo essay", "panel", "investigative docuseries".
@@ -65,14 +66,22 @@ Evaluate the metadata across these 9 distinct search facets:
    - Duration buckets: under 20 min -> "quick listen"; 20-40 min -> "commute listen"; 40-60 min -> "long commute listen"; over 60 min -> "deep dive".
    - Content sanity check: duration buckets describe substantive spoken content. Never emit a duration-bucket tag for ambient, music, white-noise, or sleep-audio episodes, regardless of length.
    - Mood only when the notes state or strongly imply it: "motivational", "relaxing", "lighthearted banter", "high-energy", "funny", "comedic". Do not invent a mood from the topic alone.
+   - TONE SUBTYPES (retrieval-critical): a coarse mood tag is not enough for taste matching. When the notes give direct evidence of a comedic flavor, emit BOTH the coarse tag ("funny") AND the specific subtype: "dry wit", "sketch comedy", "improv comedy", "satirical", "dark comedy", "slapstick", "observational comedy", "comedic interview". Evidence means the notes name it (a sketch troupe guest, "improv games", a satirical premise) -- never guess the flavor from the topic. Same principle for bleak tones: "grim", "bleak", "heavy" only with direct evidence; these power "not depressing" exclusions, so false positives here are worse than silence.
 
 8. Safety & Cleanliness
    - If Explicit = true: "explicit content", "uncensored".
    - If Explicit = false and content is mild: "clean podcast", "family friendly", "safe for work", "kid safe".
    - If Explicit is null/unknown: emit NO safety tags. Never guess cleanliness. Treat explicit=0 as false.
+   - GRAPHIC INTENSITY (retrieval-critical): tags describe WHAT an episode is about, not HOW it is told. For episodes touching violence, death, crime, medical procedures, or other disturbing topics, judge the TREATMENT from the summary/notes and emit exactly one: "graphic detail" (notes describe injuries, crime scenes, or suffering in concrete detail), "disturbing topics discussed clinically" (the topic is present but the framing is psychological, legal, or analytical -- e.g. true-crime psychology without gore), or nothing (topic absent or mild). This is what powers "not the gory details" queries. Never infer intensity beyond what the notes show; when the notes are one line and give no signal, emit nothing rather than guessing.
 
 9. Geographic & Cultural Anchors
    - Countries, cities, or regional contexts strictly relevant to the content (e.g., "us real estate", "eu regulation", "silicon valley", "latam tech").
+
+10. Episode Type & Format (retrieval-critical)
+   - Classify EVERY episode with exactly one: "full episode" (default), "trailer", "bonus episode", "preview", "rebroadcast" (see strict rule 12).
+   - Signals, in order: the `episode_type` metadata field when present; then title patterns -- trailer: "trailer", "teaser", "sneak peek", "coming soon", "first look"; bonus: "bonus", "extra episode", "minisode" (only when the notes frame it as extra/short-form); preview: "preview"; rebroadcast: rule 12's list.
+   - Duration cross-check: under 5 minutes + promotional title language ("trailer", "preview", "coming soon", "teaser") = "trailer", always. Under 5 minutes alone is NOT enough (daily news briefs are full episodes).
+   - Trailers/teasers: tag the trailer's own subject ("trailer" + the show/topic it teases) and do NOT emit entity tags for people or topics that only appear as teased content (see strict rule 2). A trailer must NEVER surface for a "full episode" style query -- this tag is the retrieval layer's exclusion signal.
 
 ---
 
@@ -80,6 +89,7 @@ Evaluate the metadata across these 9 distinct search facets:
 
 1. THE CROSS-PROMO RULE (CRITICAL): Podcasters often promote other shows or previous episodes in their notes (e.g., "If you liked this, listen to episode 45 with John Doe", or "Check out our sister podcast XYZ"). DO NOT tag guests, topics, or titles mentioned strictly as cross-promotions, ads, "upcoming episode" plugs, newsletter CTAs, or "also listen to" recommendations.
 2. TRAILERS & BONUS EPISODES: if episode_type is "trailer", its entities describe a DIFFERENT episode. Tag the trailer's own subject ("trailer", plus the show/topic it teases) and do NOT emit entity tags for people or topics that only appear as teased content.
+   TITLE-PATTERN BACKSTOP (hard rule): the metadata field is unreliable in the wild. Independently check the title against /trailer|teaser|sneak peek|coming soon|first look|preview|bonus/i. If it matches AND (duration < 300s OR the notes read as promotional rather than substantive), classify as "trailer"/"bonus episode" per dimension 10 regardless of what the metadata field says, and apply the entity quarantine above. When in doubt between trailer and short full episode, the notes decide: promotional language ("subscribe", "coming soon", "don't miss") = trailer; substantive content = full episode.
 3. Grounding: Do NOT hallucinate entities or topics not directly supported by the episode text or show context.
 4. URLS ARE NOT CONTENT: never mine entities, topics, or names from URLs, link slugs, or source lists (e.g., "roguewarrior" in an archive.org link is not a tag).
 5. SEO SKEPTICISM: publisher-supplied "Keywords:" blocks are candidates, not gospel. Use them for recall, but strip puffery and superlatives ("fastest", "best", "ultimate") and verify each against the actual notes before tagging.
