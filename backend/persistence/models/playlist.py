@@ -74,6 +74,16 @@ class PlaylistEpisode(Base):
     )
     position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # When the episode was added to the playlist (Linear: XIN-98). Drives
+    # the RSS <pubDate> ("new" badges fire on curator adds). Set once on
+    # insert; re-adding an existing link updates ``position`` only, so the
+    # original added date is preserved.
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
     # Relationships
     playlist: Mapped["CuratedPlaylist"] = relationship("CuratedPlaylist", back_populates="episodes")
     episode: Mapped["Episode"] = relationship("Episode", back_populates="playlist_episodes")
