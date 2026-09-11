@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -6,6 +7,7 @@ from urllib.parse import urlparse
 import httpx
 from sqlalchemy.exc import IntegrityError
 
+from backend.ingestion.http_util import validate_feed_url
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, Podcast
 from backend.ingestion.parser import PodcastFeedParser
@@ -247,8 +249,12 @@ class FeedIngestionService:
         # 3. Fetch and parse feed with error recovery
         now_utc = datetime.now(timezone.utc)
         try:
+            # XIN-62: SSRF gate at the service boundary, before any fetch.
+            # DNS resolution blocks, so run it off the event loop. A rejected
+            # URL marks the feed errored like any other terminal fetch failure.
+            rss_url = await asyncio.to_thread(validate_feed_url, feed.rss_url)
             parse_result: FeedParseResult = await self.parser.fetch_and_parse(
-                rss_url=feed.rss_url,
+                rss_url=rss_url,
                 known_guids=known_guids if known_guids else None,
                 etag=feed.etag,
                 last_modified=feed.last_modified,

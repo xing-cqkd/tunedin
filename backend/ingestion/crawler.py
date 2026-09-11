@@ -4,6 +4,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Set
 import httpx
 from backend.persistence.repositories import Store
 
+from backend.ingestion.http_util import maybe_client
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.service import FeedIngestionService
@@ -70,12 +71,8 @@ class PodcastCrawler:
         total_saved = 0
         visited_urls: Set[str] = set()
 
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            close_client = True
-
-        try:
+        # XIN-49: shared client lifecycle.
+        async with maybe_client(client) as client:
             for item in items:
                 try:
                     podcasts = await fetch_for_item(item, client)
@@ -97,9 +94,6 @@ class PodcastCrawler:
                     await asyncio.sleep(self.request_delay)
                 except Exception as e:
                     logger.error("Error crawling %s: %s", progress_label(item), str(e))
-        finally:
-            if close_client:
-                await client.aclose()
 
         return {
             "total_discovered": total_discovered,
@@ -229,12 +223,8 @@ class PodcastCrawler:
         all_saved_feeds: List[Feed] = []
         failed_chunks: List[Tuple[int, int]] = []
         seen_feed_ids: Set[Any] = set()
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-            close_client = True
-
-        try:
+        # XIN-49: shared client lifecycle.
+        async with maybe_client(client) as client:
             # Chunk collection IDs into batches of up to 200
             for i in range(0, len(collection_ids), self.batch_size):
                 chunk = list(collection_ids[i : i + self.batch_size])
@@ -260,9 +250,6 @@ class PodcastCrawler:
                     )
                     failed_chunks.append((i, i + len(chunk)))
                 await asyncio.sleep(self.request_delay)
-        finally:
-            if close_client:
-                await client.aclose()
 
         return {"saved_feeds": all_saved_feeds, "failed_chunks": failed_chunks}
 

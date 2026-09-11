@@ -1,4 +1,5 @@
 import calendar
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Set, Tuple
@@ -6,6 +7,7 @@ import feedparser
 import httpx
 from dateutil import parser as date_parser
 
+from backend.ingestion.http_util import fetch_limited, maybe_client
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, ParsedFeedMetadata
 
 logger = logging.getLogger(__name__)
@@ -722,16 +724,16 @@ class PodcastFeedParser:
         if last_modified:
             headers["If-Modified-Since"] = last_modified
 
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
-            close_client = True
-
-        try:
-            response = await client.get(rss_url, headers=headers)
+        # XIN-49: shared client lifecycle; XIN-56/XIN-59: retry + size cap.
+        # (XIN-62 SSRF validation lives at the service boundary in
+        # service.sync_podcast_episodes, so this stays unit-testable.)
+        async with maybe_client(client, timeout=timeout) as c:
+            body, resp_headers, status_code = await fetch_limited(
+                c, rss_url, headers=headers
+            )
 
             # 304 Not Modified
-            if response.status_code == 304:
+            if status_code == 304:
                 return FeedParseResult(
                     metadata=ParsedFeedMetadata(
                         title="",
@@ -744,21 +746,18 @@ class PodcastFeedParser:
                     is_not_modified=True,
                 )
 
-            response.raise_for_status()
-
-            new_etag = response.headers.get("ETag") or etag
-            new_last_modified = response.headers.get("Last-Modified") or last_modified
+            new_etag = resp_headers.get("ETag") or etag
+            new_last_modified = resp_headers.get("Last-Modified") or last_modified
 
             # Route through the unified entrypoint so JSON Feeds served over HTTP
             # are detected and parsed as JSON instead of being misparsed as XML.
-            return cls.parse_content(
-                content=response.content,
+            # XIN-75: feedparser.parse is CPU-bound — never block the event loop.
+            return await asyncio.to_thread(
+                cls.parse_content,
+                content=body,
                 rss_url=rss_url,
                 last_updated_at=last_updated_at,
                 known_guids=known_guids,
                 etag=new_etag,
                 last_modified=new_last_modified,
             )
-        finally:
-            if close_client:
-                await client.aclose()

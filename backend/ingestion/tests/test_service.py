@@ -624,6 +624,29 @@ class TestSyncFetchErrorPaths:
         assert synced_feed.sync_status == "active"
         assert synced_feed.error_count == 0
 
+    @pytest.mark.asyncio
+    async def test_sync_ssrf_url_rejected_before_fetch(self, in_memory_store):
+        """XIN-62: a feed URL resolving to a non-public IP is rejected at the
+        service boundary — no fetch is attempted and the feed is marked error."""
+        from unittest.mock import AsyncMock, patch
+
+        from backend.ingestion.parser import PodcastFeedParser
+
+        service = FeedIngestionService()
+        podcast = Podcast(title="SSRF Feed", feed_url="http://127.0.0.1:9999/feed.xml")
+        feed = await service.save_podcast(in_memory_store, podcast)
+
+        with patch.object(
+            PodcastFeedParser, "fetch_and_parse", new=AsyncMock()
+        ) as mock_fetch:
+            with pytest.raises(ValueError):
+                await service.sync_podcast_episodes(in_memory_store, feed)
+
+        mock_fetch.assert_not_called()
+        refreshed = await in_memory_store.feeds.get_by_id(feed.feed_id)
+        assert refreshed.sync_status == "error"
+        assert refreshed.error_count == 1
+
 
 class TestSyncInputVariants:
     """XIN-128: Feed / UUID / URL-string inputs; invalid identifiers rejected."""
