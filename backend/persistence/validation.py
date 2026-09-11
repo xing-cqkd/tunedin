@@ -23,6 +23,7 @@ identically on both backends.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Any, Mapping
 from uuid import UUID
@@ -53,8 +54,6 @@ def _json_default(value: Any) -> Any:
 
 def item_size_bytes(fields: Mapping[str, Any]) -> int:
     """Return the canonical serialized size of a field mapping, in bytes."""
-    import json
-
     return len(
         json.dumps(fields, default=_json_default, separators=(",", ":")).encode("utf-8")
     )

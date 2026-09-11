@@ -3,8 +3,9 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
-from sqlalchemy import event, inspect
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from backend.persistence._sqlite import configure_sqlite_fk
 from backend.persistence.models import Base
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./tunedin.db")
@@ -18,11 +19,7 @@ engine = create_async_engine(
 
 # Enable Foreign Key enforcement for SQLite
 if DATABASE_URL.startswith("sqlite"):
-    @event.listens_for(engine.sync_engine, "connect")
-    def _set_sqlite_pragma(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    configure_sqlite_fk(engine)
 
 # Session Factory
 AsyncSessionLocal = async_sessionmaker(
@@ -71,14 +68,6 @@ async def create_all_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency for providing async database session."""
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
 @asynccontextmanager
 async def session_scope() -> AsyncGenerator[AsyncSession, None]:
     """Async context manager yielding a session on the app database."""
@@ -87,3 +76,12 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
             yield session
         finally:
             await session.close()
+
+
+get_db = session_scope
+"""Alias kept for the conventional FastAPI dependency name.
+
+Identical to :func:`session_scope`; nothing in the codebase currently uses
+it (the configured-backend dependency lives in ``settings.get_db``), but the
+name is kept so external FastAPI ``Depends(get_db)`` usage keeps working.
+"""
