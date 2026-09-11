@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import String, Text, DateTime, Integer, ForeignKey, Uuid
+from sqlalchemy import String, Text, DateTime, Integer, ForeignKey, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.persistence.models.base import Base
 
@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 
 class CuratedPlaylist(Base):
     __tablename__ = "curated_playlists"
+    __table_args__ = (
+        # Named to match migration a49b13bc7cab, so create_all test DBs and
+        # migrated DBs agree — and so slug-conflict detection can match the
+        # constraint name instead of message text (XIN-119).
+        UniqueConstraint("slug", name="uq_curated_playlists_slug"),
+    )
 
     playlist_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -35,10 +41,15 @@ class CuratedPlaylist(Base):
     # ``token_revoked_at``. ``frozen_at`` supports the freeze-version
     # toggle (set by a later issue).
     visibility: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="unlisted"
+        String(20),
+        nullable=False,
+        default="unlisted",
+        # Matches the server_default from migration a49b13bc7cab, so
+        # create_all test DBs agree with migrated DBs (XIN-122).
+        server_default="unlisted",
     )
     slug: Mapped[Optional[str]] = mapped_column(
-        String(255), nullable=True, unique=True
+        String(255), nullable=True
     )
     token: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     token_revoked_at: Mapped[Optional[datetime]] = mapped_column(
@@ -81,6 +92,10 @@ class PlaylistEpisode(Base):
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+        # Matches migration 742ddc0a7799 (XIN-122): the column is NOT NULL
+        # with a server default, so create_all test DBs agree with
+        # migrated DBs.
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 

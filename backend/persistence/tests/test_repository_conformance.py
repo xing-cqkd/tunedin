@@ -32,6 +32,7 @@ import re
 import boto3
 import pytest
 from moto import mock_aws
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -64,12 +65,29 @@ class _SqliteBackend:
 
     async def setup(self) -> None:
         self._engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        # Mirror the production session wiring in
+        # backend/persistence/database.py (XIN-122): foreign-key
+        # enforcement, so conformance tests run under the same integrity
+        # rules as the app.
+        @event.listens_for(self._engine.sync_engine, "connect")
+        def _set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
     def new_store(self) -> Store:
+        # Mirror the production session config: expire_on_commit=False,
+        # autocommit=False, autoflush=False (XIN-122). Tests must not run
+        # with autoflush=True while production runs without it.
         factory = async_sessionmaker(
-            bind=self._engine, class_=AsyncSession, expire_on_commit=False
+            bind=self._engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autocommit=False,
+            autoflush=False,
         )
         return SQLAlchemyStore(factory)
 
@@ -483,6 +501,58 @@ class TestRepositoryConformance:
         for e in eps:
             assert await store.episodes.get_by_id(e.episode_id) is not None
 
+    async def test_episode_save_many_drops_duplicate_guids(self, store: Store):
+        # XIN-120: save_many is the sync pipeline's dedup point. Conflicting
+        # duplicates are dropped and reported via the return value, which
+        # contains only the episodes actually persisted, in input order —
+        # on both backends.
+        feed = await self._seed_feed(store)
+        e1 = _episode(feed.feed_id, "E1", guid="dup")
+        e2 = _episode(feed.feed_id, "E2-duplicate", guid="dup")  # in-batch dup
+        e3 = _episode(feed.feed_id, "E3", guid="unique")
+        saved = await store.episodes.save_many([e1, e2, e3])
+        assert [e.episode_id for e in saved] == [e1.episode_id, e3.episode_id]
+
+        # A duplicate of an already-persisted episode is dropped too.
+        e4 = _episode(feed.feed_id, "E4-duplicate", guid="dup")
+        assert await store.episodes.save_many([e4]) == []
+
+        # The survivors really persisted; the duplicates did not.
+        assert await store.episodes.get_by_id(e1.episode_id) is not None
+        assert await store.episodes.get_by_id(e3.episode_id) is not None
+        assert await store.episodes.get_by_id(e2.episode_id) is None
+        assert await store.episodes.get_by_id(e4.episode_id) is None
+
+    async def test_episode_save_many_keeps_null_guid_episodes(
+        self, store: Store
+    ):
+        # Episodes without guids carry no dedup key; all are persisted.
+        feed = await self._seed_feed(store)
+        e1 = _episode(feed.feed_id, "N1", guid=None)
+        e2 = _episode(feed.feed_id, "N2", guid=None)
+        saved = await store.episodes.save_many([e1, e2])
+        assert [e.episode_id for e in saved] == [e1.episode_id, e2.episode_id]
+        assert await store.episodes.get_by_id(e1.episode_id) is not None
+        assert await store.episodes.get_by_id(e2.episode_id) is not None
+
+    async def test_feed_save_upserts_detached_instance(self, store: Store):
+        # XIN-120: save() is an upsert by primary key on both backends. A
+        # freshly built (detached) instance carrying an existing PK must
+        # update the row, not raise IntegrityError.
+        saved = await store.feeds.save(_feed("https://e.com/detach.xml", "Original"))
+        detached = Feed(
+            feed_id=saved.feed_id,
+            rss_url="https://e.com/detach.xml",
+            title="Updated",
+            sync_status="pending",
+        )
+        resaved = await store.feeds.save(detached)
+        assert resaved.feed_id == saved.feed_id
+
+        fetched = await store.feeds.get_by_id(saved.feed_id)
+        assert fetched is not None
+        assert fetched.title == "Updated"
+
     async def test_episode_counts(self, store: Store):
         feed = await self._seed_feed(store)
         assert await store.episodes.count_all() == 0
@@ -754,6 +824,16 @@ class TestRepositoryConformance:
         assert await store.playlists.publish(uuid4(), "public") is None
         assert await store.playlists.unpublish(uuid4()) is None
         assert await store.playlists.rotate_token(uuid4()) is None
+
+    async def test_playlist_publish_validates_before_missing_check(
+        self, store: Store
+    ):
+        # XIN-122: both backends call validate_visibility() BEFORE the
+        # get_by_id None-check, so an unknown id with a bogus visibility
+        # raises ValueError rather than returning None. Pinned here so the
+        # backends cannot drift.
+        with pytest.raises(ValueError):
+            await store.playlists.publish(uuid4(), "bogus")
 
     async def test_playlist_unpublish_keeps_slug_and_token(self, store: Store):
         user = await self._seed_user(store)

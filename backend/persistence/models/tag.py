@@ -1,6 +1,6 @@
 import uuid
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import String, ForeignKey, UniqueConstraint, Uuid
+from sqlalchemy import String, ForeignKey, Index, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.persistence.models.base import Base
 
@@ -10,7 +10,26 @@ if TYPE_CHECKING:
 class Tag(Base):
     __tablename__ = "tags"
     __table_args__ = (
-        UniqueConstraint("name", "category", name="uq_tag_name_category"),
+        # NULL categories need partial unique indexes: a plain unique
+        # constraint treats NULLs as distinct on both Postgres and SQLite,
+        # so uq_tag_name_category never deduplicated ('name', NULL) rows
+        # (XIN-121). Declared here so create_all test DBs agree with the
+        # databases migrated by 6ceb43cc6cf5.
+        Index(
+            "uq_tag_name_null_category",
+            "name",
+            unique=True,
+            sqlite_where=text("category IS NULL"),
+            postgresql_where=text("category IS NULL"),
+        ),
+        Index(
+            "uq_tag_name_category",
+            "name",
+            "category",
+            unique=True,
+            sqlite_where=text("category IS NOT NULL"),
+            postgresql_where=text("category IS NOT NULL"),
+        ),
     )
 
     tag_id: Mapped[uuid.UUID] = mapped_column(
