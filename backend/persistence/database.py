@@ -1,14 +1,18 @@
 import asyncio
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from backend.config import reload_settings
 from backend.persistence._sqlite import configure_sqlite_fk
 from backend.persistence.models import Base
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./tunedin.db")
+# XIN-42: sourced from the centralized settings object; the DATABASE_URL
+# environment variable name is unchanged. Settings are rebuilt (not read
+# from cache) so importlib.reload() after a setenv picks up the new value,
+# preserving the historical import-time binding behavior.
+DATABASE_URL = reload_settings().database_url
 
 # Create Async Engine
 engine = create_async_engine(

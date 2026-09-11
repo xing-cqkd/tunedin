@@ -1,6 +1,8 @@
 """XIN-130: coverage for the ingestion CLI (run_crawl, run_sync_only,
 show_status, run_init_db, and argparse wiring)."""
 
+import importlib
+import logging
 import sys
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
@@ -244,3 +246,54 @@ def test_main_status_wiring(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["prog", "status"])
     cli.main()
     show_status_mock.assert_awaited_once_with()
+
+
+def test_import_does_not_configure_logging():
+    """XIN-63: importing cli must not touch the root logger."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    importlib.reload(cli)
+    assert logging.root.handlers == []
+
+
+def test_main_configures_logging(monkeypatch):
+    """XIN-63: cli main() configures logging at the entry point."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    monkeypatch.setattr(sys, "argv", ["prog", "status"])
+    monkeypatch.setattr(cli, "show_status", AsyncMock())
+    cli.main()
+    assert logging.root.handlers, "main() should configure root logging"
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+
+
+def test_positive_int_accepts_valid():
+    assert cli._positive_int("1") == 1
+    assert cli._positive_int("16") == 16
+
+
+def test_main_crawl_concurrency_zero_rejected(monkeypatch):
+    """XIN-76: --concurrency=0 must fail at the CLI, not deadlock."""
+    monkeypatch.setattr(cli, "run_crawl", AsyncMock())
+    monkeypatch.setattr(sys, "argv", ["prog", "crawl", "--concurrency", "0"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+
+
+def test_main_crawl_negative_concurrency_rejected(monkeypatch):
+    monkeypatch.setattr(cli, "run_crawl", AsyncMock())
+    monkeypatch.setattr(sys, "argv", ["prog", "crawl", "--concurrency", "-3"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+
+
+def test_main_sync_concurrency_zero_rejected(monkeypatch):
+    """XIN-76: --concurrency=0 must fail at the CLI, not deadlock."""
+    monkeypatch.setattr(cli, "run_sync_only", AsyncMock())
+    monkeypatch.setattr(sys, "argv", ["prog", "sync", "--concurrency", "0"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2

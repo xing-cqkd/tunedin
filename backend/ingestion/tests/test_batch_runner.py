@@ -1,7 +1,10 @@
 """XIN-130: coverage for batch_runner (run_batch_ingest, write_progress_file,
 load_existing_logs, and the 429 backoff branch)."""
 
+import importlib
+import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -40,6 +43,13 @@ class _FakeStore:
         self.episodes = _FakeEpisodesRepo()
 
 
+def _patch_progress_file(monkeypatch, path):
+    """Route batch_runner's progress path through config at a tmp location."""
+    monkeypatch.setattr(
+        br, "get_settings", lambda: SimpleNamespace(progress_file=Path(path))
+    )
+
+
 def _patch_common(monkeypatch, tmp_path, pending=()):
     """Patch batch_runner's DB/settings surface with fakes."""
     store = _FakeStore(pending)
@@ -53,12 +63,12 @@ def _patch_common(monkeypatch, tmp_path, pending=()):
     monkeypatch.setattr(br, "get_auto_queue_episodes", lambda: 0)
     monkeypatch.setattr(br, "get_queue_driver", lambda: SimpleNamespace())
     monkeypatch.setattr(br, "describe_database", lambda: "testdb")
-    monkeypatch.setattr(br, "PROGRESS_FILE", tmp_path / "progress.md")
+    _patch_progress_file(monkeypatch, tmp_path / "progress.md")
     return store
 
 
 def test_load_existing_logs_no_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(br, "PROGRESS_FILE", tmp_path / "missing.md")
+    _patch_progress_file(monkeypatch, tmp_path / "missing.md")
     assert br.load_existing_logs() == []
 
 
@@ -68,7 +78,7 @@ def test_load_existing_logs_parses_block(tmp_path, monkeypatch):
         "# Tracker\n```text\nline1\nIngestion in progress...\nline2\n```\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(br, "PROGRESS_FILE", progress)
+    _patch_progress_file(monkeypatch, progress)
     assert br.load_existing_logs() == ["line1", "line2"]
 
 
@@ -165,3 +175,39 @@ async def test_run_batch_ingest_429_backoff(tmp_path, monkeypatch):
     content = (tmp_path / "progress.md").read_text(encoding="utf-8")
     assert "Recent Error / Throttle detected" in content
     assert "429" in content
+
+
+def test_import_does_not_configure_logging():
+    """XIN-63: importing batch_runner must not touch the root logger."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    importlib.reload(br)
+    assert logging.root.handlers == []
+
+
+def test_progress_file_configurable_via_env(monkeypatch, tmp_path):
+    """XIN-63: PODCAST_PROGRESS_FILE env var controls the progress path."""
+    from backend.config import reload_settings
+
+    target = tmp_path / "custom" / "progress.md"
+    monkeypatch.setenv("PODCAST_PROGRESS_FILE", str(target))
+    try:
+        reload_settings()
+        assert br._progress_file() == target
+    finally:
+        reload_settings()
+
+
+def test_main_configures_logging(monkeypatch):
+    """XIN-63: the batch_runner entry point configures logging (not import)."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--batch-size", "7"])
+    monkeypatch.setattr(br, "run_batch_ingest", lambda **kw: "not-a-coroutine")
+    monkeypatch.setattr(br, "asyncio", SimpleNamespace(run=lambda coro: coro))
+    br.main()
+    assert logging.root.handlers, "main() should configure root logging"
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)

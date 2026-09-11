@@ -4,13 +4,10 @@ import logging
 import sys
 from typing import List, Optional
 
+from backend.config import configure_logging
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
 from settings import describe_database, get_crawler_countries, init_db, session_scope
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger("ingestion_cli")
 
 
@@ -112,7 +109,29 @@ async def run_sync_only(concurrency: int = 5, max_feeds: Optional[int] = None) -
     await show_status()
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for worker counts: must be an integer >= 1 (XIN-76).
+
+    A bare ``Semaphore(0)`` downstream deadlocks the episode sync, so 0 and
+    negative values are rejected at the CLI instead of hanging.
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer >= 1, got {value!r}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be >= 1, got {parsed} (--concurrency=0 deadlocks the episode sync)"
+        )
+    return parsed
+
+
 def main() -> None:
+    # XIN-63: configure logging at the entry point, not at import time.
+    configure_logging()
+
     parser = argparse.ArgumentParser(description="TunedIn Podcast Ingestion & Crawling CLI")
     subparsers = parser.add_subparsers(dest="command", help="CLI command")
 
@@ -159,18 +178,18 @@ def main() -> None:
     )
     crawl_parser.add_argument(
         "--concurrency",
-        type=int,
+        type=_positive_int,
         default=5,
-        help="Concurrent episode download workers (default: 5)",
+        help="Concurrent episode download workers, >= 1 (default: 5)",
     )
 
     # Command: sync
     sync_parser = subparsers.add_parser("sync", help="Download episodes for pending feeds")
     sync_parser.add_argument(
         "--concurrency",
-        type=int,
+        type=_positive_int,
         default=5,
-        help="Concurrent episode download workers (default: 5)",
+        help="Concurrent episode download workers, >= 1 (default: 5)",
     )
     sync_parser.add_argument(
         "--max-feeds",

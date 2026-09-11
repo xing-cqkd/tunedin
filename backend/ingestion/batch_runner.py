@@ -5,25 +5,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import httpx
 
+from backend.config import configure_logging, get_settings
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
 logger = logging.getLogger("batch_ingest")
 
-PROGRESS_FILE = Path(__file__).parent / ".local_agents" / "podcast_ingest.md"
+
+def _progress_file() -> Path:
+    """Progress tracker path, from config (XIN-63).
+
+    Defaults to ``backend/.data/podcast_ingest.md`` (override with
+    ``PODCAST_PROGRESS_FILE``); no longer hard-coded inside ``.local_agents``.
+    """
+    return get_settings().progress_file
 
 
 def load_existing_logs() -> List[str]:
     """Preserves recent log entries from the existing progress markdown file."""
-    if not PROGRESS_FILE.exists():
+    progress_file = _progress_file()
+    if not progress_file.exists():
         return []
     try:
-        content = PROGRESS_FILE.read_text(encoding="utf-8")
+        content = progress_file.read_text(encoding="utf-8")
         if "```text" in content:
             block = content.split("```text", 1)[1].split("```", 1)[0].strip()
             lines = [l for l in block.splitlines() if l.strip() and not l.startswith("Ingestion")]
@@ -41,8 +46,9 @@ async def write_progress_file(
     recent_logs: List[str],
     last_error: Optional[str] = None,
 ) -> None:
-    """Updates the podcast_ingest.md progress tracker in the .local_agents folder."""
-    PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Updates the podcast_ingest.md progress tracker (path from config)."""
+    progress_file = _progress_file()
+    progress_file.parent.mkdir(parents=True, exist_ok=True)
 
     async with session_scope() as store:
         total_feeds = await store.feeds.count_all()
@@ -87,7 +93,7 @@ async def write_progress_file(
 - **Status**: {"⚠️ Recent Error / Throttle detected: " + last_error if last_error else "🟢 Healthy - Running smoothly"}
 - **Checkpointing**: Every podcast commits immediately to the configured database. Resumption resumes automatically from pending shows.
 """
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+    with open(progress_file, "w", encoding="utf-8") as f:
         f.write(content)
 
 
@@ -202,7 +208,11 @@ async def run_batch_ingest(
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the batch runner CLI."""
+    # XIN-63: configure logging at the entry point, not at import time.
+    configure_logging()
+
     import argparse
 
     parser = argparse.ArgumentParser(description="One-at-a-time Batch Podcast Episode Ingest Runner")
@@ -218,3 +228,7 @@ if __name__ == "__main__":
             delay_between_feeds=args.delay,
         )
     )
+
+
+if __name__ == "__main__":
+    main()
