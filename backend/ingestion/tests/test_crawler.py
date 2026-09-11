@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from backend.ingestion import crawler as crawler_module
 from backend.ingestion.crawler import PodcastCrawler
-from backend.ingestion.service import FeedIngestionService
 from backend.persistence.models.base import Base
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
@@ -149,8 +148,8 @@ class TestPodcastCrawler:
         class FakeService:
             itunes_client = None
 
-            async def sync_podcast_episodes(self, *, store, feed_or_id_or_url, **kwargs):
-                seen_ids.append(feed_or_id_or_url)
+            async def sync_podcast_episodes_by_id(self, *, store, feed_id, **kwargs):
+                seen_ids.append(feed_id)
                 return Feed(rss_url="x", title="Synced"), ["ep1", "ep2"]
 
         @asynccontextmanager
@@ -159,7 +158,7 @@ class TestPodcastCrawler:
 
         monkeypatch.setattr(crawler_module, "session_scope", fake_session_scope)
 
-        crawler = PodcastCrawler(service=FakeService(), request_delay=0.0)
+        crawler = PodcastCrawler(sync_service=FakeService(), request_delay=0.0)
         stats = await crawler.sync_episodes_concurrently(concurrency=2)
 
         assert {str(i) for i in seen_ids} == {
@@ -295,8 +294,8 @@ class TestCrawlerRobustness:
             )
         await in_memory_session.commit()
 
-        async def fake_sync(store, feed_or_id_or_url, auto_queue_episodes=0):
-            feed = await store.feeds.get_by_id(feed_or_id_or_url)
+        async def fake_sync(store, feed_id, auto_queue_episodes=0):
+            feed = await store.feeds.get_by_id(feed_id)
             if "w1.example.com" in feed.rss_url:
                 raise RuntimeError("sync boom")
             return feed, []
@@ -306,7 +305,7 @@ class TestCrawlerRobustness:
             yield SQLAlchemyStore(lambda: in_memory_session)
 
         crawler = PodcastCrawler(request_delay=0.0)
-        monkeypatch.setattr(crawler.service, "sync_podcast_episodes", fake_sync)
+        monkeypatch.setattr(crawler.sync_service, "sync_podcast_episodes_by_id", fake_sync)
         monkeypatch.setattr(crawler_module, "session_scope", fake_session_scope)
         monkeypatch.setattr(crawler_module, "get_auto_queue_episodes", lambda: 0)
 

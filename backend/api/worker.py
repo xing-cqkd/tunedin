@@ -3,8 +3,9 @@
 The ingestion queue drivers deliver ``PROCESS_EPISODE`` tasks by POSTing to
 ``/api/worker/process-episode`` — this is the default ``WORKER_WEBHOOK_URL``
 in ``backend/ingestion/task_queue/gcp.py``. This router accepts that payload
-and validates it against the contract the ingestion service enqueues
-(``backend/ingestion/service.py``).
+and validates it against the contract the sync service enqueues
+(``FeedSyncService.sync_podcast_episodes_by_feed`` in
+``backend/ingestion/service.py``).
 
 The transcription/insight worker itself does not exist yet, so the endpoint
 returns ``501 Not Implemented`` with a clear message. This is a documented
@@ -23,7 +24,7 @@ router = APIRouter(prefix="/api/worker")
 
 class ProcessEpisodePayload(BaseModel):
     """Payload contract for PROCESS_EPISODE tasks (mirrors the dict built in
-    ``FeedIngestionService.sync_podcast_episodes``)."""
+    ``FeedSyncService._enqueue_episode_tasks``)."""
 
     episode_id: str
     feed_id: str

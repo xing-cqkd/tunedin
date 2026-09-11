@@ -27,7 +27,7 @@ rate limits and your write throughput.
 
 ```python
 from settings import open_store
-from backend.ingestion.service import FeedIngestionService  # for episode reads
+from backend.insights import pipeline  # for episode reads
 
 async with open_store() as store:
     total = await store.episodes.count_unprocessed()

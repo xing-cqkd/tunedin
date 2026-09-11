@@ -8,7 +8,8 @@ from backend.ingestion.errors import IngestionError
 from backend.ingestion.http_util import maybe_client
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
-from backend.ingestion.service import FeedIngestionService, FeedSyncStatus
+from backend.ingestion.discovery import DiscoveryService
+from backend.ingestion.service import FeedSyncService, FeedSyncStatus
 from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.feed import Feed
@@ -39,13 +40,17 @@ class PodcastCrawler:
 
     def __init__(
         self,
-        service: Optional[FeedIngestionService] = None,
+        discovery: DiscoveryService | None = None,
+        sync_service: FeedSyncService | None = None,
         itunes_client: Optional[ITunesSearchClient] = None,
         request_delay: float = 0.5,
         batch_size: int = 200,
     ):
-        self.service = service or FeedIngestionService(queue_driver=get_queue_driver())
-        self.itunes_client = itunes_client or self.service.itunes_client
+        self.discovery = discovery or DiscoveryService()
+        self.sync_service = sync_service or FeedSyncService(
+            queue_driver=get_queue_driver()
+        )
+        self.itunes_client = itunes_client or self.discovery.itunes_client
         self.request_delay = request_delay
         self.batch_size = min(max(1, batch_size), 200)
 
@@ -86,7 +91,7 @@ class PodcastCrawler:
                     for p in new_podcasts:
                         visited_urls.add(p.feed_url)
 
-                    saved_feeds = await self.service.save_podcasts(store, new_podcasts)
+                    saved_feeds = await self.discovery.save_podcasts(store, new_podcasts)
                     total_saved += len(saved_feeds)
 
                     if on_progress:
@@ -235,7 +240,7 @@ class PodcastCrawler:
                         country=country,
                         client=client,
                     )
-                    saved_feeds = await self.service.save_podcasts(
+                    saved_feeds = await self.discovery.save_podcasts(
                         store, podcasts
                     )
                     for f in saved_feeds:
@@ -289,9 +294,9 @@ class PodcastCrawler:
             async with semaphore:
                 try:
                     async with session_scope() as store:
-                        feed, episodes = await self.service.sync_podcast_episodes(
+                        feed, episodes = await self.sync_service.sync_podcast_episodes_by_id(
                             store=store,
-                            feed_or_id_or_url=feed_id,
+                            feed_id=feed_id,
                             auto_queue_episodes=get_auto_queue_episodes(),
                         )
                         successful_feeds += 1

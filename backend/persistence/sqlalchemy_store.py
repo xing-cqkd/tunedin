@@ -208,7 +208,7 @@ class _FeedRepository(FeedRepository):
     async def list_error_due_retry(
         self, cutoff: datetime, max_attempts: int
     ) -> list[Feed]:
-        # Coarse SQL pre-filter from FeedIngestionService.sync_all_pending_feeds
+        # Coarse SQL pre-filter from FeedSyncService.sync_all_pending_feeds
         # (XIN-34). Callers still re-check the exact per-feed backoff window.
         # Error rows with a NULL last_fetched_at are included (XIN-128): they
         # can arise from direct inserts/migrations and must not be stranded.
@@ -269,7 +269,7 @@ class _EpisodeRepository(EpisodeRepository):
         )
 
     async def list_guids_by_feed(self, feed_id: UUID) -> set[str]:
-        # From FeedIngestionService.sync_podcast_episodes (guid dedup step).
+        # From FeedSyncService.sync_podcast_episodes_by_feed (guid dedup step).
         res = await self._session.execute(
             select(Episode.guid).where(Episode.feed_id == feed_id)
         )
@@ -289,7 +289,7 @@ class _EpisodeRepository(EpisodeRepository):
         feed_id: Optional[UUID] = None,
         limit: int = 50,
     ) -> list[Episode]:
-        # From FeedIngestionService.get_unprocessed_episodes. SQL applies the
+        # From backend.insights.pipeline.get_unprocessed_episodes. SQL applies the
         # WHERE clause before LIMIT, so the limit is a hard cap on matching
         # rows — the contract the DynamoDB implementation must reproduce by
         # paginating.
@@ -344,7 +344,7 @@ class _EpisodeRepository(EpisodeRepository):
     async def mark_processed(
         self, episode_id: UUID, processed: bool = True
     ) -> Optional[Episode]:
-        # From FeedIngestionService.mark_episode_processed (query logic only —
+        # From backend.insights.pipeline.mark_episode_processed (query logic only —
         # the original committed internally; here the unit of work commits).
         res = await self._session.execute(
             select(Episode).where(Episode.episode_id == episode_id)
