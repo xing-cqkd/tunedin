@@ -511,6 +511,20 @@ class TaskLogRepository(ABC):
         Returns the updated entry, or ``None`` if the id does not exist.
         """
 
+    @abstractmethod
+    async def get_by_type_and_episode(
+        self,
+        task_type: str,
+        episode_id: UUID,
+    ) -> Optional[TaskLog]:
+        """Return the task-log row for a (task_type, episode_id) pair.
+
+        XIN-45: the idempotency lookup for the durable task outbox — the
+        sync service checks this before recording/enqueueing a task so a
+        re-enqueue of the same episode is a no-op. ``None`` when no row
+        exists for the pair.
+        """
+
 
 class Store(ABC):
     """Unit of work over all repositories.

@@ -719,6 +719,20 @@ class _TaskLogRepository(TaskLogRepository):
             await self._session.flush()
         return entry
 
+    async def get_by_type_and_episode(
+        self,
+        task_type: str,
+        episode_id: UUID,
+    ) -> Optional[TaskLog]:
+        # XIN-45: idempotency lookup for the task outbox.
+        res = await self._session.execute(
+            select(TaskLog).where(
+                TaskLog.task_type == task_type,
+                TaskLog.episode_id == episode_id,
+            )
+        )
+        return res.scalar_one_or_none()
+
 
 class SQLAlchemyStore(Store):
     """Unit of work backed by an async SQLAlchemy session.

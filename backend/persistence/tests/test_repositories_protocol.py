@@ -101,6 +101,7 @@ EXPECTED = {
         "update_status": _sig(
             ("task_log_id",), ("status",), ("error_message", _POS_OR_KW, None)
         ),
+        "get_by_type_and_episode": _sig(("task_type",), ("episode_id",)),
     },
 }
 

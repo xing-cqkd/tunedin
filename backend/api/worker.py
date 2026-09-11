@@ -7,6 +7,15 @@ and validates it against the contract the sync service enqueues
 (``FeedSyncService.sync_podcast_episodes_by_feed`` in
 ``backend/ingestion/service.py``).
 
+The payload schema is shared (XIN-41): both the producer
+(``FeedSyncService._process_episode_payload``) and this consumer validate
+against ``ProcessEpisodePayload`` in
+``backend/ingestion/task_queue/schemas.py``. Drivers wrap it in the
+``TaskEnvelope`` (``{"task_type": ..., "payload": {...}}``) on the wire;
+this endpoint currently validates the inner payload. When the real worker
+lands, decide explicitly whether it accepts the envelope or the driver
+unwraps before POSTing.
+
 The transcription/insight worker itself does not exist yet, so the endpoint
 returns ``501 Not Implemented`` with a clear message. This is a documented
 placeholder — not dead code — so the queue driver's target URL resolves to
@@ -17,20 +26,10 @@ goes here.
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+
+from backend.ingestion.task_queue.schemas import ProcessEpisodePayload
 
 router = APIRouter(prefix="/api/worker")
-
-
-class ProcessEpisodePayload(BaseModel):
-    """Payload contract for PROCESS_EPISODE tasks (mirrors the dict built in
-    ``FeedSyncService._enqueue_episode_tasks``)."""
-
-    episode_id: str
-    feed_id: str
-    title: str
-    audio_url: str
-    transcript_url: str
 
 
 @router.post("/process-episode")

@@ -993,6 +993,35 @@ class TestRepositoryConformance:
 
         assert await store.task_logs.update_status(uuid4(), "done") is None
 
+    async def test_tasklog_get_by_type_and_episode(self, store: Store):
+        """XIN-45: the idempotency lookup for the task outbox."""
+        ep_a, ep_b = uuid4(), uuid4()
+        t = await store.task_logs.save(
+            TaskLog(
+                task_type="PROCESS_EPISODE",
+                episode_id=ep_a,
+                status="queued",
+            )
+        )
+
+        found = await store.task_logs.get_by_type_and_episode(
+            "PROCESS_EPISODE", ep_a
+        )
+        assert found is not None
+        assert found.task_log_id == t.task_log_id
+
+        # No row for a different episode or a different task type.
+        assert (
+            await store.task_logs.get_by_type_and_episode(
+                "PROCESS_EPISODE", ep_b
+            )
+            is None
+        )
+        assert (
+            await store.task_logs.get_by_type_and_episode("OTHER_TASK", ep_a)
+            is None
+        )
+
     # ------------------------------------------------------------------
     # Store unit-of-work contract
     # ------------------------------------------------------------------
