@@ -30,6 +30,7 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
     from backend.api.developer import RateLimiter, rate_limited
     from backend.api.developer import router as developer_router
     from backend.api.feeds import router as feeds_router
+    from backend.api.worker import router as worker_router
 
     app = FastAPI(title="TuneIn API")
     if store_factory is None:  # lazy: settings mirrors env at import time
@@ -55,4 +56,7 @@ def create_app(*, store_factory: Callable[[], Any] | None = None):
         dependencies=[Depends(rate_limited)],
     )
     app.include_router(developer_router)
+    # XIN-31: worker webhook for PROCESS_EPISODE tasks. Validates the payload
+    # and 501s until the transcription/insight worker is implemented.
+    app.include_router(worker_router)
     return app
