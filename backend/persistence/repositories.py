@@ -399,6 +399,9 @@ class PlaylistRepository(ABC):
 
         Upsert on (playlist_id, episode_id): re-adding an existing link
         updates its position instead of duplicating it.
+
+        Raises :class:`MissingParentError` when the playlist or the
+        episode does not exist (FK parity on all backends, XIN-124).
         """
 
     @abstractmethod

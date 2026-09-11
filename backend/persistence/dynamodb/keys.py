@@ -25,8 +25,9 @@ Task log                  ``TASK#<task_log_id>``    ``META``
 ========================  ========================  =====================================
 
 Every item also carries a ``type`` attribute (entity type string) used by
-scans/filters.  The ``type`` attribute is added by the store layer (XIN-90)
-at write time — the key builders here emit only key attributes.
+scans/filters.  The ``type`` attribute is added by
+:func:`codec.model_to_item` at write time — the key builders here emit
+only key attributes.
 
 GSIs:
 
@@ -57,10 +58,8 @@ from uuid import UUID
 # Sentinel for a missing timestamp in a sort key.  Sorts before every real
 # ISO-8601 timestamp lexicographically, so under a descending scan (newest
 # first) missing values come last — matching the SQL "DESC NULLS LAST"
-# contracts.  The 9999-… form is provided for the (currently unused)
-# ascending-nulls-last pattern.
+# contracts.
 MISSING_TS_MIN = "0001-01-01T00:00:00+00:00"
-MISSING_TS_MAX = "9999-12-31T23:59:59+00:00"
 
 # Constant sort-key value for singleton items (mirrors the main table's META).
 META = "META"
@@ -205,6 +204,24 @@ def tag_keys(tag_id: UUID, *, name: str, category: Optional[str]) -> dict:
     }
 
 
+def tag_natural_key_hash(name: str, category: Optional[str]) -> str:
+    """Hash of the exact-case (name, category) natural key (Linear: XIN-124).
+
+    Used for tag-claim item keys (write-time uniqueness in
+    ``get_or_create``), which must be case-SENSITIVE to match the SQL
+    unique constraint on (name, category). Deliberately NOT the same
+    normalization as :func:`tag_keys`' lowercased gsi1 lookup key: the
+    lookup key is case-insensitive by design (candidates are re-checked
+    for the exact pair in Python), while the claim key must distinguish
+    ``"Foo"`` from ``"FOO"``. Keep both derivations here so the two
+    normalizations cannot drift apart.
+    """
+    return (
+        f"TAGNAME#{sha256_hex(name)}"
+        f"#{sha256_hex(category or '')}"
+    )
+
+
 def normalize_email(email: str) -> str:
     """Normalize an email for key use (lowercase, stripped)."""
     return email.strip().lower()
@@ -250,6 +267,36 @@ def slug_claim_keys(slug: str) -> dict:
     """
     return {
         "pk": f"SLUG#{slug}",
+        "sk": META,
+    }
+
+
+def rss_url_claim_keys(rss_url: str) -> dict:
+    """Key attributes for a feed rss_url-claim item (Linear: XIN-124).
+
+    The write-time uniqueness lock for ``Feed.rss_url``, mirroring the
+    SQL ``unique=True`` constraint. The URL is hashed (it can be up to
+    1024 chars) and the claim carries the owning ``feed_id`` so
+    re-saves of the same feed pass the claim's condition expression.
+    """
+    return {
+        "pk": f"RSSURLCLAIM#{sha256_hex(rss_url)}",
+        "sk": META,
+    }
+
+
+def email_claim_keys(email: str) -> dict:
+    """Key attributes for a user email-claim item (Linear: XIN-124).
+
+    The write-time uniqueness lock for ``User.email``, mirroring the
+    SQL ``unique=True`` constraint. The hash is over the exact-case
+    email (matching SQL's case-sensitive uniqueness); lookup still goes
+    through the normalized gsi1 key with an exact re-check in Python.
+    The claim carries the owning ``user_id`` so re-saves of the same
+    user pass the claim's condition expression.
+    """
+    return {
+        "pk": f"EMAILCLAIM#{sha256_hex(email)}",
         "sk": META,
     }
 

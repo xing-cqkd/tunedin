@@ -46,6 +46,8 @@ TYPE_USER = "user"
 TYPE_PLAYLIST = "playlist"
 TYPE_PLAYLIST_EPISODE_LINK = "playlist_episode_link"
 TYPE_SLUG_CLAIM = "slug_claim"
+TYPE_RSS_URL_CLAIM = "rss_url_claim"
+TYPE_EMAIL_CLAIM = "email_claim"
 TYPE_PROGRESS = "progress"
 TYPE_TASK_LOG = "task_log"
 

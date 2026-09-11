@@ -453,3 +453,84 @@ async def test_batch_write_raises_after_max_attempts(monkeypatch):
     # Bounded: exactly the cap, then a loud failure naming the table —
     # no infinite hot loop against a throttled table.
     assert client.calls == 3
+
+
+async def test_playlist_episode_link_added_at_round_trip(ddb_backend, tmp_path):
+    """XIN-124 §4: added_at round-trips through the adapter both ways.
+
+    Before the fix the write path dropped added_at, so DynamoDB
+    list_entries synthesized _now_utc() per read and every migrated
+    entry got a nondeterministic RSS <pubDate>.
+    """
+    backend, _ = ddb_backend
+    u1, f1, e1, p1 = uuid4(), uuid4(), uuid4(), uuid4()
+    added = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
+    now = datetime.now(UTC)
+    # FK-safe seed: the reverse migration lands in a pragma-enforced DB.
+    await backend.write_rows(
+        "users", [{"user_id": u1, "email": "u@example.com", "created_at": now}]
+    )
+    await backend.write_rows(
+        "feeds",
+        [
+            {
+                "feed_id": f1,
+                "rss_url": "https://example.com/f.xml",
+                "title": "F",
+                "sync_status": "pending",
+                "error_count": 0,
+                "created_at": now,
+            }
+        ],
+    )
+    await backend.write_rows(
+        "episodes",
+        [
+            {
+                "episode_id": e1,
+                "feed_id": f1,
+                "title": "E",
+                "audio_url": "https://example.com/e.mp3",
+                "processed": False,
+                "created_at": now,
+            }
+        ],
+    )
+    await backend.write_rows(
+        "curated_playlists",
+        [
+            {
+                "playlist_id": p1,
+                "user_id": u1,
+                "title": "P",
+                "created_at": now,
+            }
+        ],
+    )
+    await backend.write_rows(
+        "playlist_episodes",
+        [
+            {
+                "playlist_id": p1,
+                "episode_id": e1,
+                "position": 3,
+                "added_at": added,
+            }
+        ],
+    )
+
+    rows = await backend.read_table("playlist_episodes")
+    assert len(rows) == 1
+    assert rows[0]["position"] == 3
+    assert _norm(rows[0]["added_at"]) == _norm(added)
+
+    # Reverse direction: DynamoDB -> SQL preserves the instant too.
+    sql = await _make_sql_backend(tmp_path, "dst")
+    try:
+        await migrate(backend, sql)
+        back = await sql.read_table("playlist_episodes")
+        assert len(back) == 1
+        assert back[0]["position"] == 3
+        assert _norm(back[0]["added_at"]) == _norm(added)
+    finally:
+        await sql.close()
