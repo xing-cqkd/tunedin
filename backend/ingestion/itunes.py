@@ -36,6 +36,18 @@ class ITunesSearchClient:
             "Accept": "application/json, text/javascript, */*",
         }
 
+    async def _backoff(self, attempt: int, reason: str) -> None:
+        """Sleep with exponential backoff, logging the reason (XIN-129)."""
+        backoff = (2 ** attempt) * 0.5
+        logger.warning(
+            "%s Retrying in %.2fs (attempt %d/%d)...",
+            reason,
+            backoff,
+            attempt + 1,
+            self.max_retries,
+        )
+        await asyncio.sleep(backoff)
+
     async def _get_with_retry(
         self,
         url: str,
@@ -50,49 +62,36 @@ class ITunesSearchClient:
 
         headers = self._get_headers()
         try:
-            last_response = None
             for attempt in range(self.max_retries + 1):
                 try:
                     response = await client.get(url, params=params, headers=headers)
                     if response.status_code == 429 and attempt < self.max_retries:
-                        backoff = (2 ** attempt) * 0.5
-                        logger.warning(
-                            "Received HTTP 429 Rate Limit from iTunes API. Retrying in %.2fs (attempt %d/%d)...",
-                            backoff,
-                            attempt + 1,
-                            self.max_retries,
+                        await self._backoff(
+                            attempt,
+                            "Received HTTP 429 Rate Limit from iTunes API.",
                         )
-                        await asyncio.sleep(backoff)
                         continue
                     response.raise_for_status()
                     return response
                 except httpx.HTTPStatusError as err:
-                    last_response = err.response
                     if err.response.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                        backoff = (2 ** attempt) * 0.5
-                        logger.warning(
-                            "HTTP %d error from iTunes API. Retrying in %.2fs...",
-                            err.response.status_code,
-                            backoff,
+                        await self._backoff(
+                            attempt,
+                            f"HTTP {err.response.status_code} error from iTunes API.",
                         )
-                        await asyncio.sleep(backoff)
                         continue
                     raise
                 except (httpx.ConnectError, httpx.TimeoutException) as err:
                     if attempt < self.max_retries:
-                        backoff = (2 ** attempt) * 0.5
-                        logger.warning(
-                            "Network error contacting iTunes API (%s). Retrying in %.2fs...",
-                            str(err),
-                            backoff,
+                        await self._backoff(
+                            attempt,
+                            f"Network error contacting iTunes API ({err}).",
                         )
-                        await asyncio.sleep(backoff)
                         continue
                     raise
-
-            if last_response is not None:
-                last_response.raise_for_status()
-            raise httpx.RequestError(f"Request failed after {self.max_retries} retries: {url}")
+            # The loop above is exhaustive: every iteration returns, retries
+            # (only when attempt < max_retries), or raises — so control never
+            # reaches here. (The old unreachable tail was deleted, XIN-129.)
         finally:
             if close_client:
                 await client.aclose()

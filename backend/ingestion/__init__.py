@@ -15,7 +15,7 @@ from backend.ingestion.task_queue import (
     TaskQueueDriver,
     get_queue_driver,
 )
-from backend.ingestion.service import FeedIngestionService, IngestionMode
+from backend.ingestion.service import FeedIngestionService
 from settings import (
     describe_database,
     get_db,
@@ -36,7 +36,6 @@ __all__ = [
     "FeedParseResult",
     "PodcastFeedParser",
     "FeedIngestionService",
-    "IngestionMode",
     "TaskQueueDriver",
     "LocalInMemoryDriver",
     "GCPCloudTasksDriver",

@@ -241,7 +241,8 @@ class _FeedRepository(FeedRepository):
         self, cutoff: datetime, max_attempts: int
     ) -> list[models.Feed]:
         # Mirrors the SQL coarse pre-filter: error status, error_count below
-        # the cap, and a non-null last_fetched_at at or before the cutoff.
+        # the cap, and last_fetched_at at or before the cutoff — or NULL
+        # (XIN-128: null-last_fetched_at error rows must not be stranded).
         # The GSI query is already created_at-ascending and the filter
         # preserves relative order, so no re-sort is needed.
         items = await _query_all(
@@ -250,8 +251,8 @@ class _FeedRepository(FeedRepository):
             IndexName="gsi2",
             KeyConditionExpression="gsi2pk = :p",
             FilterExpression=(
-                "error_count < :m AND attribute_exists(last_fetched_at) "
-                "AND last_fetched_at <= :c"
+                "error_count < :m AND (attribute_not_exists(last_fetched_at) "
+                "OR last_fetched_at <= :c)"
             ),
             ExpressionAttributeValues={
                 ":p": _s("STATUS#error"),

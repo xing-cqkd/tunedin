@@ -1,4 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import sys
+import types
 import pytest
 from unittest.mock import AsyncMock, patch
 from backend.ingestion.task_queue import (
@@ -141,3 +143,126 @@ async def test_service_auto_queues_episodes(in_memory_session):
     assert len(queue_driver.tasks) == 2
     assert queue_driver.tasks[0].payload["title"] == "Episode 3"
     assert queue_driver.tasks[1].payload["title"] == "Episode 4"
+
+
+# ---------------------------------------------------------------------------
+# XIN-128 / XIN-130: delayed tasks, no-handler warning, GCP driver, factory
+# ---------------------------------------------------------------------------
+from types import SimpleNamespace
+
+
+@pytest.mark.asyncio
+async def test_process_next_no_handler_warns_and_records(caplog):
+    driver = LocalInMemoryDriver()
+    await driver.enqueue("UNKNOWN_TYPE", {"x": 1})
+    with caplog.at_level("WARNING"):
+        record = await driver.process_next()
+    assert record is not None
+    assert record["result"] is None
+    assert record["error"] is None
+    assert "No handler registered" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_enqueue_delay_not_processed_early():
+    """XIN-128: a delayed task must not run before its schedule_time."""
+    driver = LocalInMemoryDriver()
+    handled = []
+
+    async def handler(payload):
+        handled.append(payload["episode_id"])
+        return "ok"
+
+    driver.register_handler("PROCESS_EPISODE", handler)
+    await driver.enqueue("PROCESS_EPISODE", {"episode_id": "ep-1"}, in_seconds=3600)
+
+    # Head task is not due: process_next returns None and leaves it queued
+    assert await driver.process_next() is None
+    assert handled == []
+    assert driver._queue.qsize() == 1
+
+    # Once due, it processes normally
+    driver.tasks[0].schedule_time = datetime.now(timezone.utc) - timedelta(seconds=1)
+    record = await driver.process_next()
+    assert record is not None
+    assert handled == ["ep-1"]
+
+
+@pytest.mark.asyncio
+async def test_process_all_skips_delayed_tasks():
+    driver = LocalInMemoryDriver()
+    handled = []
+
+    async def handler(payload):
+        handled.append(payload["episode_id"])
+        return "ok"
+
+    driver.register_handler("PROCESS_EPISODE", handler)
+    await driver.enqueue("PROCESS_EPISODE", {"episode_id": "due-now"})
+    await driver.enqueue("PROCESS_EPISODE", {"episode_id": "later"}, in_seconds=3600)
+
+    results = await driver.process_all()
+    assert [r["payload"]["episode_id"] for r in results] == ["due-now"]
+    assert handled == ["due-now"]
+    # The delayed task stays queued for a later pass
+    assert driver._queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_gcp_enqueue_with_mock_client(monkeypatch):
+    from backend.ingestion.task_queue.gcp import GCPCloudTasksDriver
+
+    # google-cloud-tasks/protobuf is not a project dependency; the driver
+    # imports timestamp_pb2 lazily only when a delay is requested. Stub the
+    # module so this test runs in clean test envs too.
+    try:
+        import google.protobuf.timestamp_pb2  # noqa: F401
+    except ImportError:
+        stub_pb2 = types.ModuleType("google.protobuf.timestamp_pb2")
+
+        class _StubTimestamp:
+            def FromDatetime(self, dt):
+                self._dt = dt
+
+        stub_pb2.Timestamp = _StubTimestamp
+        monkeypatch.setitem(sys.modules, "google.protobuf", types.ModuleType("google.protobuf"))
+        monkeypatch.setitem(sys.modules, "google.protobuf.timestamp_pb2", stub_pb2)
+
+    class FakeTasksClient:
+        def __init__(self):
+            self.requests = []
+
+        def queue_path(self, project, location, queue):
+            return f"projects/{project}/locations/{location}/queues/{queue}"
+
+        async def create_task(self, request):
+            self.requests.append(request)
+            return SimpleNamespace(name=request["parent"] + "/tasks/abc123")
+
+    fake = FakeTasksClient()
+    driver = GCPCloudTasksDriver(
+        project_id="p",
+        location="l",
+        queue_name="q",
+        target_url="https://worker.example.com/hook",
+    )
+    driver._client = fake
+
+    task_id = await driver.enqueue("PROCESS_EPISODE", {"a": 1}, in_seconds=60)
+    assert task_id == "abc123"
+    req = fake.requests[0]
+    assert req["parent"] == "projects/p/locations/l/queues/q"
+    assert "schedule_time" in req["task"]
+    assert req["task"]["http_request"]["url"] == "https://worker.example.com/hook"
+
+    # Without a delay there is no schedule_time
+    task_id2 = await driver.enqueue("PROCESS_EPISODE", {"a": 2})
+    assert task_id2 == "abc123"
+    assert "schedule_time" not in fake.requests[1]["task"]
+
+
+def test_get_queue_driver_factory():
+    assert isinstance(get_queue_driver("gcp"), GCPCloudTasksDriver)
+    assert isinstance(get_queue_driver("local"), LocalInMemoryDriver)
+    with pytest.raises(ValueError, match="Unknown TASK_QUEUE_DRIVER"):
+        get_queue_driver("bogus")
