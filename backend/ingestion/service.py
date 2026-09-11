@@ -23,7 +23,7 @@ Discovery (iTunes -> Feed upserts) lives in
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 from urllib.parse import urlparse
@@ -64,25 +64,9 @@ class FeedSyncStatus(str, Enum):
     ERROR = "error"
 
 
-# Retry policy for feeds stuck in sync_status=ERROR (XIN-34). A transient
-# fetch/parse failure must not strand a feed forever: errored feeds become
-# eligible for retry after an exponential backoff based on consecutive
-# error_count, and are abandoned after MAX attempts.
-ERROR_RETRY_BASE_BACKOFF_SECONDS = 300  # 5 minutes; doubles per consecutive failure
-ERROR_RETRY_MAX_ATTEMPTS = 10  # stop retrying after this many consecutive failures
-
-
-def _error_retry_due(feed: "Feed", now: datetime) -> bool:
-    """True if an errored feed's backoff window has elapsed and it may be retried."""
-    if feed.error_count >= ERROR_RETRY_MAX_ATTEMPTS:
-        return False
-    # Note: no upper cap on the backoff — max attempts is 10 and
-    # error_count=9 yields 76,800s of backoff, so a 1-day cap would never bind.
-    backoff = ERROR_RETRY_BASE_BACKOFF_SECONDS * (2 ** max(feed.error_count - 1, 0))
-    last = feed.last_fetched_at
-    if last is not None and last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)  # SQLite returns naive datetimes
-    return last is None or last <= now - timedelta(seconds=backoff)
+# Error-retry backoff policy (XIN-34) now lives in
+# backend/ingestion/orchestration.py alongside the single feed-selection
+# implementation; this module no longer owns "which feeds are due".
 
 
 def _looks_like_url(value: str) -> bool:
@@ -485,13 +469,15 @@ class FeedSyncService:
         client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         """
-        Finds all feeds with sync_status in (DISCOVERED, PENDING), plus errored
-        feeds whose retry backoff has elapsed, and downloads all new episodes
-        into the database for each feed.
+        Sync all feeds due for a run: discovered/pending feeds plus errored
+        feeds whose retry backoff has elapsed (XIN-34).
 
-        Each feed is synced via ``sync_podcast_episodes_by_feed`` (one commit
-        per feed, owned by that method); this batch method itself only commits
-        when marking a feed ERROR after a persistence-step failure.
+        XIN-38: this is now a thin sequential delegate over
+        :class:`backend.ingestion.orchestration.FeedSyncOrchestrator` with
+        ``concurrency=1`` — the single "sync all" implementation. The
+        orchestrator normally opens its own sessions, but this overload
+        reuses the caller's already-open ``store`` (the ONE sanctioned
+        shared-session case; sequential, so no cross-worker sharing).
 
         Returns a summary dict; ``total_feeds_processed`` counts only feeds
         actually attempted (XIN-79), and ``max_feeds`` applies after the
@@ -499,89 +485,16 @@ class FeedSyncService:
         (XIN-80). ``skipped_backoff`` reports how many error feeds were
         filtered as not yet due.
         """
-        now = datetime.now(timezone.utc)
-        min_backoff_cutoff = now - timedelta(seconds=ERROR_RETRY_BASE_BACKOFF_SECONDS)
-        pending = await store.feeds.list_by_statuses(
-            [FeedSyncStatus.DISCOVERED.value, FeedSyncStatus.PENDING.value]
+        from backend.ingestion.orchestration import (
+            FeedSyncOrchestrator,
+            SyncPolicy,
+            shared_session,
         )
-        due_retry = await store.feeds.list_error_due_retry(
-            min_backoff_cutoff, ERROR_RETRY_MAX_ATTEMPTS
+
+        orchestrator = FeedSyncOrchestrator(
+            sync_service=self,
+            policy=SyncPolicy(concurrency=1, max_feeds=max_feeds),
+            session_factory=lambda: shared_session(store),
+            client=client,
         )
-        # Reproduce the original single-query OR semantics: merge the two
-        # created_at-ordered result sets (the stable sort keeps
-        # discovered/pending feeds first on created_at ties).
-        merged = sorted(pending + due_retry, key=lambda f: f.created_at)
-        # XIN-79/XIN-80: apply the per-row backoff/due filter FIRST, then the
-        # max_feeds slice — counting and limiting only feeds actually attempted.
-        due_feeds = [
-            f
-            for f in merged
-            if not (
-                f.sync_status == FeedSyncStatus.ERROR.value
-                and not _error_retry_due(f, now)
-            )
-        ]
-        skipped_backoff = len(merged) - len(due_feeds)
-        if max_feeds:
-            due_feeds = due_feeds[:max_feeds]
-        pending_feeds = due_feeds
-
-        total_synced = 0
-        total_episodes_saved = 0
-        failed_feeds: list[str] = []
-
-        # Capture PKs up front and re-fetch each feed inside the loop: a
-        # rollback in one iteration expires every instance in the session, so
-        # holding ORM objects across iterations would trigger implicit IO
-        # (MissingGreenlet) on the next attribute access.
-        pending_ids = [f.feed_id for f in pending_feeds]
-
-        for feed_id in pending_ids:
-            feed = await store.feeds.get_by_id(feed_id)
-            if feed is None:
-                continue
-            # Capture display fields now: sync_podcast_episodes_by_feed may
-            # commit or leave the session in a failed state, expiring this
-            # instance.
-            rss_url = feed.rss_url
-            # Defensive re-check of the exact per-feed backoff window (the
-            # list above was already due-filtered; this only fires on races).
-            if feed.sync_status == FeedSyncStatus.ERROR.value and not _error_retry_due(
-                feed, now
-            ):
-                continue
-            pre_error_count = feed.error_count
-            try:
-                _, new_eps = await self.sync_podcast_episodes_by_feed(
-                    store, feed, client=client
-                )
-                total_synced += 1
-                total_episodes_saved += len(new_eps)
-            except Exception as e:
-                logger.warning("Failed batch sync for feed %s: %s", rss_url, str(e))
-                # XIN-127: a write failure (e.g. a duplicate-episode race in
-                # save_many) must not poison the shared session for the
-                # remaining feeds — roll back before continuing.
-                await store.rollback()
-                feed = await store.feeds.get_by_id(feed_id)
-                if feed is not None and feed.error_count == pre_error_count:
-                    # The fetch/parse path inside sync_podcast_episodes_by_feed
-                    # marks and commits the error state itself (bumping
-                    # error_count); only mark here when it didn't (e.g. a
-                    # persistence-step failure after a successful fetch, raised
-                    # as FeedSyncError).
-                    feed.error_count = pre_error_count + 1
-                    feed.sync_status = FeedSyncStatus.ERROR.value
-                    feed.last_fetched_at = now
-                    feed = await store.feeds.save(feed)
-                    await store.commit()
-                failed_feeds.append(str(feed_id))
-
-        return {
-            "total_feeds_processed": len(pending_feeds),
-            "total_synced": total_synced,
-            "total_episodes_saved": total_episodes_saved,
-            "failed_count": len(failed_feeds),
-            "failed_feed_ids": failed_feeds,
-            "skipped_backoff": skipped_backoff,
-        }
+        return await orchestrator.run()

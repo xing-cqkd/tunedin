@@ -4,6 +4,7 @@ load_existing_logs, and the 429 backoff branch)."""
 import importlib
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,20 @@ import httpx
 import pytest
 
 import backend.ingestion.batch_runner as br
+import backend.ingestion.orchestration as orch
+
+
+def _make_feed(feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"):
+    """Feed fixture with the attributes the orchestrator's selection needs."""
+    return SimpleNamespace(
+        feed_id=feed_id,
+        title=title,
+        rss_url=rss_url,
+        sync_status="discovered",
+        error_count=0,
+        last_fetched_at=None,
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
 
 
 class _FakeFeedsRepo:
@@ -19,8 +34,20 @@ class _FakeFeedsRepo:
         self._pending = list(pending)
 
     async def list_by_statuses(self, statuses, limit=None):
-        feeds = list(self._pending)
+        feeds = [f for f in self._pending if f.sync_status in statuses]
         return feeds[:limit] if limit else feeds
+
+    async def list_error_due_retry(self, min_backoff_cutoff, max_attempts):
+        return []
+
+    async def get_by_id(self, feed_id):
+        for f in self._pending:
+            if f.feed_id == feed_id:
+                return f
+        return None
+
+    async def save(self, feed):
+        return feed
 
     async def count_all(self):
         return 10
@@ -41,6 +68,12 @@ class _FakeStore:
     def __init__(self, pending=()):
         self.feeds = _FakeFeedsRepo(pending)
         self.episodes = _FakeEpisodesRepo()
+
+    async def rollback(self):
+        pass
+
+    async def commit(self):
+        pass
 
 
 def _patch_progress_file(monkeypatch, path):
@@ -111,9 +144,7 @@ async def test_run_batch_ingest_no_pending(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_batch_ingest_processes_feed(tmp_path, monkeypatch):
-    feed = SimpleNamespace(
-        feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"
-    )
+    feed = _make_feed()
     _patch_common(monkeypatch, tmp_path, pending=[feed])
 
     class FakeService:
@@ -141,9 +172,7 @@ async def test_run_batch_ingest_processes_feed(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_batch_ingest_429_backoff(tmp_path, monkeypatch):
-    feed = SimpleNamespace(
-        feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"
-    )
+    feed = _make_feed()
     _patch_common(monkeypatch, tmp_path, pending=[feed])
 
     req = httpx.Request("GET", "https://one.example.com/feed.xml")
@@ -221,7 +250,7 @@ def _http_status_error(status):
 
 
 def test_fetch_status_code_reads_httpx_response():
-    assert br._fetch_status_code(_http_status_error(503)) == 503
+    assert orch.fetch_status_code(_http_status_error(503)) == 503
 
 
 def test_fetch_status_code_prefers_status_code_property():
@@ -232,20 +261,18 @@ def test_fetch_status_code_prefers_status_code_property():
         def status_code(self):
             return 429
 
-    assert br._fetch_status_code(_FeedFetchError()) == 429
+    assert orch.fetch_status_code(_FeedFetchError()) == 429
 
 
 def test_fetch_status_code_none_for_plain_errors():
-    assert br._fetch_status_code(RuntimeError("boom")) is None
+    assert orch.fetch_status_code(RuntimeError("boom")) is None
 
 
 @pytest.mark.asyncio
 async def test_run_batch_ingest_typed_fetch_error_429_backoff(tmp_path, monkeypatch):
     """PR #32 shape: a FeedFetchError-like error with status_code=429
     triggers the 5s throttle backoff through the unified handler."""
-    feed = SimpleNamespace(
-        feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"
-    )
+    feed = _make_feed()
     _patch_common(monkeypatch, tmp_path, pending=[feed])
 
     class _FeedFetchError(Exception):
@@ -263,7 +290,6 @@ async def test_run_batch_ingest_typed_fetch_error_429_backoff(tmp_path, monkeypa
             raise _FeedFetchError("throttled")
 
     monkeypatch.setattr(br, "FeedSyncService", FakeService)
-    monkeypatch.setattr(br, "_FETCH_ERROR_TYPES", (_FeedFetchError,))
     sleep_mock = AsyncMock()
     monkeypatch.setattr(br.asyncio, "sleep", sleep_mock)
 

@@ -4,12 +4,12 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Set
 import httpx
 from backend.persistence.repositories import Store
 
-from backend.ingestion.errors import IngestionError
 from backend.ingestion.http_util import maybe_client
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
 from backend.ingestion.discovery import DiscoveryService
-from backend.ingestion.service import FeedSyncService, FeedSyncStatus
+from backend.ingestion.orchestration import FeedSyncOrchestrator, SyncPolicy
+from backend.ingestion.service import FeedSyncService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.feed import Feed
@@ -269,65 +269,28 @@ class PodcastCrawler:
         max_feeds: Optional[int] = None,
         on_feed_synced: Optional[Callable[[str, int], None]] = None,
     ) -> Dict[str, Any]:
+        """Sync episodes for all due discovered/pending feeds.
+
+        XIN-38: thin wrapper over :class:`FeedSyncOrchestrator` — the single
+        "sync all" implementation. Kept for compatibility (``cli.run_crawl``
+        and external callers); the legacy 4-key summary shape is preserved.
         """
-        Spawns worker pool to download episodes for all discovered/pending feeds
-        in the configured database with bounded async concurrency.
-        """
-        # 1. Fetch pending feed records
-        async with session_scope() as store:
-            pending_feeds = await store.feeds.list_by_statuses(
-                [FeedSyncStatus.DISCOVERED.value, FeedSyncStatus.PENDING.value],
-                limit=max_feeds,
-            )
-            pending_ids = [f.feed_id for f in pending_feeds]
-
-        if not pending_ids:
-            return {"total_feeds": 0, "synced": 0, "episodes_saved": 0, "failed": 0}
-
-        semaphore = asyncio.Semaphore(concurrency)
-        total_episodes_saved = 0
-        successful_feeds = 0
-        failed_feeds = 0
-
-        async def _worker(feed_id: Any) -> None:
-            nonlocal total_episodes_saved, successful_feeds, failed_feeds
-            async with semaphore:
-                try:
-                    async with session_scope() as store:
-                        feed, episodes = await self.sync_service.sync_podcast_episodes_by_id(
-                            store=store,
-                            feed_id=feed_id,
-                            auto_queue_episodes=get_auto_queue_episodes(),
-                        )
-                        successful_feeds += 1
-                        total_episodes_saved += len(episodes)
-                        if on_feed_synced:
-                            on_feed_synced(feed.title, len(episodes))
-                except IngestionError as err:
-                    # XIN-53: the service records the failure on the feed row
-                    # and raises WITHOUT logging; log exactly once here.
-                    logger.warning(
-                        "Failed to sync episodes for feed %s: %s: %s",
-                        str(feed_id),
-                        type(err).__name__,
-                        str(err),
-                    )
-                    failed_feeds += 1
-                except Exception as err:
-                    # Non-ingestion failure (unexpected); still counted, logged once.
-                    logger.warning(
-                        "Unexpected error syncing feed %s: %s",
-                        str(feed_id),
-                        str(err),
-                    )
-                    failed_feeds += 1
-
-        tasks = [_worker(fid) for fid in pending_ids]
-        await asyncio.gather(*tasks)
-
+        orchestrator = FeedSyncOrchestrator(
+            sync_service=self.sync_service,
+            policy=SyncPolicy(
+                concurrency=concurrency,
+                max_feeds=max_feeds,
+                auto_queue_episodes=get_auto_queue_episodes(),
+                on_feed_synced=on_feed_synced,
+            ),
+            # Same session source the orchestrator defaults to; passed
+            # explicitly so tests can substitute it via this module.
+            session_factory=session_scope,
+        )
+        summary = await orchestrator.run()
         return {
-            "total_feeds": len(pending_ids),
-            "synced": successful_feeds,
-            "episodes_saved": total_episodes_saved,
-            "failed": failed_feeds,
+            "total_feeds": summary["total_feeds_processed"],
+            "synced": summary["total_synced"],
+            "episodes_saved": summary["total_episodes_saved"],
+            "failed": summary["failed_count"],
         }

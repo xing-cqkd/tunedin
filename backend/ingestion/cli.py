@@ -6,7 +6,15 @@ from typing import List, Optional
 
 from backend.config import configure_logging
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
-from settings import describe_database, get_crawler_countries, init_db, session_scope
+from backend.ingestion.orchestration import FeedSyncOrchestrator, SyncPolicy
+from backend.ingestion.service import FeedSyncService
+from settings import (
+    describe_database,
+    get_auto_queue_episodes,
+    get_crawler_countries,
+    init_db,
+    session_scope,
+)
 
 logger = logging.getLogger("ingestion_cli")
 
@@ -93,19 +101,26 @@ async def run_crawl(
 
 
 async def run_sync_only(concurrency: int = 5, max_feeds: Optional[int] = None) -> None:
-    """Downloads episodes for existing discovered/pending feeds in the database."""
+    """Downloads episodes for existing discovered/pending feeds in the database.
+
+    XIN-38: thin over FeedSyncOrchestrator — the single feed-sync path.
+    """
     await init_db()
-    crawler = PodcastCrawler()
     print(f"\n⚡ Syncing episodes for pending feeds (concurrency={concurrency}, max_feeds={max_feeds})...")
     def _feed_synced(title: str, ep_count: int) -> None:
         print(f"  [>] Synced {ep_count:3d} episodes: {title[:45]}")
 
-    stats = await crawler.sync_episodes_concurrently(
-        concurrency=concurrency,
-        max_feeds=max_feeds,
-        on_feed_synced=_feed_synced,
+    orchestrator = FeedSyncOrchestrator(
+        sync_service=FeedSyncService(),
+        policy=SyncPolicy(
+            concurrency=concurrency,
+            max_feeds=max_feeds,
+            auto_queue_episodes=get_auto_queue_episodes(),
+            on_feed_synced=_feed_synced,
+        ),
     )
-    print(f"\n✅ Synced {stats['episodes_saved']} episodes across {stats['synced']} feeds.")
+    summary = await orchestrator.run()
+    print(f"\n✅ Synced {summary['total_episodes_saved']} episodes across {summary['total_synced']} feeds.")
     await show_status()
 
 

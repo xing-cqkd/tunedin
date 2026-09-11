@@ -6,37 +6,16 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from backend.config import configure_logging, get_settings
+from backend.ingestion.orchestration import (
+    FeedSyncOrchestrator,
+    SyncPolicy,
+    fetch_status_code,
+)
 from backend.ingestion.service import FeedSyncService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 
-try:
-    # Typed fetch errors (PR #32, service batch). Not yet merged at the time
-    # this was written; until it lands the service layer raises raw httpx
-    # errors, so fall back to catching those directly.
-    from backend.ingestion.errors import FeedFetchError
-except ImportError:  # pragma: no cover - disappears once PR #32 merges
-    FeedFetchError = None  # type: ignore[assignment,misc]
-
 logger = logging.getLogger("batch_ingest")
-
-# Fetch-failure types that carry an HTTP status for the 429 special-case.
-# Once PR #32 is merged this collapses to just (FeedFetchError,).
-_FETCH_ERROR_TYPES = tuple(
-    t for t in (FeedFetchError, httpx.HTTPStatusError) if t is not None
-)
-
-
-def _fetch_status_code(err: Exception) -> Optional[int]:
-    """Best-effort HTTP status for a fetch failure.
-
-    ``FeedFetchError.status_code`` (PR #32) is preferred; raw
-    ``httpx.HTTPStatusError`` exposes it via ``err.response``.
-    """
-    status = getattr(err, "status_code", None)
-    if status is None and isinstance(err, httpx.HTTPStatusError):
-        status = err.response.status_code
-    return status
 
 
 def _progress_file() -> Path:
@@ -129,17 +108,41 @@ async def run_batch_ingest(
     delay_between_feeds: float = 0.35,
 ) -> Dict[str, Any]:
     """
-    Ingests episodes sequentially one podcast at a time in batches,
-    committing to the configured database after each show and recording progress in .local_agents/podcast_ingest.md.
+    Ingests episodes one podcast at a time in batches, committing after each
+    show and recording progress in the configured progress markdown file.
+
+    XIN-38: thin entry point over :class:`FeedSyncOrchestrator` — sequential
+    (``concurrency=1``), one batch per run with ``max_feeds=batch_size``,
+    plus the batch-runner progress callbacks. The only orchestration left
+    here is the batch loop and the markdown progress file.
     """
     await init_db()
-    auto_queue = get_auto_queue_episodes()
     sync_service = FeedSyncService(queue_driver=get_queue_driver())
     logs: List[str] = load_existing_logs()
     last_error_msg: Optional[str] = None
 
     # Initial progress file write
     await write_progress_file(0, max_batches, 0, 0, logs if logs else ["Ingestion job resumed."])
+
+    def on_feed_synced(title: str, new_episode_count: int) -> None:
+        nonlocal last_error_msg
+        msg = f"[{datetime.now().strftime('%H:%M:%S')}] OK: Synced {new_episode_count:3d} eps -> {title[:45]}"
+        logger.info(msg)
+        logs.append(msg)
+        last_error_msg = None
+
+    def on_feed_failed(label: str, err: Exception) -> None:
+        nonlocal last_error_msg
+        status_code = fetch_status_code(err)
+        if status_code == 429:
+            last_error_msg = f"HTTP 429 Throttled on {label}. Backing off 5s..."
+            logger.warning(last_error_msg)
+            logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] THROTTLE (429): {label} - Backing off 5s")
+        else:
+            status_label = f"HTTP {status_code}" if status_code else type(err).__name__
+            last_error_msg = f"{status_label} on {label}"
+            logger.warning(last_error_msg)
+            logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_label}): {label}")
 
     # Persistent HTTP client with browser User-Agent
     transport = httpx.AsyncHTTPTransport(retries=2)
@@ -156,79 +159,45 @@ async def run_batch_ingest(
             if max_batches and batch_idx > max_batches:
                 break
 
-            # 1. Fetch next batch of pending feed IDs
-            async with session_scope() as store:
-                pending_batch = await store.feeds.list_by_statuses(
-                    ["discovered", "pending"], limit=batch_size
-                )
+            policy = SyncPolicy(
+                concurrency=1,
+                delay_between_feeds=delay_between_feeds,
+                max_feeds=batch_size,
+                auto_queue_episodes=get_auto_queue_episodes(),
+                on_feed_synced=on_feed_synced,
+                on_feed_failed=on_feed_failed,
+            )
+            summary = await FeedSyncOrchestrator(
+                sync_service=sync_service,
+                policy=policy,
+                # Same session source the orchestrator defaults to; passed
+                # explicitly so tests can substitute it via this module.
+                session_factory=session_scope,
+                client=client,
+            ).run()
 
-            if not pending_batch:
+            if summary["total_feeds_processed"] == 0:
                 logger.info("No more pending feeds to ingest. All shows synced!")
                 logs.append("All pending podcast shows have been processed.")
                 await write_progress_file(batch_idx, max_batches or batch_idx, 0, 0, logs)
                 break
 
-            logger.info("=== Starting Batch %d (%d shows) ===", batch_idx, len(pending_batch))
-            batch_synced = 0
-            batch_episodes = 0
-
-            # 2. Process ONE podcast at a time
-            for feed in pending_batch:
-                feed_id, title, rss_url = feed.feed_id, feed.title, feed.rss_url
-                show_label = f"{title[:40]} ({rss_url[:35]}...)"
-                try:
-                    async with session_scope() as store:
-                        feed, new_eps = await sync_service.sync_podcast_episodes_by_id(
-                            store=store,
-                            feed_id=feed_id,
-                            client=client,
-                            auto_queue_episodes=auto_queue,
-                        )
-                        batch_synced += 1
-                        batch_episodes += len(new_eps)
-                        msg = f"[{datetime.now().strftime('%H:%M:%S')}] OK: Synced {len(new_eps):3d} eps -> {feed.title[:45]}"
-                        logger.info(msg)
-                        logs.append(msg)
-                        last_error_msg = None
-
-                    # Politeness throttle
-                    await asyncio.sleep(delay_between_feeds)
-
-                except _FETCH_ERROR_TYPES as e:
-                    # PR #32: fetch failures arrive as FeedFetchError carrying
-                    # status_code; pre-merge they are raw httpx.HTTPStatusError.
-                    status_code = _fetch_status_code(e)
-                    if status_code == 429:
-                        last_error_msg = f"HTTP 429 Throttled on {show_label}. Backing off 5s..."
-                        logger.warning(last_error_msg)
-                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] THROTTLE (429): {show_label} - Backing off 5s")
-                        await asyncio.sleep(5.0)
-                    else:
-                        status_label = f"HTTP {status_code}" if status_code else type(e).__name__
-                        last_error_msg = f"{status_label} on {show_label}"
-                        logger.warning(last_error_msg)
-                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_label}): {show_label}")
-                except Exception as err:
-                    last_error_msg = f"Error on {show_label}: {str(err)[:60]}"
-                    logger.warning(last_error_msg)
-                    logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL: {show_label} ({str(err)[:40]})")
-
-            # 3. Checkpoint progress after batch (XIN-129: the per-feed write
+            # Checkpoint progress after batch (XIN-129: the per-feed write
             # ran 5 count queries + rewrote the markdown file after EVERY
             # feed; batch-boundary writes are sufficient).
             await write_progress_file(
                 batch_num=batch_idx,
                 total_batches=max_batches,
-                batch_synced_shows=batch_synced,
-                batch_new_episodes=batch_episodes,
+                batch_synced_shows=summary["total_synced"],
+                batch_new_episodes=summary["total_episodes_saved"],
                 recent_logs=logs,
                 last_error=last_error_msg,
             )
             logger.info(
                 "Batch %d complete: %d shows synced, %d episodes saved.",
                 batch_idx,
-                batch_synced,
-                batch_episodes,
+                summary["total_synced"],
+                summary["total_episodes_saved"],
             )
 
     return {
