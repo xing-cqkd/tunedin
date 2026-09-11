@@ -319,3 +319,35 @@ def task_log_keys(
         "gsi2pk": f"TASKTYPE#{task_type}#{status}",
         "gsi2sk": iso_timestamp(created_at),
     }
+
+
+def feed_template_keys(
+    template_id: UUID,
+    *,
+    feed_id: UUID,
+    episode_type: str,
+    rev: int,
+    created_at: Optional[datetime],
+) -> dict:
+    """Key attributes for a FeedTemplateRecord item.
+
+    pk groups every revision of one feed's template; sk orders revisions per
+    episode type so the live template is the max sk. gsi1 finds a feed's
+    templates by episode type.
+    """
+    return {
+        "pk": f"FEED#{uuid_str(feed_id)}",
+        "sk": f"TPL#{episode_type}#REV#{rev:06d}#{uuid_str(template_id)}",
+        "gsi1pk": f"TPLTYPE#{episode_type}",
+        "gsi1sk": iso_timestamp(created_at),
+    }
+
+
+def drift_decision_keys(
+    decision_id: UUID, *, feed_id: UUID, created_at: Optional[datetime]
+) -> dict:
+    """Key attributes for a DriftDecision item (time-ordered per feed)."""
+    return {
+        "pk": f"FEED#{uuid_str(feed_id)}",
+        "sk": f"DRIFT#{iso_timestamp(created_at)}#{uuid_str(decision_id)}",
+    }
