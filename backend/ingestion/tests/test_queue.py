@@ -8,10 +8,19 @@ from backend.ingestion.task_queue import (
     LocalInMemoryDriver,
     get_queue_driver,
 )
+import backend.ingestion.task_queue as task_queue_mod
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.models import ParsedEpisode, FeedParseResult, ParsedFeedMetadata
 from backend.persistence.models.feed import Feed
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
+
+
+@pytest.fixture(autouse=True)
+def _fresh_driver_cache():
+    """Each test gets a hermetic driver-singleton cache (XIN-40)."""
+    task_queue_mod._DRIVERS.clear()
+    yield
+    task_queue_mod._DRIVERS.clear()
 
 
 @pytest.mark.asyncio
@@ -245,6 +254,8 @@ async def test_gcp_enqueue_with_mock_client(monkeypatch):
         location="l",
         queue_name="q",
         target_url="https://worker.example.com/hook",
+        # XIN-77: OIDC is required for non-localhost webhook URLs.
+        service_account_email="sa@example.iam.gserviceaccount.com",
     )
     driver._client = fake
 
@@ -261,8 +272,115 @@ async def test_gcp_enqueue_with_mock_client(monkeypatch):
     assert "schedule_time" not in fake.requests[1]["task"]
 
 
-def test_get_queue_driver_factory():
+def test_get_queue_driver_factory(monkeypatch):
+    # XIN-77: constructing the GCP driver is fail-closed — the factory can
+    # only build it with a securely configured webhook URL.
+    monkeypatch.setenv("WORKER_WEBHOOK_URL", "https://worker.example.com/hook")
+    monkeypatch.setenv(
+        "GCP_SERVICE_ACCOUNT_EMAIL", "sa@example.iam.gserviceaccount.com"
+    )
     assert isinstance(get_queue_driver("gcp"), GCPCloudTasksDriver)
     assert isinstance(get_queue_driver("local"), LocalInMemoryDriver)
     with pytest.raises(ValueError, match="Unknown TASK_QUEUE_DRIVER"):
         get_queue_driver("bogus")
+
+
+# ---------------------------------------------------------------------------
+# XIN-40: handler contract is real on the local driver, fail-fast on GCP;
+# driver singletons share one lifecycle.
+# XIN-77: GCP driver URL validation is fail-closed.
+# ---------------------------------------------------------------------------
+
+
+def test_driver_singletons_cached_consistently(monkeypatch):
+    """XIN-40: both drivers share the same singleton lifecycle."""
+    monkeypatch.setenv("WORKER_WEBHOOK_URL", "https://worker.example.com/hook")
+    monkeypatch.setenv(
+        "GCP_SERVICE_ACCOUNT_EMAIL", "sa@example.iam.gserviceaccount.com"
+    )
+    assert get_queue_driver("local") is get_queue_driver("local")
+    assert get_queue_driver("gcp") is get_queue_driver("gcp")
+    # Explicit selection and env selection resolve to the same instance.
+    monkeypatch.setenv("TASK_QUEUE_DRIVER", "gcp")
+    assert get_queue_driver() is get_queue_driver("gcp")
+
+
+@pytest.mark.asyncio
+async def test_local_handler_register_get_round_trip():
+    """XIN-40: register_handler/get_handler are a real registry locally."""
+    driver = LocalInMemoryDriver()
+
+    async def handler(payload):
+        return payload
+
+    assert driver.get_handler("PROCESS_EPISODE") is None
+    driver.register_handler("PROCESS_EPISODE", handler)
+    assert driver.get_handler("PROCESS_EPISODE") is handler
+
+    # And the registered handler actually fires through process_next.
+    await driver.enqueue("PROCESS_EPISODE", {"episode_id": "ep-rt"})
+    record = await driver.process_next()
+    assert record["result"] == {"episode_id": "ep-rt"}
+
+
+def _gcp_driver(**kwargs):
+    kwargs.setdefault("project_id", "p")
+    kwargs.setdefault("location", "l")
+    kwargs.setdefault("queue_name", "q")
+    return GCPCloudTasksDriver(**kwargs)
+
+
+def test_gcp_driver_rejects_handler_registration():
+    """XIN-40: in-process dispatch can never work on the GCP driver — it must
+    fail fast instead of silently dropping the handler."""
+    driver = _gcp_driver(
+        target_url="https://worker.example.com/hook",
+        service_account_email="sa@example.iam.gserviceaccount.com",
+    )
+
+    async def handler(payload):
+        return payload
+
+    with pytest.raises(NotImplementedError, match="in-process"):
+        driver.register_handler("PROCESS_EPISODE", handler)
+    with pytest.raises(NotImplementedError, match="in-process"):
+        driver.get_handler("PROCESS_EPISODE")
+
+
+def test_gcp_driver_refuses_default_localhost_without_opt_in(monkeypatch):
+    """XIN-77: the default plaintext-http localhost target is refused unless
+    explicitly opted in."""
+    monkeypatch.delenv("WORKER_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("TASK_QUEUE_ALLOW_INSECURE_LOCAL", raising=False)
+    with pytest.raises(ValueError, match="TASK_QUEUE_ALLOW_INSECURE_LOCAL"):
+        _gcp_driver()
+
+
+def test_gcp_driver_allows_localhost_with_explicit_opt_in(monkeypatch):
+    """XIN-77: the opt-in env makes the dev-localhost default constructible."""
+    monkeypatch.delenv("WORKER_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("TASK_QUEUE_ALLOW_INSECURE_LOCAL", "1")
+    driver = _gcp_driver()
+    assert driver.target_url == "http://localhost:8000/api/worker/process-episode"
+
+
+def test_gcp_driver_rejects_plaintext_remote_url(monkeypatch):
+    """XIN-77: non-localhost webhook URLs must use https."""
+    monkeypatch.setenv("TASK_QUEUE_ALLOW_INSECURE_LOCAL", "1")
+    with pytest.raises(ValueError, match="https"):
+        _gcp_driver(target_url="http://worker.example.com/hook")
+
+
+def test_gcp_driver_requires_oidc_for_remote_url():
+    """XIN-77: non-localhost webhook URLs require OIDC auth."""
+    with pytest.raises(ValueError, match="GCP_SERVICE_ACCOUNT_EMAIL"):
+        _gcp_driver(target_url="https://worker.example.com/hook")
+
+
+def test_gcp_driver_accepts_https_with_oidc():
+    """XIN-77: https + service account is the happy path."""
+    driver = _gcp_driver(
+        target_url="https://worker.example.com/hook",
+        service_account_email="sa@example.iam.gserviceaccount.com",
+    )
+    assert driver.target_url == "https://worker.example.com/hook"

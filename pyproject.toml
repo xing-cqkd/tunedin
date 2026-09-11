@@ -1,0 +1,37 @@
+# XIN-73: lint and type-check configuration.
+#
+# This file is inert for packaging (no [project]/[build-system] sections);
+# installs still come from backend/requirements.txt. It exists so
+# `ruff check` / `mypy` can be run with repo-wide defaults:
+#
+#   pip install ruff mypy
+#   ruff check backend
+#   mypy backend
+#
+# Codebase style standard (XIN-73): prefer builtin generics
+# (list/dict/tuple/set, X | None) over typing.List/typing.Dict/typing.Tuple;
+# UP006/UP007 enforce this. Existing violations live in backend/ingestion/
+# and backend/persistence/, which are owned by other cleanup batches and
+# were intentionally left for them; only unowned files were normalized.
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# E: pycodestyle errors, F: pyflakes, I: isort, UP: pyupgrade
+# (flags typing.List/Dict/Tuple -> builtin generics), N: pep8-naming,
+# B: flake8-bugbear
+select = ["E", "F", "I", "UP", "N", "B"]
+ignore = ["E501"]  # line length is advisory; no formatter run yet
+
+[tool.ruff.lint.isort]
+known-first-party = ["backend"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+# Incremental adoption: strictness stays off so the many untyped defs the
+# review flagged (XIN-73) don't fail a first run. Tighten per-module
+# (e.g. disallow_untyped_defs) as batches finish their files.

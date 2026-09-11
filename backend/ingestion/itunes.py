@@ -1,8 +1,8 @@
-import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Union
 import httpx
 
+from backend.ingestion.http_util import get_with_retry, maybe_client
 from backend.ingestion.models import Podcast, PodcastSearchResult
 
 logger = logging.getLogger(__name__)
@@ -36,65 +36,25 @@ class ITunesSearchClient:
             "Accept": "application/json, text/javascript, */*",
         }
 
-    async def _backoff(self, attempt: int, reason: str) -> None:
-        """Sleep with exponential backoff, logging the reason (XIN-129)."""
-        backoff = (2 ** attempt) * 0.5
-        logger.warning(
-            "%s Retrying in %.2fs (attempt %d/%d)...",
-            reason,
-            backoff,
-            attempt + 1,
-            self.max_retries,
-        )
-        await asyncio.sleep(backoff)
-
     async def _get_with_retry(
         self,
         url: str,
         params: Optional[Dict[str, Any]] = None,
         client: Optional[httpx.AsyncClient] = None,
     ) -> httpx.Response:
-        """Execute GET request with exponential backoff on HTTP 429 / 5xx responses."""
-        close_client = False
-        if client is None:
-            client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=True)
-            close_client = True
+        """Execute GET request with exponential backoff on HTTP 429 / 5xx responses.
 
-        headers = self._get_headers()
-        try:
-            for attempt in range(self.max_retries + 1):
-                try:
-                    response = await client.get(url, params=params, headers=headers)
-                    if response.status_code == 429 and attempt < self.max_retries:
-                        await self._backoff(
-                            attempt,
-                            "Received HTTP 429 Rate Limit from iTunes API.",
-                        )
-                        continue
-                    response.raise_for_status()
-                    return response
-                except httpx.HTTPStatusError as err:
-                    if err.response.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                        await self._backoff(
-                            attempt,
-                            f"HTTP {err.response.status_code} error from iTunes API.",
-                        )
-                        continue
-                    raise
-                except (httpx.ConnectError, httpx.TimeoutException) as err:
-                    if attempt < self.max_retries:
-                        await self._backoff(
-                            attempt,
-                            f"Network error contacting iTunes API ({err}).",
-                        )
-                        continue
-                    raise
-            # The loop above is exhaustive: every iteration returns, retries
-            # (only when attempt < max_retries), or raises — so control never
-            # reaches here. (The old unreachable tail was deleted, XIN-129.)
-        finally:
-            if close_client:
-                await client.aclose()
+        XIN-49/XIN-56: delegates to the shared client lifecycle and retry
+        helper in ``backend.ingestion.http_util``.
+        """
+        async with maybe_client(client, timeout=self.timeout) as c:
+            return await get_with_retry(
+                c,
+                url,
+                params=params,
+                headers=self._get_headers(),
+                max_retries=self.max_retries,
+            )
 
     async def search_podcasts(
         self,
