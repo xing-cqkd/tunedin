@@ -178,17 +178,37 @@ async def test_run_crawl_explicit_topics(
 
 
 @pytest.mark.asyncio
-async def test_run_sync_only(fake_crawler_cls, monkeypatch):
+async def test_run_sync_only(monkeypatch):
+    """run_sync_only is a thin entry point over FeedSyncOrchestrator (XIN-38)."""
     monkeypatch.setattr(cli, "init_db", AsyncMock())
     show_status_mock = AsyncMock()
     monkeypatch.setattr(cli, "show_status", show_status_mock)
 
+    created = {}
+
+    class _FakeOrchestrator:
+        def __init__(self, sync_service=None, policy=None, **kwargs):
+            created["sync_service"] = sync_service
+            created["policy"] = policy
+
+        async def run(self):
+            return {
+                "total_feeds_processed": 2,
+                "total_synced": 2,
+                "total_episodes_saved": 9,
+                "failed_count": 0,
+                "failed_feed_ids": [],
+                "skipped_backoff": 0,
+            }
+
+    monkeypatch.setattr(cli, "FeedSyncOrchestrator", _FakeOrchestrator)
+
     await cli.run_sync_only(concurrency=3, max_feeds=7)
 
-    crawler = fake_crawler_cls["instance"]
-    assert crawler.calls == [
-        ("sync_episodes_concurrently", {"concurrency": 3, "max_feeds": 7})
-    ]
+    policy = created["policy"]
+    assert policy.concurrency == 3
+    assert policy.max_feeds == 7
+    assert isinstance(created["sync_service"], cli.FeedSyncService)
     show_status_mock.assert_awaited_once()
 
 

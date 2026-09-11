@@ -10,7 +10,8 @@ from backend.ingestion.discovery import DiscoveryService
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedFeedMetadata, Podcast
 from backend.ingestion.parser import PodcastFeedParser
-from backend.ingestion.service import FeedSyncService, _error_retry_due
+from backend.ingestion.service import FeedSyncService
+from backend.ingestion.orchestration import error_retry_due
 from backend.ingestion.task_queue.local import LocalInMemoryDriver
 from backend.insights import pipeline as insight_pipeline
 from backend.persistence.models.base import Base
@@ -521,11 +522,11 @@ class TestErrorRetryPolicy:
         """An errored feed past the max attempt count is never retried."""
         from unittest.mock import AsyncMock, patch
 
-        from backend.ingestion import service as service_module
+        from backend.ingestion import orchestration as orchestration_module
 
         feed = await in_memory_store.feeds.save(
             self._make_error_feed(
-                error_count=service_module.ERROR_RETRY_MAX_ATTEMPTS,
+                error_count=orchestration_module.ERROR_RETRY_MAX_ATTEMPTS,
                 last_fetched_ago_seconds=30 * 24 * 3600,
             )
         )
@@ -1081,7 +1082,7 @@ class TestBatchSyncResilience:
             error_count=1,
             last_fetched_at=datetime(2026, 1, 1),  # naive
         )
-        assert _error_retry_due(feed, datetime.now(timezone.utc)) is True
+        assert error_retry_due(feed, datetime.now(timezone.utc)) is True
 
     @pytest.mark.asyncio
     async def test_list_error_due_retry_includes_null_last_fetched_at(

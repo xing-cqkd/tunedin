@@ -294,7 +294,7 @@ class TestCrawlerRobustness:
             )
         await in_memory_session.commit()
 
-        async def fake_sync(store, feed_id, auto_queue_episodes=0):
+        async def fake_sync(store, feed_id, client=None, auto_queue_episodes=0):
             feed = await store.feeds.get_by_id(feed_id)
             if "w1.example.com" in feed.rss_url:
                 raise RuntimeError("sync boom")
