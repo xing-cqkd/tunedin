@@ -284,6 +284,34 @@ def _task_log_item(row: Dict[str, Any]) -> dict:
     )
 
 
+def _feed_template_item(row: Dict[str, Any]) -> dict:
+    return _model_item(
+        models.FeedTemplateRecord,
+        row,
+        keys.feed_template_keys(
+            row["template_id"],
+            feed_id=row["feed_id"],
+            episode_type=row.get("episode_type") or "full",
+            rev=row["rev"],
+            created_at=row.get("created_at"),
+        ),
+        codec.TYPE_FEED_TEMPLATE,
+    )
+
+
+def _drift_decision_item(row: Dict[str, Any]) -> dict:
+    return _model_item(
+        models.DriftDecision,
+        row,
+        keys.drift_decision_keys(
+            row["decision_id"],
+            feed_id=row["feed_id"],
+            created_at=row.get("created_at"),
+        ),
+        codec.TYPE_DRIFT_DECISION,
+    )
+
+
 # table name -> item builder (one item per row, except episodes below).
 _ITEM_BUILDERS: Dict[str, Callable[[Dict[str, Any]], dict]] = {
     "feeds": _feed_item,
@@ -296,6 +324,8 @@ _ITEM_BUILDERS: Dict[str, Callable[[Dict[str, Any]], dict]] = {
     "playlist_episodes": _playlist_episode_link_item,
     "user_episode_progress": _progress_item,
     "task_logs": _task_log_item,
+    "feed_templates": _feed_template_item,
+    "drift_decisions": _drift_decision_item,
 }
 
 
@@ -365,6 +395,8 @@ _READ_SPECS: Dict[str, tuple] = {
     ),
     "user_episode_progress": (models.UserEpisodeProgress, codec.TYPE_PROGRESS, _model_row),
     "task_logs": (models.TaskLog, codec.TYPE_TASK_LOG, _model_row),
+    "feed_templates": (models.FeedTemplateRecord, codec.TYPE_FEED_TEMPLATE, _model_row),
+    "drift_decisions": (models.DriftDecision, codec.TYPE_DRIFT_DECISION, _model_row),
 }
 
 

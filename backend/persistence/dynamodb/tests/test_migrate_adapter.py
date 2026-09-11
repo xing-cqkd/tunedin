@@ -42,6 +42,8 @@ _PK_COLUMNS = {
     "playlist_episodes": ("playlist_id", "episode_id"),
     "user_episode_progress": ("user_id", "episode_id"),
     "task_logs": ("task_log_id",),
+    "feed_templates": ("template_id",),
+    "drift_decisions": ("decision_id",),
 }
 
 
@@ -177,6 +179,44 @@ def _seed_rows() -> Dict[str, List[Dict[str, Any]]]:
                 "task_log_id": uuid4(),
                 "task_type": "sync",
                 "status": "done",
+                "created_at": now,
+            },
+        ],
+        "feed_templates": [
+            {
+                "template_id": uuid4(),
+                "feed_id": f1,
+                "episode_type": "full",
+                "rev": 1,
+                "labeler_version": "crude-0",
+                "template_json": '{"slots": []}',
+                "confidence": 0.9,
+                "learned_from": ["e1", "e2"],
+                "notes": None,
+                "created_at": now,
+            },
+            {
+                "template_id": uuid4(),
+                "feed_id": f1,
+                "episode_type": "full",
+                "rev": 2,
+                "labeler_version": "crude-0",
+                "template_json": '{"slots": []}',
+                "confidence": 0.95,
+                "learned_from": ["e1", "e2", "e3"],
+                "notes": "agent: v2",
+                "created_at": now,
+            },
+        ],
+        "drift_decisions": [
+            {
+                "decision_id": uuid4(),
+                "feed_id": f1,
+                "episode_type": "full",
+                "template_rev": 1,
+                "decision": "one_off",
+                "rationale": "live crossover episode, keep v1",
+                "decided_by": "agent",
                 "created_at": now,
             },
         ],

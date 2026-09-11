@@ -30,7 +30,7 @@ from alembic.config import Config
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ALEMBIC_INI = str(REPO_ROOT / "backend" / "alembic.ini")
 
-HEAD = "2529fed59a29"  # current chain head (XIN-44/XIN-45 task-log outbox + feed URL canonicalization)
+HEAD = "9f2b7c4e1a83"  # current chain head (XIN-136 feed_templates + drift_decisions)
 GUID_MIGRATION_DOWN = "9e2f3a4b5c6d"  # revision before the XIN-68 migration
 CANON_MIGRATION_DOWN = "0f3a4b5c6d7e"  # revision before the XIN-44/XIN-45 migration
 TEXT_MIGRATION_DOWN = "8d1e2f3a4b5c"  # revision before the XIN-47 migration

@@ -19,11 +19,12 @@ codec stays correct if model columns are added later.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Type
 from uuid import UUID, uuid4
 
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
-from sqlalchemy import Boolean, DateTime, Integer, Uuid
+from sqlalchemy import Boolean, DateTime, Float, Integer, Uuid
 
 from backend.persistence import models
 from backend.persistence import validation
@@ -50,6 +51,8 @@ TYPE_RSS_URL_CLAIM = "rss_url_claim"
 TYPE_EMAIL_CLAIM = "email_claim"
 TYPE_PROGRESS = "progress"
 TYPE_TASK_LOG = "task_log"
+TYPE_FEED_TEMPLATE = "feed_template"
+TYPE_DRIFT_DECISION = "drift_decision"
 
 
 def _now() -> datetime:
@@ -134,6 +137,10 @@ def _serialize_value(value: Any) -> Any:
         value = keys.iso_timestamp(value)
     elif isinstance(value, UUID):
         value = str(value)
+    elif isinstance(value, float):
+        # DynamoDB has no float type; store as Decimal via str() to avoid
+        # binary float artifacts (Decimal(0.1) != Decimal("0.1")).
+        value = Decimal(str(value))
     return _SER.serialize(value)
 
 
@@ -182,6 +189,8 @@ def item_to_model(model_cls: Type[Any], item: dict) -> Any:
             value = UUID(str(value))
         elif isinstance(column.type, Integer) and value is not None:
             value = int(value)
+        elif isinstance(column.type, Float) and value is not None:
+            value = float(value)
         elif isinstance(column.type, Boolean) and value is not None:
             value = bool(value)
         kwargs[name] = value

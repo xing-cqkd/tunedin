@@ -6,6 +6,7 @@ from backend.persistence.models.tag import Tag, EpisodeTag
 from backend.persistence.models.insight import Insight
 from backend.persistence.models.playlist import CuratedPlaylist, PlaylistEpisode
 from backend.persistence.models.task_log import TaskLog
+from backend.persistence.models.feed_template import DriftDecision, FeedTemplateRecord
 
 __all__ = [
     "Base",
@@ -19,4 +20,6 @@ __all__ = [
     "CuratedPlaylist",
     "PlaylistEpisode",
     "TaskLog",
+    "DriftDecision",
+    "FeedTemplateRecord",
 ]
