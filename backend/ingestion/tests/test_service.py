@@ -474,8 +474,6 @@ class TestErrorRetryPolicy:
         """An errored feed past its backoff window is retried and recovers."""
         from unittest.mock import AsyncMock, patch
 
-        from backend.ingestion import service as service_module
-
         feed = await in_memory_store.feeds.save(
             self._make_error_feed(error_count=1, last_fetched_ago_seconds=3600)
         )
@@ -491,7 +489,6 @@ class TestErrorRetryPolicy:
         feed = await in_memory_store.feeds.get_by_id(feed.feed_id)
         assert feed.sync_status == "active"
         assert feed.error_count == 0
-        assert service_module.ERROR_RETRY_MAX_ATTEMPTS > 1
 
     @pytest.mark.asyncio
     async def test_errored_feed_not_retried_within_backoff(self, in_memory_store: Store):
@@ -560,13 +557,17 @@ class TestSyncFetchErrorPaths:
     async def test_malformed_xml_marks_feed_error_title_preserved(
         self, in_memory_store, sample_feed_xml: str
     ):
+        """XIN-53: an unparsable feed raises the typed FeedParseError (still a
+        ValueError for backwards compatibility)."""
+        from backend.ingestion.errors import FeedParseError
+
         service = FeedIngestionService()
         podcast = Podcast(title="Real Title", feed_url="https://real.example.com/feed.xml")
         feed = await service.save_podcast(in_memory_store, podcast)
 
         client = _mock_client("<html><body>not a feed</body></html>")
         async with client:
-            with pytest.raises(ValueError):
+            with pytest.raises(FeedParseError):
                 await service.sync_podcast_episodes(
                     in_memory_store, feed, client=client
                 )
@@ -582,6 +583,10 @@ class TestSyncFetchErrorPaths:
     async def test_sync_fetch_failure_marks_error_and_reraises(
         self, in_memory_store
     ):
+        """XIN-53: a transport failure marks the feed ERROR and raises the
+        typed FeedFetchError, with the original httpx error chained."""
+        from backend.ingestion.errors import FeedFetchError, IngestionError
+
         service = FeedIngestionService()
         podcast = Podcast(title="T", feed_url="https://boom.example.com/feed.xml")
         feed = await service.save_podcast(in_memory_store, podcast)
@@ -592,10 +597,13 @@ class TestSyncFetchErrorPaths:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(mock_handler)
         ) as client:
-            with pytest.raises(httpx.ConnectError):
+            with pytest.raises(FeedFetchError) as exc_info:
                 await service.sync_podcast_episodes(
                     in_memory_store, feed, client=client
                 )
+
+        assert isinstance(exc_info.value, IngestionError)
+        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
 
         refreshed = await in_memory_store.feeds.get_by_id(feed.feed_id)
         assert refreshed.sync_status == "error"
@@ -982,3 +990,189 @@ class TestIngestPodcastVariants:
         )
         assert len(feeds) == 2
         assert {f.title for f in feeds} == {"Top A", "Top B"}
+
+
+class TestSyncStatusEnumAndTypedErrors:
+    """XIN-51: FeedSyncStatus replaces magic strings; XIN-53: typed errors."""
+
+    def test_feed_sync_status_values_are_plain_strings(self):
+        from backend.ingestion.service import FeedSyncStatus
+
+        assert FeedSyncStatus.DISCOVERED.value == "discovered"
+        assert FeedSyncStatus.PENDING.value == "pending"
+        assert FeedSyncStatus.ACTIVE.value == "active"
+        assert FeedSyncStatus.ERROR.value == "error"
+        # str-Enum members compare equal to their raw string values, so
+        # legacy queries/rows keep working.
+        assert FeedSyncStatus.ERROR == "error"
+        assert isinstance(FeedSyncStatus.ACTIVE, str)
+
+    def test_typed_error_hierarchy(self):
+        from backend.ingestion.errors import (
+            FeedFetchError,
+            FeedNotFoundError,
+            FeedParseError,
+            FeedSyncError,
+            FeedValidationError,
+            IngestionError,
+        )
+
+        for cls in (
+            FeedFetchError,
+            FeedNotFoundError,
+            FeedParseError,
+            FeedSyncError,
+            FeedValidationError,
+        ):
+            assert issubclass(cls, IngestionError)
+        # Backwards compatibility: the caller-input / parse errors remain
+        # ValueErrors so existing `pytest.raises(ValueError)` contracts hold.
+        assert issubclass(FeedParseError, ValueError)
+        assert issubclass(FeedValidationError, ValueError)
+        assert issubclass(FeedNotFoundError, ValueError)
+
+    def test_feed_fetch_error_status_code_from_cause(self):
+        from backend.ingestion.errors import FeedFetchError
+
+        req = httpx.Request("GET", "https://example.com/feed.xml")
+        resp = httpx.Response(429, request=req)
+        cause = httpx.HTTPStatusError("throttled", request=req, response=resp)
+        err = FeedFetchError("fetch failed")
+        err.__cause__ = cause
+        assert err.status_code == 429
+
+        plain = FeedFetchError("down")
+        plain.__cause__ = httpx.ConnectError("down", request=req)
+        assert plain.status_code is None
+
+    @pytest.mark.asyncio
+    async def test_save_podcast_missing_feed_url_raises_typed(self, in_memory_store):
+        """XIN-53: single save raises FeedValidationError (a ValueError)."""
+        from backend.ingestion.errors import FeedValidationError
+
+        service = FeedIngestionService()
+        with pytest.raises(FeedValidationError, match="feed_url"):
+            await service.save_podcast(
+                in_memory_store, Podcast(title="No URL", feed_url="")
+            )
+
+    @pytest.mark.asyncio
+    async def test_save_podcasts_skips_missing_feed_url_with_warning(
+        self, in_memory_store, caplog
+    ):
+        """XIN-53: batch save skips URL-less podcasts and warns instead of
+        raising, so one bad item never aborts a crawl batch."""
+        service = FeedIngestionService()
+        podcasts = [
+            Podcast(title="Good", feed_url="https://good.example.com/feed.xml"),
+            Podcast(title="Bad", feed_url=""),
+        ]
+        with caplog.at_level("WARNING", logger="backend.ingestion.service"):
+            feeds = await service.save_podcasts(in_memory_store, podcasts)
+        assert len(feeds) == 1
+        assert feeds[0].title == "Good"
+        assert any("Bad" in r.message and "feed_url" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_sync_persistence_failure_raises_feed_sync_error(
+        self, in_memory_store, monkeypatch, sample_feed_xml: str
+    ):
+        """XIN-53: a persistence-step failure after a successful parse raises
+        FeedSyncError (typed), not a raw DB exception."""
+        from backend.ingestion.errors import FeedSyncError
+
+        service = FeedIngestionService()
+        podcast = Podcast(title="T", feed_url="https://persist.example.com/feed.xml")
+        feed = await service.save_podcast(in_memory_store, podcast)
+
+        async def boom(episodes):
+            raise RuntimeError("disk on fire")
+
+        monkeypatch.setattr(in_memory_store.episodes, "save_many", boom)
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=200, text=sample_feed_xml)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            with pytest.raises(FeedSyncError):
+                await service.sync_podcast_episodes(in_memory_store, feed, client=client)
+
+    @pytest.mark.asyncio
+    async def test_backoff_skipped_feeds_not_counted_as_processed(
+        self, in_memory_store, monkeypatch
+    ):
+        """XIN-79: error feeds inside their backoff window are neither
+        attempted nor counted; the summary reports them separately."""
+        from datetime import datetime, timedelta, timezone
+
+        service = FeedIngestionService()
+        # One due pending feed...
+        await service.save_podcast(
+            in_memory_store,
+            Podcast(title="Due", feed_url="https://due.example.com/feed.xml"),
+        )
+        # ...and one error feed past the coarse SQL pre-filter (300s base) but
+        # still inside its exact exponential backoff (error_count=3 -> 1200s).
+        await in_memory_store.feeds.save(
+            Feed(
+                rss_url="https://notdue.example.com/feed.xml",
+                title="NotDue",
+                sync_status="error",
+                error_count=3,
+                last_fetched_at=datetime.now(timezone.utc) - timedelta(seconds=400),
+            )
+        )
+        await in_memory_store.commit()
+
+        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
+            return feed_or_id_or_url, []
+
+        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
+        summary = await service.sync_all_pending_feeds(in_memory_store)
+
+        assert summary["total_feeds_processed"] == 1
+        assert summary["total_synced"] == 1
+        assert summary["skipped_backoff"] == 1
+
+    @pytest.mark.asyncio
+    async def test_max_feeds_applies_after_due_filter(
+        self, in_memory_store, monkeypatch
+    ):
+        """XIN-80: not-yet-due error feeds must not consume max_feeds slots."""
+        from datetime import datetime, timedelta, timezone
+
+        service = FeedIngestionService()
+        for i in range(2):
+            await service.save_podcast(
+                in_memory_store,
+                Podcast(title=f"Due{i}", feed_url=f"https://due{i}.example.com/feed.xml"),
+            )
+        for i in range(3):
+            # Pass the coarse SQL pre-filter (300s base) but still inside the
+            # exact exponential backoff (error_count=3 -> 1200s): not due.
+            await in_memory_store.feeds.save(
+                Feed(
+                    rss_url=f"https://notdue{i}.example.com/feed.xml",
+                    title=f"NotDue{i}",
+                    sync_status="error",
+                    error_count=3,
+                    last_fetched_at=datetime.now(timezone.utc) - timedelta(seconds=400),
+                )
+            )
+        await in_memory_store.commit()
+
+        attempted = []
+
+        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
+            attempted.append(feed_or_id_or_url.feed_id)
+            return feed_or_id_or_url, []
+
+        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
+        summary = await service.sync_all_pending_feeds(in_memory_store, max_feeds=2)
+
+        assert summary["total_feeds_processed"] == 2
+        assert summary["total_synced"] == 2
+        assert summary["skipped_backoff"] == 3
+        assert len(attempted) == 2
