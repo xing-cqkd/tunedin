@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import String, Text, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, Uuid
+from sqlalchemy import Index, String, Text, DateTime, Integer, Boolean, ForeignKey, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.persistence.models.base import Base
 
@@ -16,6 +16,9 @@ class Episode(Base):
     __tablename__ = "episodes"
     __table_args__ = (
         UniqueConstraint("feed_id", "guid", name="uq_episode_feed_guid"),
+        # XIN-46: get_unprocessed_episodes filters on (feed_id, processed);
+        # the composite index keeps it off full table scans at scale.
+        Index("ix_episodes_feed_processed", "feed_id", "processed"),
     )
 
     episode_id: Mapped[uuid.UUID] = mapped_column(
@@ -29,9 +32,17 @@ class Episode(Base):
         nullable=False,
         index=True
     )
-    guid: Mapped[Optional[str]] = mapped_column(String(512), nullable=True, index=True)
-    title: Mapped[str] = mapped_column(String(512), nullable=False)
-    audio_url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # XIN-68: never null. The (feed_id, guid) dedup unique constraint treats
+    # NULLs as distinct, so a nullable guid would permit unlimited
+    # (feed_id, NULL) duplicates and re-insertion on every sync. The parser
+    # already guarantees a non-empty guid; legacy NULLs were backfilled with
+    # a deterministic fallback in migration 0f3a4b5c6d7e.
+    guid: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    # XIN-47: real-world podcast titles and enclosure URLs routinely exceed
+    # the old String(512)/String(1024) caps, which raise DataError on
+    # Postgres instead of truncating. Text is unbounded on both dialects.
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    audio_url: Mapped[str] = mapped_column(Text, nullable=False)
     duration: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

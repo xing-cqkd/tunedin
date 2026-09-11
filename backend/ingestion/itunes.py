@@ -8,6 +8,55 @@ from backend.ingestion.models import Podcast, PodcastSearchResult
 logger = logging.getLogger(__name__)
 
 
+def podcast_from_itunes(data: Dict[str, Any]) -> Podcast:
+    """Build a provider-neutral :class:`Podcast` from iTunes Search/Lookup API JSON.
+
+    Moved here from ``Podcast.from_itunes`` (XIN-64): provider-specific
+    parsing belongs in the provider module, not in the domain model.
+    The Apple collection id and Apple Podcasts page land in the generic
+    ``provider_id`` / ``external_url`` fields with ``provider="itunes"``.
+    """
+    collection_id = data.get("collectionId") or data.get("trackId")
+    title = data.get("collectionName") or data.get("trackName") or "Untitled Show"
+    feed_url = data.get("feedUrl", "")
+    author = data.get("artistName")
+    artwork_url = data.get("artworkUrl600") or data.get("artworkUrl100")
+    primary_genre = data.get("primaryGenreName")
+    genres = data.get("genres", [])
+    if isinstance(genres, list):
+        genres_list = [str(g) for g in genres]
+    else:
+        genres_list = [str(genres)] if genres else []
+
+    episode_count = data.get("trackCount")
+    country = data.get("country")
+    external_url = data.get("collectionViewUrl") or data.get("trackViewUrl")
+
+    release_date = None
+    raw_date = data.get("releaseDate")
+    if raw_date:
+        try:
+            from dateutil import parser as dt_parser
+            release_date = dt_parser.parse(raw_date)
+        except Exception:
+            pass
+
+    return Podcast(
+        title=title,
+        feed_url=feed_url,
+        author=author,
+        artwork_url=artwork_url,
+        primary_genre=primary_genre,
+        genres=genres_list,
+        episode_count=episode_count,
+        country=country,
+        release_date=release_date,
+        provider="itunes",
+        provider_id=str(collection_id) if collection_id is not None else None,
+        external_url=external_url,
+    )
+
+
 class ITunesSearchClient:
     """
     Asynchronous client for podcast discovery via Apple Podcasts (iTunes Search & Lookup API
@@ -99,7 +148,7 @@ class ITunesSearchClient:
             if min_episodes is not None and (track_count is None or track_count < min_episodes):
                 continue
 
-            podcasts.append(Podcast.from_itunes(item))
+            podcasts.append(podcast_from_itunes(item))
 
         return podcasts
 
@@ -178,7 +227,7 @@ class ITunesSearchClient:
         for item in results:
             feed_url = item.get("feedUrl")
             if feed_url and feed_url.strip():
-                podcasts.append(Podcast.from_itunes(item))
+                podcasts.append(podcast_from_itunes(item))
 
         return podcasts
 
@@ -221,7 +270,7 @@ class ITunesSearchClient:
 
         # Maintain chart ordering
         podcast_map = {
-            str(p.itunes_id): p for p in resolved_podcasts if p.itunes_id is not None
+            str(p.provider_id): p for p in resolved_podcasts if p.provider_id is not None
         }
         ordered_podcasts: List[Podcast] = []
         for cid in collection_ids:

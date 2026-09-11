@@ -16,8 +16,11 @@ class Feed(Base):
         primary_key=True,
         default=uuid.uuid4
     )
-    rss_url: Mapped[str] = mapped_column(String(1024), unique=True, nullable=False, index=True)
-    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    # XIN-47: unbounded — real feed URLs and titles exceed the old
+    # String(1024)/String(512) caps and Postgres raises DataError on
+    # overflow instead of truncating.
+    rss_url: Mapped[str] = mapped_column(Text, unique=True, nullable=False, index=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
     author: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
@@ -32,7 +35,9 @@ class Feed(Base):
     etag: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     last_modified: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     last_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    sync_status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
+    # XIN-46: sync_all_pending_feeds / batch_runner / crawler all filter
+    # Feed by sync_status; the index avoids full table scans at scale.
+    sync_status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False, index=True)
     error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(

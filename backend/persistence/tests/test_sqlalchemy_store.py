@@ -220,15 +220,17 @@ async def test_episode_save_many_returns_in_order(store):
 
 
 @pytest.mark.asyncio
-async def test_episode_list_guids_by_feed_excludes_null(store):
+async def test_episode_list_guids_by_feed_returns_all_guids(store):
+    # XIN-68: guid is NOT NULL, so every stored episode contributes its
+    # guid; list_guids_by_feed returns the full per-feed set.
     feed = await make_feed(store)
     other = await make_feed(store)
     await make_episode(store, feed, guid="keep")
-    await make_episode(store, feed, guid=None)
+    await make_episode(store, feed, guid="keep-2")
     await make_episode(store, other, guid="other")
     await store.commit()
 
-    assert await store.episodes.list_guids_by_feed(feed.feed_id) == {"keep"}
+    assert await store.episodes.list_guids_by_feed(feed.feed_id) == {"keep", "keep-2"}
 
 
 @pytest.mark.asyncio

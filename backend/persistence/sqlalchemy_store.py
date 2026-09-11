@@ -293,7 +293,7 @@ class _EpisodeRepository(EpisodeRepository):
         # WHERE clause before LIMIT, so the limit is a hard cap on matching
         # rows — the contract the DynamoDB implementation must reproduce by
         # paginating.
-        stmt = select(Episode).where(Episode.processed == False)
+        stmt = select(Episode).where(Episode.processed.is_(False))
         if feed_id is not None:
             stmt = stmt.where(Episode.feed_id == feed_id)
         stmt = stmt.order_by(Episode.published_at.desc().nullslast()).limit(limit)
@@ -312,8 +312,10 @@ class _EpisodeRepository(EpisodeRepository):
         if not episodes:
             return []
         # Within-batch dedup first: keep the first episode per
-        # (feed_id, guid), like the DynamoDB backend. Null-guid episodes
-        # cannot be deduped and are always kept.
+        # (feed_id, guid), like the DynamoDB backend. Post-XIN-68 the model
+        # enforces guid NOT NULL, so every episode is dedupable; the
+        # ``episode.guid`` guard below is only defensive for in-memory
+        # objects constructed before validation.
         seen: set[tuple[str, str]] = set()
         candidates: list[Episode] = []
         for episode in episodes:
@@ -359,7 +361,7 @@ class _EpisodeRepository(EpisodeRepository):
 
     async def count_unprocessed(self) -> int:
         res = await self._session.execute(
-            select(func.count(Episode.episode_id)).where(Episode.processed == False)
+            select(func.count(Episode.episode_id)).where(Episode.processed.is_(False))
         )
         return res.scalar_one()
 

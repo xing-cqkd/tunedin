@@ -1,14 +1,20 @@
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 
 @dataclass
 class Podcast:
     """
     Provider-agnostic domain model representing a discovered podcast show.
-    Core fields are provider-neutral, with provider-specific attributes
-    (such as iTunes / Apple Podcasts, Podcast Index, Spotify) stored as optional fields.
+
+    Core fields are provider-neutral. The generic ``provider`` /
+    ``provider_id`` / ``external_url`` triple records where the show was
+    discovered (e.g. provider="itunes", provider_id=<Apple collection id>,
+    external_url=<Apple Podcasts page>) without naming any provider in the
+    domain type itself. Provider-specific parsing lives in the provider
+    module (see ``backend/ingestion/itunes.py::podcast_from_itunes``);
+    a new provider adds a new parser, not a new field here.
     """
     title: str
     feed_url: str
@@ -24,54 +30,9 @@ class Podcast:
     release_date: Optional[datetime] = None
     provider: str = "itunes"
     provider_id: Optional[str] = None
-
-    # Provider-specific metadata (iTunes / Apple Podcasts)
-    itunes_id: Optional[int] = None
-    itunes_url: Optional[str] = None
-
-    @classmethod
-    def from_itunes(cls, data: Dict[str, Any]) -> "Podcast":
-        """Factory method to construct a Podcast instance from iTunes Search/Lookup API JSON."""
-        collection_id = data.get("collectionId") or data.get("trackId")
-        title = data.get("collectionName") or data.get("trackName") or "Untitled Show"
-        feed_url = data.get("feedUrl", "")
-        author = data.get("artistName")
-        artwork_url = data.get("artworkUrl600") or data.get("artworkUrl100")
-        primary_genre = data.get("primaryGenreName")
-        genres = data.get("genres", [])
-        if isinstance(genres, list):
-            genres_list = [str(g) for g in genres]
-        else:
-            genres_list = [str(genres)] if genres else []
-
-        episode_count = data.get("trackCount")
-        country = data.get("country")
-        itunes_url = data.get("collectionViewUrl") or data.get("trackViewUrl")
-
-        release_date = None
-        raw_date = data.get("releaseDate")
-        if raw_date:
-            try:
-                from dateutil import parser as dt_parser
-                release_date = dt_parser.parse(raw_date)
-            except Exception:
-                pass
-
-        return cls(
-            title=title,
-            feed_url=feed_url,
-            author=author,
-            artwork_url=artwork_url,
-            primary_genre=primary_genre,
-            genres=genres_list,
-            episode_count=episode_count,
-            country=country,
-            release_date=release_date,
-            provider="itunes",
-            provider_id=str(collection_id) if collection_id is not None else None,
-            itunes_id=int(collection_id) if collection_id is not None else None,
-            itunes_url=itunes_url,
-        )
+    # Provider-neutral link to the show's page on the discovery provider's
+    # site (e.g. the Apple Podcasts page for provider="itunes").
+    external_url: Optional[str] = None
 
 
 @dataclass

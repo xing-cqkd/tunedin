@@ -160,6 +160,9 @@ def _feed(rss_url: str, title: str = "Feed", **kw) -> Feed:
 
 
 def _episode(feed_id: UUID, title: str = "Episode", **kw) -> Episode:
+    # XIN-68: guid is the dedup key and NOT NULL on the SQL backend, so
+    # every fixture episode carries one unless the caller overrides it.
+    kw.setdefault("guid", f"guid-{uuid4().hex}")
     kw.setdefault("audio_url", f"https://example.com/{uuid4().hex}.mp3")
     return Episode(feed_id=feed_id, title=title, **kw)
 
@@ -367,12 +370,12 @@ class TestRepositoryConformance:
         other = await self._seed_feed(store)
         await store.episodes.save(_episode(feed.feed_id, "A", guid="g1"))
         await store.episodes.save(_episode(feed.feed_id, "B", guid="g2"))
-        await store.episodes.save(_episode(feed.feed_id, "C", guid=None))
+        await store.episodes.save(_episode(feed.feed_id, "C", guid="g3"))
         # Same guid in a different feed is a different dedup scope.
         await store.episodes.save(_episode(other.feed_id, "D", guid="g1"))
 
         guids = await store.episodes.list_guids_by_feed(feed.feed_id)
-        assert guids == {"g1", "g2"}
+        assert guids == {"g1", "g2", "g3"}
         assert await store.episodes.list_guids_by_feed(other.feed_id) == {"g1"}
         assert await store.episodes.list_guids_by_feed(uuid4()) == set()
 
@@ -534,13 +537,14 @@ class TestRepositoryConformance:
         assert await store.episodes.get_by_id(e2.episode_id) is None
         assert await store.episodes.get_by_id(e4.episode_id) is None
 
-    async def test_episode_save_many_keeps_null_guid_episodes(
+    async def test_episode_save_many_persists_distinct_guid_episodes(
         self, store: Store
     ):
-        # Episodes without guids carry no dedup key; all are persisted.
+        # XIN-68: guid is the dedup key on every backend (NOT NULL on the
+        # SQL backend), so distinct guids are all persisted.
         feed = await self._seed_feed(store)
-        e1 = _episode(feed.feed_id, "N1", guid=None)
-        e2 = _episode(feed.feed_id, "N2", guid=None)
+        e1 = _episode(feed.feed_id, "N1", guid="n1")
+        e2 = _episode(feed.feed_id, "N2", guid="n2")
         saved = await store.episodes.save_many([e1, e2])
         assert [e.episode_id for e in saved] == [e1.episode_id, e2.episode_id]
         assert await store.episodes.get_by_id(e1.episode_id) is not None

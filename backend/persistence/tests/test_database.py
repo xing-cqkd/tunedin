@@ -90,6 +90,21 @@ async def test_configure_sqlite_fk_enables_pragma(tmp_path):
         await engine.dispose()
 
 
+async def test_configure_sqlite_fk_enables_wal_and_busy_timeout(tmp_path):
+    """XIN-58: the shared SQLite listener sets WAL mode + busy timeout so
+    concurrent workers on one SQLite file don't hit 'database is locked'."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/wal.db")
+    configure_sqlite_fk(engine)
+    try:
+        async with engine.connect() as conn:
+            journal_mode = await conn.exec_driver_sql("PRAGMA journal_mode")
+            assert journal_mode.scalar() == "wal"
+            busy_timeout = await conn.exec_driver_sql("PRAGMA busy_timeout")
+            assert busy_timeout.scalar() == 5000
+    finally:
+        await engine.dispose()
+
+
 def test_get_db_is_session_scope_alias():
     # get_db is kept only as the conventional FastAPI dependency name;
     # behaviorally it is session_scope (XIN-133).

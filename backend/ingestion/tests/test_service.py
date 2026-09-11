@@ -59,7 +59,7 @@ class TestFeedIngestionModes:
             artwork_url="https://example.com/art.jpg",
             primary_genre="Health & Fitness",
             provider="itunes",
-            itunes_id=1545953110,
+            provider_id="1545953110",
         )
 
         feed = await service.save_podcast(in_memory_store, podcast)

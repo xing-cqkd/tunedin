@@ -125,7 +125,7 @@ def _seed_rows() -> Dict[str, List[Dict[str, Any]]]:
             {
                 "episode_id": e3,
                 "feed_id": f2,
-                "guid": None,
+                "guid": "guid-3",
                 "title": "Episode 3",
                 "audio_url": "https://example.com/e3.mp3",
                 "published_at": None,
@@ -280,8 +280,8 @@ async def test_migrate_simple_to_dynamodb_parity(ddb_backend, tmp_path):
         episodes = migrated["episodes"]
         assert sum(1 for e in episodes if not e["processed"]) == 2
 
-        # Spot-checked payload: episode 3 kept its NULL guid / NULL timestamp.
-        e3 = next(e for e in episodes if e["guid"] is None)
+        # Spot-checked payload: episode 3 kept its guid / NULL timestamp.
+        e3 = next(e for e in episodes if e["guid"] == "guid-3")
         assert e3["title"] == "Episode 3"
         assert e3["published_at"] is None
 
@@ -290,14 +290,14 @@ async def test_migrate_simple_to_dynamodb_parity(ddb_backend, tmp_path):
         assert len(pl_ep) == 1 and pl_ep[0]["position"] == 2
         assert len(migrated["episode_tags"]) == 2
 
-        # Guid markers were rebuilt (2 episodes have guids), never migrated.
+        # Guid markers were rebuilt (3 episodes have guids), never migrated.
         markers = sync.scan(
             TableName=DEFAULT_TABLE_NAME,
             FilterExpression="#t = :t",
             ExpressionAttributeNames={"#t": "type"},
             ExpressionAttributeValues={":t": {"S": codec.TYPE_GUID_MARKER}},
         )["Items"]
-        assert len(markers) == 2
+        assert len(markers) == 3
         claims = sync.scan(
             TableName=DEFAULT_TABLE_NAME,
             FilterExpression="#t = :t",
@@ -333,7 +333,7 @@ async def test_migrate_dynamodb_to_simple_parity(ddb_backend, tmp_path):
         # Spot check: guid survived the round trip; link payloads intact.
         episodes = {str(e["episode_id"]): e for e in round_tripped["episodes"]}
         guids = sorted(e["guid"] for e in episodes.values() if e["guid"])
-        assert guids == ["guid-1", "guid-2"]
+        assert guids == ["guid-1", "guid-2", "guid-3"]
         assert round_tripped["playlist_episodes"][0]["position"] == 2
     finally:
         await src.close()
@@ -489,6 +489,7 @@ async def test_playlist_episode_link_added_at_round_trip(ddb_backend, tmp_path):
             {
                 "episode_id": e1,
                 "feed_id": f1,
+                "guid": "e-guid",
                 "title": "E",
                 "audio_url": "https://example.com/e.mp3",
                 "processed": False,
