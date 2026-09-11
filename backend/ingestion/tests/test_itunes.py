@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import httpx
 
-from backend.ingestion.itunes import ITunesSearchClient
+from backend.ingestion.itunes import ITunesSearchClient, podcast_from_itunes
 from backend.ingestion.models import Podcast, PodcastSearchResult
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -20,12 +20,12 @@ class TestITunesPodcastModelParsing:
         data = json.loads(itunes_search_json)
         item = data["results"][0]
 
-        podcast = Podcast.from_itunes(item)
+        podcast = podcast_from_itunes(item)
 
         assert podcast.title == "Huberman Lab"
         assert podcast.author == "Scicomm Media"
         assert podcast.feed_url == "https://feeds.megaphone.fm/hubermanlab"
-        assert podcast.itunes_id == 1545953110
+        assert podcast.provider_id == "1545953110"
         assert podcast.provider == "itunes"
         assert podcast.provider_id == "1545953110"
         assert podcast.artwork_url == "https://is1-ssl.mzstatic.com/image/thumb/Podcasts116/v4/huberman_600x600.jpg"
@@ -33,8 +33,28 @@ class TestITunesPodcastModelParsing:
         assert "Health & Fitness" in podcast.genres
         assert podcast.episode_count == 210
         assert podcast.country == "USA"
-        assert podcast.itunes_url == "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?uo=4"
+        assert podcast.external_url == "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?uo=4"
         assert podcast.release_date is not None
+
+    def test_podcast_model_is_provider_neutral(self, itunes_search_json: str):
+        """XIN-64: the domain model carries no provider-specific fields;
+        provider data lives in the generic provider/provider_id/external_url
+        triple, parsed by the provider module."""
+        import dataclasses
+
+        data = json.loads(itunes_search_json)
+        podcast = podcast_from_itunes(data["results"][0])
+
+        field_names = {f.name for f in dataclasses.fields(podcast)}
+        assert "itunes_id" not in field_names
+        assert "itunes_url" not in field_names
+        assert not hasattr(podcast, "itunes_id")
+        assert not hasattr(podcast, "itunes_url")
+        assert podcast.provider == "itunes"
+        assert podcast.provider_id == "1545953110"
+        assert podcast.external_url == (
+            "https://podcasts.apple.com/us/podcast/huberman-lab/id1545953110?uo=4"
+        )
 
 
 class TestITunesSearchClient:
@@ -114,7 +134,7 @@ class TestITunesSearchClient:
             podcast = await search_client.lookup_podcast_by_id(1545953110, client=client)
 
             assert podcast is not None
-            assert podcast.itunes_id == 1545953110
+            assert podcast.provider_id == "1545953110"
             assert podcast.title == "Huberman Lab"
 
     @pytest.mark.asyncio
@@ -134,8 +154,8 @@ class TestITunesSearchClient:
             )
 
             assert len(podcasts) == 2
-            assert podcasts[0].itunes_id == 1545953110
-            assert podcasts[1].itunes_id == 1600000001
+            assert podcasts[0].provider_id == "1545953110"
+            assert podcasts[1].provider_id == "1600000001"
 
     @pytest.mark.asyncio
     async def test_get_top_podcasts_resolves_feed_urls(self, itunes_search_json: str):
@@ -164,9 +184,9 @@ class TestITunesSearchClient:
             top_podcasts = await search_client.get_top_podcasts(limit=25, country="us", client=client)
 
             assert len(top_podcasts) == 2
-            assert top_podcasts[0].itunes_id == 1545953110
+            assert top_podcasts[0].provider_id == "1545953110"
             assert top_podcasts[0].feed_url == "https://feeds.megaphone.fm/hubermanlab"
-            assert top_podcasts[1].itunes_id == 1600000001
+            assert top_podcasts[1].provider_id == "1600000001"
             assert top_podcasts[1].feed_url == "https://lexfridman.com/feed/podcast/"
 
     @pytest.mark.asyncio

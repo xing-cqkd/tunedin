@@ -93,6 +93,56 @@ async def test_episode_unique_guid_per_feed(test_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_overlength_title_and_audio_url_round_trip(test_session: AsyncSession):
+    """XIN-47: titles/URLs past the old String caps persist without DataError."""
+    feed = Feed(
+        rss_url="https://example.com/" + "u" * 2000 + ".xml",
+        title="F" * 2000,
+    )
+    test_session.add(feed)
+    await test_session.commit()
+
+    long_title = "T" * 2000
+    long_url = "https://example.com/" + "a" * 3000 + ".mp3"
+    ep = Episode(
+        feed_id=feed.feed_id,
+        guid="long-1",
+        title=long_title,
+        audio_url=long_url,
+    )
+    test_session.add(ep)
+    await test_session.commit()
+
+    res = await test_session.execute(
+        select(Episode).where(Episode.episode_id == ep.episode_id)
+    )
+    fetched = res.scalar_one()
+    assert fetched.title == long_title
+    assert fetched.audio_url == long_url
+    assert fetched.feed.title == "F" * 2000
+    assert fetched.feed.rss_url == feed.rss_url
+
+
+@pytest.mark.asyncio
+async def test_guid_is_required(test_session: AsyncSession):
+    """XIN-68: episodes.guid is NOT NULL — the (feed_id, guid) dedup holds."""
+    feed = Feed(rss_url="https://example.com/guidreq.xml", title="Guid Req")
+    test_session.add(feed)
+    await test_session.commit()
+
+    ep = Episode(
+        feed_id=feed.feed_id,
+        guid=None,
+        title="No guid",
+        audio_url="https://example.com/noguid.mp3",
+    )
+    test_session.add(ep)
+    with pytest.raises(IntegrityError):
+        await test_session.commit()
+    await test_session.rollback()
+
+
+@pytest.mark.asyncio
 async def test_insights_and_tags(test_session: AsyncSession):
     feed = Feed(rss_url="https://example.com/insights_feed.xml", title="Insights Pod")
     test_session.add(feed)
@@ -183,19 +233,29 @@ async def test_task_log(test_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_init_db_migrates_fresh_database(tmp_path, monkeypatch):
-    """XIN-32: init_db() on an empty file creates the schema via Alembic."""
-    import importlib
+    """XIN-32: init_db() on an empty file creates the schema via Alembic.
+
+    XIN-78: the engine is swapped via monkeypatch.setattr (auto-restored
+    at teardown) instead of importlib.reload — reloading while
+    monkeypatch's DATABASE_URL override is active re-binds the module to
+    the tmp URL rather than the true default, and leaks an undisposed
+    engine. monkeypatch restores the original binding for us.
+    """
     import sqlite3
 
-    db_path = tmp_path / "fresh.db"
-    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
     import backend.persistence.database as db
 
-    importlib.reload(db)
+    db_path = tmp_path / "fresh.db"
+    # init_db() drives Alembic through env.py, which builds its own engine
+    # from DATABASE_URL at migration time; the module-level engine is used
+    # only for the pre-migration inspection step.
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setattr(db, "engine", engine)
     try:
         await db.init_db()
     finally:
-        await db.engine.dispose()
+        await engine.dispose()
 
     con = sqlite3.connect(db_path)
     tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
@@ -203,31 +263,30 @@ async def test_init_db_migrates_fresh_database(tmp_path, monkeypatch):
     version = con.execute("select version_num from alembic_version").fetchone()[0]
     assert version  # stamped at head
     con.close()
-    importlib.reload(db)  # restore default engine binding
 
 
 @pytest.mark.asyncio
 async def test_init_db_stamps_legacy_create_all_database(tmp_path, monkeypatch):
-    """XIN-32: init_db() stamps (not migrates) a DB built by the old create_all path."""
-    import importlib
+    """XIN-32: init_db() stamps (not migrates) a DB built by the old create_all path.
+
+    XIN-78: same setattr-not-reload isolation as the test above.
+    """
     import sqlite3
+
+    import backend.persistence.database as db
 
     db_path = tmp_path / "legacy.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{db_path}")
-    import backend.persistence.database as db
-
-    importlib.reload(db)
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    monkeypatch.setattr(db, "engine", engine)
     try:
         await db.create_all_tables()
-        await db.engine.dispose()
-        importlib.reload(db)
         await db.init_db()  # must not fail: stamp instead of migrate
         await db.init_db()  # idempotent re-run
     finally:
-        await db.engine.dispose()
+        await engine.dispose()
 
     con = sqlite3.connect(db_path)
     version = con.execute("select version_num from alembic_version").fetchone()[0]
     assert version
     con.close()
-    importlib.reload(db)  # restore default engine binding

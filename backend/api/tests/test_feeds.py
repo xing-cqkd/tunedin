@@ -61,7 +61,9 @@ async def _seed(factory) -> dict:
                 feed_id=feed.feed_id,
                 title="Ep Two",
                 audio_url="https://example.com/audio2.m4a",
-                # duration None, explicit True, no guid/image on purpose
+                # XIN-68: guid is NOT NULL, so every seeded episode carries one.
+                guid="orig-guid-2",
+                # duration None, explicit True on purpose
                 published_at=datetime(2021, 8, 9, 12, 0, tzinfo=timezone.utc),
                 summary="Second episode summary",
                 explicit=True,
@@ -130,7 +132,7 @@ def test_feed_xml_structure_and_order(api_client):
     # Original episode GUID in the tunedin:sourceGuid extension tag.
     ns = {"tunedin": TUNEDIN_NS}
     assert items[1].find("tunedin:sourceGuid", ns).text == "orig-guid-1"
-    assert items[0].find("tunedin:sourceGuid", ns) is None  # ep2 has no guid
+    assert items[0].find("tunedin:sourceGuid", ns).text == "orig-guid-2"
 
     # Enclosures redirect to the publisher audio URL — never proxied.
     enc = [i.find("enclosure") for i in items]
@@ -673,3 +675,30 @@ def test_public_feed_endpoints_share_rate_limiter(api_client):
     assert limited.headers["retry-after"] == str(
         limited.json()["detail"]["retry_after"]
     )
+
+
+def test_source_guid_omitted_when_episode_guid_absent():
+    """XIN-68: guid is NOT NULL in the DB, but build_rss still guards the
+    extension tag — an in-memory episode with no guid renders no
+    tunedin:sourceGuid (builder-level coverage; no DB round trip)."""
+    episode = Episode(
+        feed_id=uuid4(),
+        title="Guidless Ep",
+        audio_url="https://example.com/guidless.mp3",
+        guid=None,
+    )
+    playlist = CuratedPlaylist(user_id=uuid4(), title="T")
+    entry = PlaylistEpisodeEntry(
+        episode=episode,
+        position=0,
+        added_at=datetime(2021, 1, 1, tzinfo=timezone.utc),
+    )
+    body = build_rss(
+        playlist,
+        [entry],
+        page_url="http://testserver/f/s",
+        feed_url="http://testserver/f/s/feed.xml",
+    )
+    ns = {"tunedin": TUNEDIN_NS}
+    item = _parse(body).find("channel").find("item")
+    assert item.find("tunedin:sourceGuid", ns) is None

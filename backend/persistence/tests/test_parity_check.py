@@ -75,7 +75,7 @@ def _seed_rows() -> Dict[str, List[Dict[str, Any]]]:
             {
                 "episode_id": e3,
                 "feed_id": f2,
-                "guid": None,
+                "guid": "guid-3",
                 "title": "Episode 3",
                 "audio_url": "https://example.com/e3.mp3",
                 "published_at": None,

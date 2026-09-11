@@ -58,6 +58,7 @@ async def _seed(factory) -> dict:
                 title="Ep Two",
                 audio_url="https://example.com/audio2.m4a",
                 published_at=datetime(2021, 8, 9, 12, 0, tzinfo=timezone.utc),
+                guid="orig-guid-2",
             )
         )
         pl = await store.playlists.save(
@@ -82,6 +83,7 @@ async def _add_episode(factory, feed_id, title, position, playlist_id):
                 title=title,
                 audio_url=f"https://example.com/{uuid4().hex}.mp3",
                 published_at=datetime(2022, 1, 1, tzinfo=timezone.utc),
+                guid=f"add-{uuid4().hex}",
             )
         )
         await store.playlists.add_episode(playlist_id, ep.episode_id, position)
