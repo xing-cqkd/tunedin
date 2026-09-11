@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import logging
 import pytest
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -586,3 +587,89 @@ class TestFetchAndParseErrors:
             )
         assert seen["if-none-match"] == '"etag-1"'
         assert seen["if-modified-since"] == "Mon, 24 Jan 2026 12:00:00 GMT"
+
+
+# ---------------------------------------------------------------------------
+# XIN-82: BOM-prefixed JSON detection in parse_content
+# ---------------------------------------------------------------------------
+
+
+class TestBomPrefixedJsonDetection:
+    """A leading UTF-8 BOM must not defeat parse_content's JSON sniffing."""
+
+    JSON_DOC = """{
+        "version": "https://jsonfeed.org/version/1.1",
+        "title": "BOM Cast",
+        "items": [
+            {
+                "id": "bom-ep-1",
+                "title": "BOM Episode",
+                "date_published": "2026-05-01T10:00:00Z",
+                "attachments": [
+                    {"url": "https://example.com/bom.mp3", "mime_type": "audio/mpeg"}
+                ]
+            }
+        ]
+    }"""
+
+    def _assert_parsed_as_json(self, result):
+        assert isinstance(result, FeedParseResult)
+        assert result.metadata.title == "BOM Cast"
+        assert result.total_feed_episodes == 1
+        assert len(result.episodes) == 1
+        assert result.episodes[0].guid == "bom-ep-1"
+
+    def test_bom_prefixed_json_str_is_detected(self):
+        payload = "\ufeff" + self.JSON_DOC
+        assert not payload.strip().startswith("{")  # sanity: the old check failed
+        result = PodcastFeedParser.parse_content(
+            content=payload, rss_url="https://example.com/feed.json"
+        )
+        self._assert_parsed_as_json(result)
+
+    def test_bom_prefixed_json_bytes_are_detected(self):
+        payload = b"\xef\xbb\xbf" + self.JSON_DOC.encode("utf-8")
+        assert not payload.strip().startswith(b"{")  # sanity: the old check failed
+        result = PodcastFeedParser.parse_content(
+            content=payload, rss_url="https://example.com/feed.json"
+        )
+        self._assert_parsed_as_json(result)
+
+    def test_json_without_bom_still_detected(self):
+        result = PodcastFeedParser.parse_content(
+            content=self.JSON_DOC, rss_url="https://example.com/feed.json"
+        )
+        self._assert_parsed_as_json(result)
+
+
+# ---------------------------------------------------------------------------
+# XIN-52: date-parse failures must be logged, not silently swallowed
+# ---------------------------------------------------------------------------
+
+
+class TestDateParseFailureLogging:
+    """The former `except Exception: pass` sites in the date parsers now log."""
+
+    def test_struct_time_failure_logs_and_returns_none(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.ingestion.parser"):
+            result = PodcastFeedParser.parse_published_date(
+                {"published_parsed": "garbage-struct-time"}
+            )
+        assert result is None
+        assert "struct_time" in caplog.text
+
+    def test_unparseable_date_string_logs_and_returns_none(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.ingestion.parser"):
+            result = PodcastFeedParser.parse_published_date(
+                {"published": "not a date"}
+            )
+        assert result is None
+        assert "not a date" in caplog.text
+
+    def test_unparseable_json_date_logs_and_returns_none(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="backend.ingestion.parser"):
+            result = PodcastFeedParser._parse_json_published_at(
+                {"date_published": "not a date either"}
+            )
+        assert result is None
+        assert "not a date either" in caplog.text

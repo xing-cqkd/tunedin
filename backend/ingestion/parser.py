@@ -66,8 +66,13 @@ class PodcastFeedParser:
             try:
                 ts = calendar.timegm(struct_time)
                 return datetime.fromtimestamp(ts, tz=timezone.utc)
-            except Exception:
-                pass
+            except Exception as err:
+                # XIN-52: log instead of swallowing — fall through to string parsing
+                logger.debug(
+                    "parse_published_date: struct_time conversion failed (%s); "
+                    "falling back to string parsing",
+                    err,
+                )
 
         # Fallback to string parsing
         raw_date = entry.get("published") or entry.get("pubDate") or entry.get("updated")
@@ -77,7 +82,13 @@ class PodcastFeedParser:
                 if dt.tzinfo is None:
                     return dt.replace(tzinfo=timezone.utc)
                 return dt.astimezone(timezone.utc)
-            except Exception:
+            except Exception as err:
+                # XIN-52: log the offending value instead of swallowing it
+                logger.debug(
+                    "parse_published_date: unparseable date string %r (%s)",
+                    raw_date,
+                    err,
+                )
                 return None
 
         return None
@@ -525,8 +536,13 @@ class PodcastFeedParser:
             try:
                 dt = date_parser.parse(raw_date)
                 published_at = cls._as_utc(dt)
-            except Exception:
-                pass
+            except Exception as err:
+                # XIN-52: log the offending value instead of swallowing it
+                logger.debug(
+                    "_parse_json_published_at: unparseable date string %r (%s)",
+                    raw_date,
+                    err,
+                )
         return published_at
 
     @classmethod
@@ -646,11 +662,21 @@ class PodcastFeedParser:
             )
 
         stripped = content.strip() if isinstance(content, (str, bytes)) else b""
-        if (isinstance(stripped, str) and stripped.startswith("{")) or (
-            isinstance(stripped, bytes) and stripped.startswith(b"{")
+        # A leading UTF-8 BOM defeats the "{" sniff below (str.strip() does not
+        # remove \ufeff, and bytes.strip() does not remove \xef\xbb\xbf), so a
+        # BOM-prefixed JSON payload would fall through to the XML parser.
+        # Strip exactly one BOM before sniffing, and pass the BOM-free content
+        # into the JSON path (json.loads on str rejects a leading BOM).
+        # (XIN-82)
+        if isinstance(stripped, str):
+            sniff = stripped.removeprefix("\ufeff")
+        else:
+            sniff = stripped.removeprefix(b"\xef\xbb\xbf")
+        if (isinstance(sniff, str) and sniff.startswith("{")) or (
+            isinstance(sniff, bytes) and sniff.startswith(b"{")
         ):
             return cls.parse_json_content(
-                content=content,
+                content=sniff,
                 rss_url=rss_url,
                 last_updated_at=last_updated_at,
                 known_guids=known_guids,
