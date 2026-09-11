@@ -33,7 +33,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Tuple
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import Table, func, make_url, select
 from sqlalchemy.ext.asyncio import (
@@ -129,8 +129,8 @@ def assert_distinct_backends(source: "Backend", target: "Backend") -> None:
 
 
 def reconcile_tables(
-    source_tables: List[str], target_tables: List[str]
-) -> Tuple[List[str], List[str], List[str]]:
+    source_tables: list[str], target_tables: list[str]
+) -> tuple[list[str], list[str], list[str]]:
     """Partition table names into ``(common, source_only, target_only)``.
 
     ``common`` and ``source_only`` keep source order (which is FK-safe
@@ -163,7 +163,7 @@ class Backend(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def table_names(self) -> List[str]:
+    def table_names(self) -> list[str]:
         """All table names in dependency (parents-first) order.
 
         Source and target backends are expected to cover the same table
@@ -176,7 +176,7 @@ class Backend(abc.ABC):
         """Ensure the target store exists (create tables if needed)."""
 
     @abc.abstractmethod
-    async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+    async def read_table(self, table_name: str) -> list[dict[str, Any]]:
         """Return every row of a table as plain ``{column: value}`` dicts.
 
         Value-type contract: values must be SQLAlchemy-hydrated native
@@ -198,7 +198,7 @@ class Backend(abc.ABC):
         return len(await self.read_table(table_name))
 
     @abc.abstractmethod
-    async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
+    async def write_rows(self, table_name: str, rows: list[dict[str, Any]]) -> int:
         """Idempotently write rows (upsert by primary key). Returns rows written."""
 
     @abc.abstractmethod
@@ -265,7 +265,7 @@ class SqlAlchemyBackend(Backend):
         return f"sqlalchemy:{_normalize_url(self._url)}"
 
     @property
-    def table_names(self) -> List[str]:
+    def table_names(self) -> list[str]:
         # sorted_tables yields parents before children (FK-safe order).
         return [t.name for t in Base.metadata.sorted_tables]
 
@@ -275,7 +275,7 @@ class SqlAlchemyBackend(Backend):
     async def _table(self, table_name: str) -> Table:
         return Base.metadata.tables[table_name]
 
-    async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+    async def read_table(self, table_name: str) -> list[dict[str, Any]]:
         table = await self._table(table_name)
         async with self._session_factory() as session:
             result = await session.execute(select(table))
@@ -289,7 +289,7 @@ class SqlAlchemyBackend(Backend):
             result = await session.execute(select(func.count()).select_from(table))
             return result.scalar_one()
 
-    async def write_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> int:
+    async def write_rows(self, table_name: str, rows: list[dict[str, Any]]) -> int:
         if not rows:
             return 0
         model_cls = _TABLE_TO_CLASS[table_name]
@@ -358,7 +358,7 @@ class TableReport:
 
 async def migrate(
     source: Backend, target: Backend, dry_run: bool = False
-) -> List[TableReport]:
+) -> list[TableReport]:
     """Copy every table from source to target. Returns a per-table report.
 
     Source tables missing from the target backend are skipped: a warning
@@ -369,7 +369,7 @@ async def migrate(
     assert_distinct_backends(source, target)
     if not dry_run:
         await target.init()
-    report: List[TableReport] = []
+    report: list[TableReport] = []
     common, source_only, _target_only = reconcile_tables(
         list(source.table_names), list(target.table_names)
     )
@@ -412,7 +412,7 @@ async def migrate(
     return report
 
 
-def print_report(report: List[TableReport], dry_run: bool) -> None:
+def print_report(report: list[TableReport], dry_run: bool) -> None:
     mode = "DRY RUN -- nothing written" if dry_run else "MIGRATED"
     print(f"{mode}")
     print(f"{'table':<28}{'source rows':>12}{'copied':>10}{'status':>10}")
@@ -427,7 +427,7 @@ def print_report(report: List[TableReport], dry_run: bool) -> None:
     print(f"{'TOTAL':<28}{total_source:>12}{total_copied:>10}")
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Copy all data from one configured database backend to another."
     )

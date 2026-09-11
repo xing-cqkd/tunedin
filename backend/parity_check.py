@@ -33,7 +33,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any
 from uuid import UUID
 
 from backend.migrate_data import (
@@ -77,16 +77,16 @@ def _norm_container(value: Any) -> Any:
     return [_norm(v) for v in value]
 
 
-def _norm_row(row: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+def _norm_row(row: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
     return tuple(sorted(((k, _norm(v)) for k, v in row.items()), key=lambda kv: kv[0]))
 
 
-def _pk_columns(table_name: str) -> Tuple[str, ...]:
+def _pk_columns(table_name: str) -> tuple[str, ...]:
     table = Base.metadata.tables[table_name]
     return tuple(c.name for c in table.primary_key.columns)
 
 
-def _sort_key(row: Dict[str, Any], pk: Tuple[str, ...]) -> Tuple:
+def _sort_key(row: dict[str, Any], pk: tuple[str, ...]) -> tuple:
     return tuple(str(_norm(row.get(c))) for c in pk)
 
 
@@ -96,12 +96,12 @@ class TableParity:
     source_rows: int
     target_rows: int
     # Only populated for feeds / episodes.
-    source_by_status: Dict[str, int] = field(default_factory=dict)
-    target_by_status: Dict[str, int] = field(default_factory=dict)
+    source_by_status: dict[str, int] = field(default_factory=dict)
+    target_by_status: dict[str, int] = field(default_factory=dict)
     source_unprocessed: int = 0
     target_unprocessed: int = 0
     # (kind, detail) mismatches found in the payload sample.
-    sample_mismatches: List[Tuple[str, str]] = field(default_factory=list)
+    sample_mismatches: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -117,7 +117,7 @@ class TableParity:
 class ParityReport:
     source: str
     target: str
-    tables: List[TableParity] = field(default_factory=list)
+    tables: list[TableParity] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -181,8 +181,8 @@ async def compare(
     return report
 
 
-def _count_by(rows: List[Dict[str, Any]], column: str) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
+def _count_by(rows: list[dict[str, Any]], column: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
     for row in rows:
         key = str(row.get(column))
         counts[key] = counts.get(key, 0) + 1
@@ -190,8 +190,8 @@ def _count_by(rows: List[Dict[str, Any]], column: str) -> Dict[str, int]:
 
 
 def _hash_spread_sample(
-    rows: List[Dict[str, Any]], pk: Tuple[str, ...], sample_size: int
-) -> List[Dict[str, Any]]:
+    rows: list[dict[str, Any]], pk: tuple[str, ...], sample_size: int
+) -> list[dict[str, Any]]:
     """Deterministic sample spread across the whole key space.
 
     Rows are ordered by sha256 of their (normalized) primary key and the
@@ -201,7 +201,7 @@ def _hash_spread_sample(
     the full range instead.
     """
 
-    def _digest(row: Dict[str, Any]) -> bytes:
+    def _digest(row: dict[str, Any]) -> bytes:
         key = "\x00".join(_sort_key(row, pk))
         return hashlib.sha256(key.encode("utf-8")).digest()
 
@@ -210,10 +210,10 @@ def _hash_spread_sample(
 
 def _sample_diff(
     table_name: str,
-    s_rows: List[Dict[str, Any]],
-    t_rows: List[Dict[str, Any]],
+    s_rows: list[dict[str, Any]],
+    t_rows: list[dict[str, Any]],
     sample_size: int,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     """Diff rows; return (kind, detail) mismatches.
 
     Missing/extra rows are computed over the FULL pk sets -- truncating to
@@ -224,7 +224,7 @@ def _sample_diff(
     pk = _pk_columns(table_name)
     s_map = {_sort_key(r, pk): _norm_row(r) for r in s_rows}
     t_map = {_sort_key(r, pk): _norm_row(r) for r in t_rows}
-    mismatches: List[Tuple[str, str]] = []
+    mismatches: list[tuple[str, str]] = []
     for key in s_map:
         if key not in t_map:
             mismatches.append(
@@ -296,7 +296,7 @@ async def _run(source_name: str, target_name: str, sample_size: int) -> int:
     return 0 if report.ok else 1
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check that two database backends hold the same data."
     )
