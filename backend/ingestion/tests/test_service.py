@@ -13,6 +13,10 @@ from backend.ingestion.parser import PodcastFeedParser
 from backend.ingestion.service import FeedSyncService
 from backend.ingestion.orchestration import error_retry_due
 from backend.ingestion.task_queue.local import LocalInMemoryDriver
+from backend.ingestion.task_queue.schemas import (
+    PROCESS_EPISODE_TASK_TYPE,
+    ProcessEpisodePayload,
+)
 from backend.insights import pipeline as insight_pipeline
 from backend.persistence.models.base import Base
 from backend.persistence.models.feed import Feed
@@ -1161,6 +1165,132 @@ class TestQueueBranches:
                 in_memory_store, feed, client=client, auto_queue_episodes=5
             )
         assert len(new_eps) == 3  # episodes still saved; just not queued
+
+
+class TestTaskOutbox:
+    """XIN-45: the TaskLog outbox is durable (rides the sync's single
+    commit) and idempotent across re-enqueues."""
+
+    @pytest.mark.asyncio
+    async def test_sync_records_task_log_outbox_rows(
+        self, in_memory_store, sample_feed_xml: str
+    ):
+        driver = LocalInMemoryDriver()
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=driver)
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client, auto_queue_episodes=2
+            )
+        assert len(new_eps) == 3
+
+        rows = await in_memory_store.task_logs.list_by_type_status(
+            PROCESS_EPISODE_TASK_TYPE, "queued"
+        )
+        assert len(rows) == 2
+        assert {r.episode_id for r in rows} == {
+            ep.episode_id for ep in new_eps[-2:]
+        }
+        for row in rows:
+            payload = ProcessEpisodePayload.model_validate_json(row.payload_json)
+            assert payload.episode_id == str(row.episode_id)
+            assert payload.feed_id == str(feed.feed_id)
+        # The driver was asked to enqueue exactly the recorded episodes.
+        assert len(driver.tasks) == 2
+        assert all(t.task_type == PROCESS_EPISODE_TASK_TYPE for t in driver.tasks)
+
+    @pytest.mark.asyncio
+    async def test_reenqueue_while_queued_is_idempotent_noop(
+        self, in_memory_store, sample_feed_xml: str
+    ):
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=LocalInMemoryDriver())
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client, auto_queue_episodes=2
+            )
+        # The tasks are still queued: re-recording must not duplicate them.
+        again = await sync._record_task_outbox(
+            in_memory_store, feed, new_eps, 2
+        )
+        assert again == []
+        rows = await in_memory_store.task_logs.list_by_type_status(
+            PROCESS_EPISODE_TASK_TYPE, "queued"
+        )
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_resets_to_queued_on_reenqueue(
+        self, in_memory_store, sample_feed_xml: str
+    ):
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=LocalInMemoryDriver())
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client, auto_queue_episodes=2
+            )
+        target = new_eps[-1]
+        row = await in_memory_store.task_logs.get_by_type_and_episode(
+            PROCESS_EPISODE_TASK_TYPE, target.episode_id
+        )
+        assert row is not None
+        await in_memory_store.task_logs.update_status(row.task_log_id, "done")
+        await in_memory_store.commit()
+
+        requeued = await sync._record_task_outbox(
+            in_memory_store, feed, new_eps, 2
+        )
+        # Only the terminal episode is eligible again; the still-queued one
+        # stays a no-op.
+        assert [ep.episode_id for ep in requeued] == [target.episode_id]
+        row = await in_memory_store.task_logs.get_by_type_and_episode(
+            PROCESS_EPISODE_TASK_TYPE, target.episode_id
+        )
+        assert row.status == "queued"
+        assert row.error_message is None
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_commit_per_feed(
+        self, in_memory_store, sample_feed_xml: str, monkeypatch
+    ):
+        """XIN-39: episodes, feed metadata, and outbox rows share one commit."""
+        driver = LocalInMemoryDriver()
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=driver)
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        commits = 0
+        real_commit = in_memory_store.commit
+
+        async def counting_commit() -> None:
+            nonlocal commits
+            commits += 1
+            await real_commit()
+
+        monkeypatch.setattr(in_memory_store, "commit", counting_commit)
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client, auto_queue_episodes=2
+            )
+        assert commits == 1
 
 
 class TestIngestPodcastVariants:

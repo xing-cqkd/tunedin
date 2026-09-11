@@ -1715,3 +1715,32 @@ class _TaskLogRepository(TaskLogRepository):
         entry.error_message = error_message
         await self._c.put_item(TableName=self._t, Item=_task_log_item(entry))
         return entry
+
+    async def get_by_type_and_episode(
+        self,
+        task_type: str,
+        episode_id: UUID,
+    ) -> Optional[models.TaskLog]:
+        """XIN-45: idempotency lookup for the task outbox.
+
+        gsi2 is keyed ``TASKTYPE#{type}#{status}``, so one query per
+        status is needed; the episode_id match is a FilterExpression.
+        Only non-terminal statuses are consulted — a 'done'/'failed' row
+        does not block re-enqueue (the service resets it to 'queued').
+        """
+        for status in ("queued", "processing", "pending"):
+            items = await _query_all(
+                self._c,
+                self._t,
+                IndexName="gsi2",
+                KeyConditionExpression="gsi2pk = :p",
+                FilterExpression="episode_id = :e",
+                ExpressionAttributeValues={
+                    ":p": _s(f"TASKTYPE#{task_type}#{status}"),
+                    ":e": _s(str(episode_id)),
+                },
+                ScanIndexForward=False,
+            )
+            if items:
+                return codec.item_to_model(models.TaskLog, items[0])
+        return None

@@ -21,6 +21,7 @@ import logging
 import httpx
 from sqlalchemy.exc import IntegrityError
 
+from backend.ingestion.canonicalize import canonicalize_feed_url
 from backend.ingestion.errors import FeedValidationError
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
@@ -67,11 +68,16 @@ class DiscoveryService:
                 "Cannot save podcast without a valid canonical feed_url"
             )
 
-        feed = await store.feeds.get_by_rss_url(podcast.feed_url)
+        # XIN-44: identity is the canonical URL — look up and store the
+        # canonical form so http/https, trailing-slash, port, and tracking-
+        # param variants of the same feed resolve to one row.
+        rss_url = canonicalize_feed_url(podcast.feed_url)
+
+        feed = await store.feeds.get_by_rss_url(rss_url)
 
         if feed is None:
             feed = Feed(
-                rss_url=podcast.feed_url,
+                rss_url=rss_url,
                 title=podcast.title or "Untitled Podcast",
                 author=podcast.author,
                 description=podcast.description,

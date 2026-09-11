@@ -26,23 +26,27 @@ import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
+from backend.ingestion.canonicalize import canonicalize_feed_url
 from backend.ingestion.errors import (
     FeedFetchError,
     FeedNotFoundError,
     FeedParseError,
     FeedSyncError,
-    FeedValidationError,
 )
 from backend.ingestion.http_util import validate_feed_url
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, ParsedFeedMetadata
 from backend.ingestion.parser import PodcastFeedParser
 from backend.ingestion.task_queue.base import TaskQueueDriver
+from backend.ingestion.task_queue.schemas import (
+    PROCESS_EPISODE_TASK_TYPE,
+    ProcessEpisodePayload,
+)
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
+from backend.persistence.models.task_log import TaskLog
 from backend.persistence.repositories import Store
 
 logger = logging.getLogger(__name__)
@@ -67,15 +71,6 @@ class FeedSyncStatus(str, Enum):
 # Error-retry backoff policy (XIN-34) now lives in
 # backend/ingestion/orchestration.py alongside the single feed-selection
 # implementation; this module no longer owns "which feeds are due".
-
-
-def _looks_like_url(value: str) -> bool:
-    """True if the string parses as an absolute http(s) URL."""
-    try:
-        parts = urlparse(value)
-    except Exception:
-        return False
-    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +159,12 @@ def _sort_episodes_chronologically(
     if all(ep.published_at is None for ep in episodes):
         return list(reversed(episodes))
     return sorted(episodes, key=_chronological_sort_key)
+
+
+# Task statuses that block re-enqueue of the same (task_type, episode_id)
+# pair (XIN-45 idempotency). Any other status is terminal: re-recording
+# resets the row to "queued" with the fresh payload.
+_ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "processing"})
 
 
 class FeedSyncService:
@@ -258,12 +259,14 @@ class FeedSyncService:
     ) -> tuple[Feed, list[Episode]]:
         """
         Bulk-insert Episode rows (``processed=False``, ready for LLM
-        ingestion) and save the feed's updated metadata in ONE commit — the
-        single commit of the success path.
+        ingestion) and save the feed's updated metadata.
 
-        On persistence failure raises FeedSyncError WITHOUT committing; the
-        session may be in a failed state and the caller must roll back
-        (XIN-53).
+        WITHOUT committing — the caller (``sync_podcast_episodes_by_feed``)
+        records the task-outbox rows and then performs the single commit of
+        the success path (XIN-39). On persistence failure the exception
+        propagates and the caller raises ``FeedSyncError`` without
+        committing; the session may be in a failed state and the caller
+        must roll back (XIN-53).
         """
         new_episodes = [
             Episode(
@@ -286,38 +289,85 @@ class FeedSyncService:
             )
             for ep_data in sorted_episodes
         ]
-        try:
-            new_episodes = await store.episodes.save_many(new_episodes)
-            feed = await store.feeds.save(feed)
-            await store.commit()
-        except Exception as err:
-            # A persistence-step failure after a successful parse: raise typed
-            # so the batch caller can mark the feed ERROR and continue (XIN-53).
-            # The session may be in a failed state; the caller rolls back.
-            raise FeedSyncError(
-                f"Failed to persist episodes for feed '{feed.rss_url}': {err}"
-            ) from err
+        new_episodes = await store.episodes.save_many(new_episodes)
+        feed = await store.feeds.save(feed)
         return feed, new_episodes
+
+    @staticmethod
+    def _process_episode_payload(feed: Feed, ep: Episode) -> ProcessEpisodePayload:
+        """Build the shared PROCESS_EPISODE payload (XIN-41) for one episode."""
+        return ProcessEpisodePayload(
+            episode_id=str(ep.episode_id),
+            feed_id=str(feed.feed_id),
+            title=ep.title,
+            audio_url=ep.audio_url,
+            transcript_url=ep.transcript_url,
+        )
+
+    async def _record_task_outbox(
+        self,
+        store: Store,
+        feed: Feed,
+        new_episodes: list[Episode],
+        auto_queue_episodes: int,
+    ) -> list[Episode]:
+        """Record TaskLog outbox rows for episodes queued for downstream LLM
+        work (XIN-45).
+
+        WITHOUT committing — the rows ride the sync's single commit, so
+        the episode insert and its durable queue record are atomic (durable
+        outbox). Returns the episodes the queue driver should be asked to
+        enqueue.
+
+        Idempotency: the (task_type, episode_id) pair is the idempotency key
+        (unique index ``uq_task_log_type_episode``). Re-recording while the
+        task is still active (pending/queued/processing) is a no-op; a task
+        in a terminal state is reset to ``queued`` with the fresh payload.
+        """
+        if auto_queue_episodes <= 0 or not new_episodes:
+            return []
+        to_enqueue: list[Episode] = []
+        for ep in new_episodes[-auto_queue_episodes:]:
+            payload = self._process_episode_payload(feed, ep)
+            existing = await store.task_logs.get_by_type_and_episode(
+                PROCESS_EPISODE_TASK_TYPE, ep.episode_id
+            )
+            if existing is not None:
+                if existing.status in _ACTIVE_TASK_STATUSES:
+                    continue  # idempotent no-op: already queued/processing
+                existing.status = "queued"
+                existing.payload_json = payload.model_dump_json()
+                existing.error_message = None
+                await store.task_logs.save(existing)
+            else:
+                await store.task_logs.save(
+                    TaskLog(
+                        task_type=PROCESS_EPISODE_TASK_TYPE,
+                        episode_id=ep.episode_id,
+                        payload_json=payload.model_dump_json(),
+                        status="queued",
+                    )
+                )
+            to_enqueue.append(ep)
+        return to_enqueue
 
     async def _enqueue_episode_tasks(
         self,
         feed: Feed,
-        new_episodes: list[Episode],
-        auto_queue_episodes: int,
+        episodes: list[Episode],
     ) -> None:
-        """Enqueue the newest episodes for downstream AI insight extraction."""
-        if self.queue_driver and auto_queue_episodes > 0 and new_episodes:
-            for ep in new_episodes[-auto_queue_episodes:]:
-                payload = {
-                    "episode_id": str(ep.episode_id),
-                    "feed_id": str(feed.feed_id),
-                    "title": ep.title,
-                    "audio_url": ep.audio_url,
-                    "transcript_url": ep.transcript_url,
-                }
+        """Enqueue episodes to the queue driver (XIN-41 shared payload schema).
+
+        External side effect — call only AFTER the outbox rows are
+        committed, with exactly the episodes :meth:`_record_task_outbox`
+        returned.
+        """
+        if self.queue_driver and episodes:
+            for ep in episodes:
+                payload = self._process_episode_payload(feed, ep)
                 await self.queue_driver.enqueue(
-                    task_type="PROCESS_EPISODE",
-                    payload=payload,
+                    task_type=PROCESS_EPISODE_TASK_TYPE,
+                    payload=payload.model_dump(),
                 )
 
     # ------------------------------------------------------------------
@@ -372,15 +422,29 @@ class FeedSyncService:
             await store.commit()
             return feed, []
 
-        # 5. Persist episodes + feed metadata in one commit.
+        # 5. Persist episodes + feed metadata and record the task-outbox
+        #    rows (XIN-45), then commit ONCE — the single commit of the
+        #    success path (XIN-39).
         sorted_episodes = _sort_episodes_chronologically(parse_result.episodes)
-        feed, new_episodes = await self._persist_episodes(
-            store, feed, sorted_episodes
-        )
+        try:
+            feed, new_episodes = await self._persist_episodes(
+                store, feed, sorted_episodes
+            )
+            episodes_to_enqueue = await self._record_task_outbox(
+                store, feed, new_episodes, auto_queue_episodes
+            )
+            await store.commit()
+        except Exception as err:
+            # A persistence-step failure after a successful parse: raise typed
+            # so the batch caller can mark the feed ERROR and continue (XIN-53).
+            # The session may be in a failed state; the caller rolls back.
+            raise FeedSyncError(
+                f"Failed to persist episodes for feed '{feed.rss_url}': {err}"
+            ) from err
 
-        # 6. Optionally enqueue background tasks for downstream AI insight
-        #    extraction.
-        await self._enqueue_episode_tasks(feed, new_episodes, auto_queue_episodes)
+        # 6. Enqueue to the queue driver (external side effect, after the
+        #    durable commit) for exactly the episodes recorded in the outbox.
+        await self._enqueue_episode_tasks(feed, episodes_to_enqueue)
 
         return feed, new_episodes
 
@@ -420,15 +484,14 @@ class FeedSyncService:
         created as part of the sync's single commit — callers can tell from
         this signature that the call may insert a row. ``rss_url`` must be an
         absolute http(s) URL; anything else raises FeedValidationError (a
-        ValueError) without creating a row.
+        ValueError) without creating a row. The URL is canonicalized
+        (XIN-44) before lookup/creation, so equivalent URL spellings share
+        one feed row.
 
         Raises FeedNotFoundError never — a missing URL creates; an invalid
         URL raises FeedValidationError.
         """
-        if not _looks_like_url(rss_url):
-            raise FeedValidationError(
-                f"Invalid feed identifier {rss_url!r}: expected an http(s) URL"
-            )
+        rss_url = canonicalize_feed_url(rss_url)
         feed = await store.feeds.get_by_rss_url(rss_url)
         if feed is None:
             feed = Feed(

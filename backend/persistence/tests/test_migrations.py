@@ -30,8 +30,9 @@ from alembic.config import Config
 REPO_ROOT = Path(__file__).resolve().parents[3]
 ALEMBIC_INI = str(REPO_ROOT / "backend" / "alembic.ini")
 
-HEAD = "0f3a4b5c6d7e"  # current chain head (XIN-68 guid backfill + NOT NULL)
+HEAD = "2529fed59a29"  # current chain head (XIN-44/XIN-45 task-log outbox + feed URL canonicalization)
 GUID_MIGRATION_DOWN = "9e2f3a4b5c6d"  # revision before the XIN-68 migration
+CANON_MIGRATION_DOWN = "0f3a4b5c6d7e"  # revision before the XIN-44/XIN-45 migration
 TEXT_MIGRATION_DOWN = "8d1e2f3a4b5c"  # revision before the XIN-47 migration
 TAG_MIGRATION_DOWN = "f3a8c1d2e4b5"  # revision before the XIN-121 migration
 
@@ -331,3 +332,225 @@ async def test_guid_backfill_assigns_deterministic_guids(monkeypatch, tmp_path):
                 (str(uuid.uuid4()), feed_id),
             )
         con.rollback()
+
+
+async def test_feed_canonicalization_merges_duplicate_feeds(monkeypatch, tmp_path):
+    """XIN-44/XIN-45: canonicalization merges duplicate feeds; TaskLog outbox
+    columns and the idempotency index exist after upgrade.
+
+    Two feed rows whose URLs canonicalize identically are merged: the
+    earliest-created feed survives, episodes are repointed, and the
+    (feed_id, guid) collision on the shared episode merges the two episode
+    rows (earliest-created episode wins) with dependents repointed.
+    """
+    # Migrate to the revision before the XIN-44/XIN-45 migration.
+    db_path = await _migrate(monkeypatch, tmp_path, CANON_MIGRATION_DOWN)
+    feed_a = str(uuid.uuid4())  # survivor: created first
+    feed_b = str(uuid.uuid4())  # duplicate URL spelling
+    ep_a1 = str(uuid.uuid4())
+    ep_a2 = str(uuid.uuid4())  # guid g2, later-created -> merge loser
+    ep_b2 = str(uuid.uuid4())  # guid g2, earlier-created -> merge winner
+    ep_b3 = str(uuid.uuid4())
+    user_u = str(uuid.uuid4())
+    tag_t1 = str(uuid.uuid4())
+    playlist_p = str(uuid.uuid4())
+    with _connect(db_path) as con:
+        con.execute(
+            "INSERT INTO users (user_id, email, created_at)"
+            " VALUES (?, 'canon@example.com', CURRENT_TIMESTAMP)",
+            (user_u,),
+        )
+        con.execute(
+            "INSERT INTO feeds (feed_id, rss_url, title, sync_status,"
+            " error_count, created_at)"
+            " VALUES (?, 'https://feeds.example.com/show.xml', 'Show',"
+            " 'synced', 0, '2026-01-01 00:00:00')",
+            (feed_a,),
+        )
+        con.execute(
+            "INSERT INTO feeds (feed_id, rss_url, title, sync_status,"
+            " error_count, created_at)"
+            " VALUES (?, 'HTTPS://feeds.example.com:443/show.xml"
+            "?utm_source=newsletter', 'Show Dup', 'synced', 0,"
+            " '2026-02-01 00:00:00')",
+            (feed_b,),
+        )
+        for ep_id, feed_id, guid, created in [
+            (ep_a1, feed_a, "g1", "2026-01-02 00:00:00"),
+            (ep_a2, feed_a, "g2", "2026-01-03 00:00:00"),
+            (ep_b2, feed_b, "g2", "2026-01-02 12:00:00"),
+            (ep_b3, feed_b, "g3", "2026-02-02 00:00:00"),
+        ]:
+            con.execute(
+                "INSERT INTO episodes (episode_id, feed_id, guid, title,"
+                " audio_url, episode_type, processed, created_at)"
+                " VALUES (?, ?, ?, 'Ep', 'https://example.com/a.mp3',"
+                " 'full', 0, ?)",
+                (ep_id, feed_id, guid, created),
+            )
+        # Dependents on the merge loser (ep_a2) and winner (ep_b2).
+        con.execute(
+            "INSERT INTO insights (insight_id, episode_id, title, created_at)"
+            " VALUES (?, ?, 'Takeaway', CURRENT_TIMESTAMP)",
+            (str(uuid.uuid4()), ep_a2),
+        )
+        con.execute(
+            "INSERT INTO tags (tag_id, name, category) VALUES (?, 't1', NULL)",
+            (tag_t1,),
+        )
+        # The same tag on both rows: the merge must keep exactly one link.
+        con.execute(
+            "INSERT INTO episode_tags (episode_id, tag_id) VALUES (?, ?)",
+            (ep_a2, tag_t1),
+        )
+        con.execute(
+            "INSERT INTO episode_tags (episode_id, tag_id) VALUES (?, ?)",
+            (ep_b2, tag_t1),
+        )
+        # Progress on both rows: the merge keeps the furthest position.
+        con.execute(
+            "INSERT INTO user_episode_progress (user_id, episode_id,"
+            " position_seconds, completed, last_played_at)"
+            " VALUES (?, ?, 100, 0, CURRENT_TIMESTAMP)",
+            (user_u, ep_a2),
+        )
+        con.execute(
+            "INSERT INTO user_episode_progress (user_id, episode_id,"
+            " position_seconds, completed, last_played_at)"
+            " VALUES (?, ?, 50, 1, CURRENT_TIMESTAMP)",
+            (user_u, ep_b2),
+        )
+        con.execute(
+            "INSERT INTO curated_playlists (playlist_id, user_id, title,"
+            " created_at) VALUES (?, ?, 'P', CURRENT_TIMESTAMP)",
+            (playlist_p, user_u),
+        )
+        # The playlist already contains the winner: loser link must drop.
+        con.execute(
+            "INSERT INTO playlist_episodes (playlist_id, episode_id,"
+            " position, added_at) VALUES (?, ?, 0, CURRENT_TIMESTAMP)",
+            (playlist_p, ep_a2),
+        )
+        con.execute(
+            "INSERT INTO playlist_episodes (playlist_id, episode_id,"
+            " position, added_at) VALUES (?, ?, 1, CURRENT_TIMESTAMP)",
+            (playlist_p, ep_b2),
+        )
+        con.commit()
+
+    db_path = await _migrate(monkeypatch, tmp_path, "head")
+    with _connect(db_path) as con:
+        assert _version(con) == HEAD
+
+        # One feed survives: the earliest-created, with the canonical URL.
+        feeds = con.execute(
+            "SELECT feed_id, rss_url FROM feeds"
+        ).fetchall()
+        assert len(feeds) == 1
+        assert feeds[0][0] == feed_a
+        assert feeds[0][1] == "https://feeds.example.com/show.xml"
+
+        # Three episodes under the survivor; the g2 collision merged to the
+        # earliest-created episode row (ep_b2, from the duplicate feed).
+        episodes = {
+            r[1]: (r[0], r[2])
+            for r in con.execute(
+                "SELECT episode_id, guid, feed_id FROM episodes"
+            ).fetchall()
+        }
+        assert set(episodes) == {"g1", "g2", "g3"}
+        assert all(feed_id == feed_a for _, feed_id in episodes.values())
+        assert episodes["g2"][0] == ep_b2
+
+        # Dependents followed the merge winner.
+        assert con.execute(
+            "SELECT COUNT(*) FROM insights WHERE episode_id = ?",
+            (ep_b2,),
+        ).fetchone()[0] == 1
+        assert con.execute(
+            "SELECT COUNT(*) FROM episode_tags WHERE episode_id = ?",
+            (ep_b2,),
+        ).fetchone()[0] == 1
+        progress = con.execute(
+            "SELECT position_seconds, completed FROM user_episode_progress"
+            " WHERE user_id = ? AND episode_id = ?",
+            (user_u, ep_b2),
+        ).fetchone()
+        assert progress == (100, 1)
+        assert con.execute(
+            "SELECT COUNT(*) FROM playlist_episodes"
+            " WHERE playlist_id = ? AND episode_id = ?",
+            (playlist_p, ep_b2),
+        ).fetchone()[0] == 1
+        # Nothing still points at the merged-away rows or the dup feed.
+        for table, col, dead in [
+            ("episodes", "episode_id", ep_a2),
+            ("insights", "episode_id", ep_a2),
+            ("episode_tags", "episode_id", ep_a2),
+            ("user_episode_progress", "episode_id", ep_a2),
+            ("playlist_episodes", "episode_id", ep_a2),
+            ("episodes", "feed_id", feed_b),
+        ]:
+            assert con.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {col} = ?", (dead,)
+            ).fetchone()[0] == 0
+
+        # XIN-45 schema: episode_id column + idempotency unique index.
+        assert not _notnull(con, "task_logs", "episode_id")
+        uniq_idx = _index_sql(con, "uq_task_log_type_episode")
+        assert uniq_idx is not None
+        assert "UNIQUE" in uniq_idx.upper()
+
+        def add_task_log(task_type, episode_id):
+            con.execute(
+                "INSERT INTO task_logs (task_log_id, task_type, episode_id,"
+                " status, created_at) VALUES (?, ?, ?, 'queued',"
+                " CURRENT_TIMESTAMP)",
+                (str(uuid.uuid4()), task_type, episode_id),
+            )
+
+        add_task_log("PROCESS_EPISODE", ep_b2)
+        with pytest.raises(sqlite3.IntegrityError):
+            add_task_log("PROCESS_EPISODE", ep_b2)
+        con.rollback()
+        # A different task_type for the same episode is fine...
+        add_task_log("OTHER_TASK", ep_b2)
+        # ...and NULL episode_ids never conflict with each other.
+        add_task_log("PROCESS_EPISODE", None)
+        add_task_log("PROCESS_EPISODE", None)
+        con.rollback()
+
+
+async def test_feed_canonicalization_downgrade_drops_outbox_columns(
+    monkeypatch, tmp_path
+):
+    """XIN-44/XIN-45 downgrade: the TaskLog columns go away; the feed dedup
+    is one-way and is NOT reversed."""
+    db_path = await _migrate(monkeypatch, tmp_path, CANON_MIGRATION_DOWN)
+    with _connect(db_path) as con:
+        con.execute(
+            "INSERT INTO feeds (feed_id, rss_url, title, sync_status,"
+            " error_count, created_at)"
+            " VALUES (?, 'https://feeds.example.com/show.xml?utm_source=x',"
+            " 'Show', 'synced', 0, '2026-01-01 00:00:00')",
+            (str(uuid.uuid4()),),
+        )
+        con.execute(
+            "INSERT INTO feeds (feed_id, rss_url, title, sync_status,"
+            " error_count, created_at)"
+            " VALUES (?, 'https://feeds.example.com/show.xml', 'Show 2',"
+            " 'synced', 0, '2026-02-01 00:00:00')",
+            (str(uuid.uuid4()),),
+        )
+        con.commit()
+
+    await _migrate(monkeypatch, tmp_path, "head")
+    db_path = await _migrate(monkeypatch, tmp_path, f"-{CANON_MIGRATION_DOWN}")
+    with _connect(db_path) as con:
+        assert _version(con) == CANON_MIGRATION_DOWN
+        assert _index_sql(con, "uq_task_log_type_episode") is None
+        assert _index_sql(con, "ix_task_logs_episode_id") is None
+        cols = [r[1] for r in con.execute("PRAGMA table_info(task_logs)")]
+        assert "episode_id" not in cols
+        # The dedup is not reversed: still one feed row.
+        assert con.execute("SELECT COUNT(*) FROM feeds").fetchone()[0] == 1
