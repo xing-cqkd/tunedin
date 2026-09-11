@@ -1,18 +1,19 @@
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.config import reload_settings
 from backend.persistence._sqlite import configure_sqlite_fk
 from backend.persistence.models.base import Base
 
 # Database file path located directly in the ingestion directory
 INGESTION_DB_PATH = Path(__file__).parent / "simple.db"
-DATABASE_URL = os.getenv(
-    "INGESTION_DATABASE_URL",
-    f"sqlite+aiosqlite:///{INGESTION_DB_PATH.resolve()}",
-)
+# XIN-42: sourced from the centralized settings object; the
+# INGESTION_DATABASE_URL environment variable name is unchanged. Settings
+# are rebuilt (not read from cache) so importlib.reload() after a setenv
+# picks up the new value, preserving the historical import-time binding.
+DATABASE_URL = reload_settings().ingestion_database_url
 
 # Create Async SQLAlchemy Engine
 engine: AsyncEngine = create_async_engine(

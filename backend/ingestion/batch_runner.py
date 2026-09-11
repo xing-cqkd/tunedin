@@ -5,25 +5,56 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import httpx
 
+from backend.config import configure_logging, get_settings
 from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+try:
+    # Typed fetch errors (PR #32, service batch). Not yet merged at the time
+    # this was written; until it lands the service layer raises raw httpx
+    # errors, so fall back to catching those directly.
+    from backend.ingestion.errors import FeedFetchError
+except ImportError:  # pragma: no cover - disappears once PR #32 merges
+    FeedFetchError = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("batch_ingest")
 
-PROGRESS_FILE = Path(__file__).parent / ".local_agents" / "podcast_ingest.md"
+# Fetch-failure types that carry an HTTP status for the 429 special-case.
+# Once PR #32 is merged this collapses to just (FeedFetchError,).
+_FETCH_ERROR_TYPES = tuple(
+    t for t in (FeedFetchError, httpx.HTTPStatusError) if t is not None
+)
+
+
+def _fetch_status_code(err: Exception) -> Optional[int]:
+    """Best-effort HTTP status for a fetch failure.
+
+    ``FeedFetchError.status_code`` (PR #32) is preferred; raw
+    ``httpx.HTTPStatusError`` exposes it via ``err.response``.
+    """
+    status = getattr(err, "status_code", None)
+    if status is None and isinstance(err, httpx.HTTPStatusError):
+        status = err.response.status_code
+    return status
+
+
+def _progress_file() -> Path:
+    """Progress tracker path, from config (XIN-63).
+
+    Defaults to ``backend/.data/podcast_ingest.md`` (override with
+    ``PODCAST_PROGRESS_FILE``); no longer hard-coded inside ``.local_agents``.
+    """
+    return get_settings().progress_file
 
 
 def load_existing_logs() -> List[str]:
     """Preserves recent log entries from the existing progress markdown file."""
-    if not PROGRESS_FILE.exists():
+    progress_file = _progress_file()
+    if not progress_file.exists():
         return []
     try:
-        content = PROGRESS_FILE.read_text(encoding="utf-8")
+        content = progress_file.read_text(encoding="utf-8")
         if "```text" in content:
             block = content.split("```text", 1)[1].split("```", 1)[0].strip()
             lines = [l for l in block.splitlines() if l.strip() and not l.startswith("Ingestion")]
@@ -41,8 +72,9 @@ async def write_progress_file(
     recent_logs: List[str],
     last_error: Optional[str] = None,
 ) -> None:
-    """Updates the podcast_ingest.md progress tracker in the .local_agents folder."""
-    PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Updates the podcast_ingest.md progress tracker (path from config)."""
+    progress_file = _progress_file()
+    progress_file.parent.mkdir(parents=True, exist_ok=True)
 
     async with session_scope() as store:
         total_feeds = await store.feeds.count_all()
@@ -87,7 +119,7 @@ async def write_progress_file(
 - **Status**: {"⚠️ Recent Error / Throttle detected: " + last_error if last_error else "🟢 Healthy - Running smoothly"}
 - **Checkpointing**: Every podcast commits immediately to the configured database. Resumption resumes automatically from pending shows.
 """
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+    with open(progress_file, "w", encoding="utf-8") as f:
         f.write(content)
 
 
@@ -162,17 +194,20 @@ async def run_batch_ingest(
                     # Politeness throttle
                     await asyncio.sleep(delay_between_feeds)
 
-                except httpx.HTTPStatusError as e:
-                    status_code = e.response.status_code
+                except _FETCH_ERROR_TYPES as e:
+                    # PR #32: fetch failures arrive as FeedFetchError carrying
+                    # status_code; pre-merge they are raw httpx.HTTPStatusError.
+                    status_code = _fetch_status_code(e)
                     if status_code == 429:
                         last_error_msg = f"HTTP 429 Throttled on {show_label}. Backing off 5s..."
                         logger.warning(last_error_msg)
                         logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] THROTTLE (429): {show_label} - Backing off 5s")
                         await asyncio.sleep(5.0)
                     else:
-                        last_error_msg = f"HTTP {status_code} on {show_label}"
+                        status_label = f"HTTP {status_code}" if status_code else type(e).__name__
+                        last_error_msg = f"{status_label} on {show_label}"
                         logger.warning(last_error_msg)
-                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_code}): {show_label}")
+                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_label}): {show_label}")
                 except Exception as err:
                     last_error_msg = f"Error on {show_label}: {str(err)[:60]}"
                     logger.warning(last_error_msg)
@@ -202,7 +237,11 @@ async def run_batch_ingest(
     }
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the batch runner CLI."""
+    # XIN-63: configure logging at the entry point, not at import time.
+    configure_logging()
+
     import argparse
 
     parser = argparse.ArgumentParser(description="One-at-a-time Batch Podcast Episode Ingest Runner")
@@ -218,3 +257,7 @@ if __name__ == "__main__":
             delay_between_feeds=args.delay,
         )
     )
+
+
+if __name__ == "__main__":
+    main()

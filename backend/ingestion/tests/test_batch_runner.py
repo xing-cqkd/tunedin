@@ -1,7 +1,10 @@
 """XIN-130: coverage for batch_runner (run_batch_ingest, write_progress_file,
 load_existing_logs, and the 429 backoff branch)."""
 
+import importlib
+import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -40,6 +43,13 @@ class _FakeStore:
         self.episodes = _FakeEpisodesRepo()
 
 
+def _patch_progress_file(monkeypatch, path):
+    """Route batch_runner's progress path through config at a tmp location."""
+    monkeypatch.setattr(
+        br, "get_settings", lambda: SimpleNamespace(progress_file=Path(path))
+    )
+
+
 def _patch_common(monkeypatch, tmp_path, pending=()):
     """Patch batch_runner's DB/settings surface with fakes."""
     store = _FakeStore(pending)
@@ -53,12 +63,12 @@ def _patch_common(monkeypatch, tmp_path, pending=()):
     monkeypatch.setattr(br, "get_auto_queue_episodes", lambda: 0)
     monkeypatch.setattr(br, "get_queue_driver", lambda: SimpleNamespace())
     monkeypatch.setattr(br, "describe_database", lambda: "testdb")
-    monkeypatch.setattr(br, "PROGRESS_FILE", tmp_path / "progress.md")
+    _patch_progress_file(monkeypatch, tmp_path / "progress.md")
     return store
 
 
 def test_load_existing_logs_no_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(br, "PROGRESS_FILE", tmp_path / "missing.md")
+    _patch_progress_file(monkeypatch, tmp_path / "missing.md")
     assert br.load_existing_logs() == []
 
 
@@ -68,7 +78,7 @@ def test_load_existing_logs_parses_block(tmp_path, monkeypatch):
         "# Tracker\n```text\nline1\nIngestion in progress...\nline2\n```\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(br, "PROGRESS_FILE", progress)
+    _patch_progress_file(monkeypatch, progress)
     assert br.load_existing_logs() == ["line1", "line2"]
 
 
@@ -161,6 +171,103 @@ async def test_run_batch_ingest_429_backoff(tmp_path, monkeypatch):
     # (existing behavior: max_batches=1 -> 2).
     assert result["batches_completed"] == 2
     # 429 triggers the 5s backoff (not the per-feed delay)
+    sleep_mock.assert_any_call(5.0)
+    content = (tmp_path / "progress.md").read_text(encoding="utf-8")
+    assert "Recent Error / Throttle detected" in content
+    assert "429" in content
+
+
+def test_import_does_not_configure_logging():
+    """XIN-63: importing batch_runner must not touch the root logger."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    importlib.reload(br)
+    assert logging.root.handlers == []
+
+
+def test_progress_file_configurable_via_env(monkeypatch, tmp_path):
+    """XIN-63: PODCAST_PROGRESS_FILE env var controls the progress path."""
+    from backend.config import reload_settings
+
+    target = tmp_path / "custom" / "progress.md"
+    monkeypatch.setenv("PODCAST_PROGRESS_FILE", str(target))
+    try:
+        reload_settings()
+        assert br._progress_file() == target
+    finally:
+        reload_settings()
+
+
+def test_main_configures_logging(monkeypatch):
+    """XIN-63: the batch_runner entry point configures logging (not import)."""
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--batch-size", "7"])
+    monkeypatch.setattr(br, "run_batch_ingest", lambda **kw: "not-a-coroutine")
+    monkeypatch.setattr(br, "asyncio", SimpleNamespace(run=lambda coro: coro))
+    br.main()
+    assert logging.root.handlers, "main() should configure root logging"
+    for h in list(logging.root.handlers):
+        logging.root.removeHandler(h)
+
+
+def _http_status_error(status):
+    req = httpx.Request("GET", "https://one.example.com/feed.xml")
+    return httpx.HTTPStatusError(
+        str(status), request=req, response=httpx.Response(status, request=req)
+    )
+
+
+def test_fetch_status_code_reads_httpx_response():
+    assert br._fetch_status_code(_http_status_error(503)) == 503
+
+
+def test_fetch_status_code_prefers_status_code_property():
+    """PR #32 shape: FeedFetchError carries status_code (no .response)."""
+
+    class _FeedFetchError(Exception):
+        @property
+        def status_code(self):
+            return 429
+
+    assert br._fetch_status_code(_FeedFetchError()) == 429
+
+
+def test_fetch_status_code_none_for_plain_errors():
+    assert br._fetch_status_code(RuntimeError("boom")) is None
+
+
+@pytest.mark.asyncio
+async def test_run_batch_ingest_typed_fetch_error_429_backoff(tmp_path, monkeypatch):
+    """PR #32 shape: a FeedFetchError-like error with status_code=429
+    triggers the 5s throttle backoff through the unified handler."""
+    feed = SimpleNamespace(
+        feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"
+    )
+    _patch_common(monkeypatch, tmp_path, pending=[feed])
+
+    class _FeedFetchError(Exception):
+        @property
+        def status_code(self):
+            return 429
+
+    class FakeService:
+        def __init__(self, queue_driver=None):
+            pass
+
+        async def sync_podcast_episodes(
+            self, store, feed_or_id_or_url, client=None, auto_queue_episodes=0
+        ):
+            raise _FeedFetchError("throttled")
+
+    monkeypatch.setattr(br, "FeedIngestionService", FakeService)
+    monkeypatch.setattr(br, "_FETCH_ERROR_TYPES", (_FeedFetchError,))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(br.asyncio, "sleep", sleep_mock)
+
+    await br.run_batch_ingest(batch_size=5, max_batches=1, delay_between_feeds=0)
     sleep_mock.assert_any_call(5.0)
     content = (tmp_path / "progress.md").read_text(encoding="utf-8")
     assert "Recent Error / Throttle detected" in content
