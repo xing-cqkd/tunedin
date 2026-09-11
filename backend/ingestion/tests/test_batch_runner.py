@@ -120,12 +120,12 @@ async def test_run_batch_ingest_processes_feed(tmp_path, monkeypatch):
         def __init__(self, queue_driver=None):
             pass
 
-        async def sync_podcast_episodes(
-            self, store, feed_or_id_or_url, client=None, auto_queue_episodes=0
+        async def sync_podcast_episodes_by_id(
+            self, store, feed_id, client=None, auto_queue_episodes=0
         ):
             return feed, [SimpleNamespace(), SimpleNamespace()]
 
-    monkeypatch.setattr(br, "FeedIngestionService", FakeService)
+    monkeypatch.setattr(br, "FeedSyncService", FakeService)
     monkeypatch.setattr(br.asyncio, "sleep", AsyncMock())
 
     result = await br.run_batch_ingest(
@@ -155,12 +155,12 @@ async def test_run_batch_ingest_429_backoff(tmp_path, monkeypatch):
         def __init__(self, queue_driver=None):
             pass
 
-        async def sync_podcast_episodes(
-            self, store, feed_or_id_or_url, client=None, auto_queue_episodes=0
+        async def sync_podcast_episodes_by_id(
+            self, store, feed_id, client=None, auto_queue_episodes=0
         ):
             raise err429
 
-    monkeypatch.setattr(br, "FeedIngestionService", FakeService)
+    monkeypatch.setattr(br, "FeedSyncService", FakeService)
     sleep_mock = AsyncMock()
     monkeypatch.setattr(br.asyncio, "sleep", sleep_mock)
 
@@ -257,12 +257,12 @@ async def test_run_batch_ingest_typed_fetch_error_429_backoff(tmp_path, monkeypa
         def __init__(self, queue_driver=None):
             pass
 
-        async def sync_podcast_episodes(
-            self, store, feed_or_id_or_url, client=None, auto_queue_episodes=0
+        async def sync_podcast_episodes_by_id(
+            self, store, feed_id, client=None, auto_queue_episodes=0
         ):
             raise _FeedFetchError("throttled")
 
-    monkeypatch.setattr(br, "FeedIngestionService", FakeService)
+    monkeypatch.setattr(br, "FeedSyncService", FakeService)
     monkeypatch.setattr(br, "_FETCH_ERROR_TYPES", (_FeedFetchError,))
     sleep_mock = AsyncMock()
     monkeypatch.setattr(br.asyncio, "sleep", sleep_mock)

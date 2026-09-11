@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from backend.ingestion.models import FeedParseResult, ParsedEpisode
 from backend.ingestion.parser import PodcastFeedParser
-from backend.ingestion.service import FeedIngestionService
+from backend.ingestion.service import FeedSyncService
 from backend.persistence.models.base import Base
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
@@ -365,7 +365,7 @@ class TestIngestionService:
 
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            service = FeedIngestionService()
+            service = FeedSyncService()
 
             # 1. Initial Ingestion
             feed, new_eps = await service.ingest_feed(

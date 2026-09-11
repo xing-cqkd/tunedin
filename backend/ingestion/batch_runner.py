@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from backend.config import configure_logging, get_settings
-from backend.ingestion.service import FeedIngestionService
+from backend.ingestion.service import FeedSyncService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 
@@ -134,7 +134,7 @@ async def run_batch_ingest(
     """
     await init_db()
     auto_queue = get_auto_queue_episodes()
-    service = FeedIngestionService(queue_driver=get_queue_driver())
+    sync_service = FeedSyncService(queue_driver=get_queue_driver())
     logs: List[str] = load_existing_logs()
     last_error_msg: Optional[str] = None
 
@@ -178,9 +178,9 @@ async def run_batch_ingest(
                 show_label = f"{title[:40]} ({rss_url[:35]}...)"
                 try:
                     async with session_scope() as store:
-                        feed, new_eps = await service.sync_podcast_episodes(
+                        feed, new_eps = await sync_service.sync_podcast_episodes_by_id(
                             store=store,
-                            feed_or_id_or_url=feed_id,
+                            feed_id=feed_id,
                             client=client,
                             auto_queue_episodes=auto_queue,
                         )

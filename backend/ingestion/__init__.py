@@ -1,4 +1,5 @@
 from backend.ingestion.crawler import DEFAULT_TOPICS, PodcastCrawler
+from backend.ingestion.discovery import DiscoveryService
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import (
     FeedParseResult,
@@ -15,7 +16,7 @@ from backend.ingestion.task_queue import (
     TaskQueueDriver,
     get_queue_driver,
 )
-from backend.ingestion.service import FeedIngestionService
+from backend.ingestion.service import FeedSyncService
 from settings import (
     describe_database,
     get_db,
@@ -35,7 +36,8 @@ __all__ = [
     "ParsedEpisode",
     "FeedParseResult",
     "PodcastFeedParser",
-    "FeedIngestionService",
+    "FeedSyncService",
+    "DiscoveryService",
     "TaskQueueDriver",
     "LocalInMemoryDriver",
     "GCPCloudTasksDriver",

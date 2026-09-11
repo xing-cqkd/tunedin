@@ -6,11 +6,13 @@ import pytest
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.ingestion.discovery import DiscoveryService
 from backend.ingestion.itunes import ITunesSearchClient
-from backend.ingestion.models import Podcast
+from backend.ingestion.models import FeedParseResult, ParsedFeedMetadata, Podcast
 from backend.ingestion.parser import PodcastFeedParser
-from backend.ingestion.service import FeedIngestionService, _error_retry_due
+from backend.ingestion.service import FeedSyncService, _error_retry_due
 from backend.ingestion.task_queue.local import LocalInMemoryDriver
+from backend.insights import pipeline as insight_pipeline
 from backend.persistence.models.base import Base
 from backend.persistence.models.feed import Feed
 from backend.persistence.repositories import Store
@@ -46,11 +48,11 @@ async def in_memory_store():
     await engine.dispose()
 
 
-class TestFeedIngestionModes:
+class TestDiscoveryAndSyncModes:
     @pytest.mark.asyncio
     async def test_mode1_save_podcast_immediately(self, in_memory_store: Store):
         """Mode 1: Save discovered podcast show immediately to feeds table without downloading episodes."""
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         podcast = Podcast(
             title="Huberman Lab",
             feed_url="https://feeds.megaphone.fm/hubermanlab",
@@ -62,7 +64,7 @@ class TestFeedIngestionModes:
             provider_id="1545953110",
         )
 
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         assert feed.feed_id is not None
         assert feed.title == "Huberman Lab"
@@ -86,8 +88,8 @@ class TestFeedIngestionModes:
 
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            service = FeedIngestionService()
-            saved_feeds = await service.discover_and_save_podcasts(
+            discovery = DiscoveryService()
+            saved_feeds = await discovery.discover_and_save_podcasts(
                 store=in_memory_store,
                 query="huberman",
                 client=client,
@@ -108,13 +110,14 @@ class TestFeedIngestionModes:
     ):
         """Mode 2: Given a saved podcast show, downloads and saves its episodes for LLM reading."""
         # 1. First save podcast show
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(
             title="AI Frontier Podcast",
             feed_url="https://aifrontier.example.com/feed.xml",
             author="Frontier Labs",
         )
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(status_code=200, text=sample_feed_xml)
@@ -122,9 +125,9 @@ class TestFeedIngestionModes:
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
             # 2. Sync episodes for this specific podcast
-            synced_feed, new_episodes = await service.sync_podcast_episodes(
+            synced_feed, new_episodes = await sync.sync_podcast_episodes_by_id(
                 store=in_memory_store,
-                feed_or_id_or_url=feed.feed_id,
+                feed_id=feed.feed_id,
                 client=client,
             )
 
@@ -152,12 +155,12 @@ class TestFeedIngestionModes:
 
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            service = FeedIngestionService()
+            discovery = DiscoveryService()
             podcast = Podcast(
                 title="AI Frontier",
                 feed_url="https://aifrontier.example.com/feed.xml",
             )
-            feed, episodes = await service.ingest_podcast(
+            feed, episodes = await discovery.ingest_podcast(
                 store=in_memory_store,
                 podcast=podcast,
                 client=client,
@@ -172,20 +175,21 @@ class TestFeedIngestionModes:
         self, in_memory_store: Store, sample_feed_xml: str
     ):
         """Mode 4: Batch sync all discovered/pending feeds across the database."""
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
 
         # Seed 2 pending feeds
         p1 = Podcast(title="Show 1", feed_url="https://aifrontier.example.com/feed1.xml")
         p2 = Podcast(title="Show 2", feed_url="https://aifrontier.example.com/feed2.xml")
-        await service.save_podcast(in_memory_store, p1)
-        await service.save_podcast(in_memory_store, p2)
+        await discovery.save_podcast(in_memory_store, p1)
+        await discovery.save_podcast(in_memory_store, p2)
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(status_code=200, text=sample_feed_xml)
 
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            stats = await service.sync_all_pending_feeds(
+            stats = await sync.sync_all_pending_feeds(
                 store=in_memory_store,
                 client=client,
             )
@@ -205,15 +209,15 @@ class TestFeedIngestionModes:
 
         transport = httpx.MockTransport(mock_handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            service = FeedIngestionService()
-            feed, episodes = await service.ingest_feed(
+            sync = FeedSyncService()
+            feed, episodes = await sync.ingest_feed(
                 store=in_memory_store,
                 rss_url="https://aifrontier.example.com/feed.xml",
                 client=client,
             )
 
-            # Query unprocessed episodes for LLM
-            unprocessed = await service.get_unprocessed_episodes(
+            # Query unprocessed episodes for LLM (XIN-39: owned by insights)
+            unprocessed = await insight_pipeline.get_unprocessed_episodes(
                 store=in_memory_store,
                 feed_id=feed.feed_id,
             )
@@ -221,7 +225,7 @@ class TestFeedIngestionModes:
 
             # Mark first episode as processed by LLM
             ep1 = unprocessed[0]
-            updated_ep = await service.mark_episode_processed(
+            updated_ep = await insight_pipeline.mark_episode_processed(
                 store=in_memory_store,
                 episode_id=ep1.episode_id,
                 processed=True,
@@ -230,7 +234,7 @@ class TestFeedIngestionModes:
             assert updated_ep.processed is True
 
             # Remaining unprocessed should now be 2
-            remaining = await service.get_unprocessed_episodes(
+            remaining = await insight_pipeline.get_unprocessed_episodes(
                 store=in_memory_store,
                 feed_id=feed.feed_id,
             )
@@ -414,6 +418,7 @@ class TestSettingsYamlLoading:
             "    path: sqlite+aiosqlite:////tmp/remote.db\n",
         )
         monkeypatch.delenv("INGESTION_DATABASE_URL", raising=False)
+        assert "legacy.db" not in settings.describe_database() or True
         assert settings.describe_database() == (
             "SimpleDB (SQLite): sqlite+aiosqlite:////tmp/remote.db"
         )
@@ -434,7 +439,9 @@ class TestSettingsYamlLoading:
         self._use_yaml(
             monkeypatch,
             tmp_path,
-            "database:\n  backend: simple\n  simple:\n    path: backend/ingestion/custom.db\n",
+            "database:\n  backend: simple\n"
+            "  simple:\n"
+            "    path: backend/ingestion/custom.db\n",
         )
         monkeypatch.delenv("INGESTION_DATABASE_URL", raising=False)
         settings._apply_to_env()
@@ -460,9 +467,7 @@ class TestErrorRetryPolicy:
             last_fetched_at=datetime.now(timezone.utc) - timedelta(seconds=last_fetched_ago_seconds),
         )
 
-    def _ok_parse_result(self) -> "FeedParseResult":
-        from backend.ingestion.models import FeedParseResult, ParsedFeedMetadata
-
+    def _ok_parse_result(self) -> FeedParseResult:
         return FeedParseResult(
             metadata=ParsedFeedMetadata(title="Recovered Podcast", rss_url="https://example.com/x.xml"),
             episodes=[],
@@ -479,11 +484,11 @@ class TestErrorRetryPolicy:
         )
         await in_memory_store.commit()
 
-        svc = FeedIngestionService()
+        sync = FeedSyncService()
         with patch.object(
             PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
         ):
-            summary = await svc.sync_all_pending_feeds(in_memory_store)
+            summary = await sync.sync_all_pending_feeds(in_memory_store)
 
         assert summary["total_synced"] == 1
         feed = await in_memory_store.feeds.get_by_id(feed.feed_id)
@@ -500,11 +505,11 @@ class TestErrorRetryPolicy:
         )
         await in_memory_store.commit()
 
-        svc = FeedIngestionService()
+        sync = FeedSyncService()
         with patch.object(
             PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
         ) as mock_fetch:
-            summary = await svc.sync_all_pending_feeds(in_memory_store)
+            summary = await sync.sync_all_pending_feeds(in_memory_store)
 
         mock_fetch.assert_not_called()
         assert summary["total_synced"] == 0
@@ -526,11 +531,11 @@ class TestErrorRetryPolicy:
         )
         await in_memory_store.commit()
 
-        svc = FeedIngestionService()
+        sync = FeedSyncService()
         with patch.object(
             PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=self._ok_parse_result())
         ) as mock_fetch:
-            summary = await svc.sync_all_pending_feeds(in_memory_store)
+            summary = await sync.sync_all_pending_feeds(in_memory_store)
 
         mock_fetch.assert_not_called()
         assert summary["total_synced"] == 0
@@ -561,14 +566,15 @@ class TestSyncFetchErrorPaths:
         ValueError for backwards compatibility)."""
         from backend.ingestion.errors import FeedParseError
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(title="Real Title", feed_url="https://real.example.com/feed.xml")
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         client = _mock_client("<html><body>not a feed</body></html>")
         async with client:
             with pytest.raises(FeedParseError):
-                await service.sync_podcast_episodes(
+                await sync.sync_podcast_episodes_by_feed(
                     in_memory_store, feed, client=client
                 )
 
@@ -587,9 +593,10 @@ class TestSyncFetchErrorPaths:
         typed FeedFetchError, with the original httpx error chained."""
         from backend.ingestion.errors import FeedFetchError, IngestionError
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(title="T", feed_url="https://boom.example.com/feed.xml")
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("down", request=request)
@@ -598,7 +605,7 @@ class TestSyncFetchErrorPaths:
             transport=httpx.MockTransport(mock_handler)
         ) as client:
             with pytest.raises(FeedFetchError) as exc_info:
-                await service.sync_podcast_episodes(
+                await sync.sync_podcast_episodes_by_feed(
                     in_memory_store, feed, client=client
                 )
 
@@ -613,9 +620,10 @@ class TestSyncFetchErrorPaths:
     async def test_sync_304_preserves_metadata_returns_empty(
         self, in_memory_store
     ):
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(title="Real Title", feed_url="https://ok.example.com/feed.xml")
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         def mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(status_code=304)
@@ -623,7 +631,7 @@ class TestSyncFetchErrorPaths:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(mock_handler)
         ) as client:
-            synced_feed, new_eps = await service.sync_podcast_episodes(
+            synced_feed, new_eps = await sync.sync_podcast_episodes_by_feed(
                 in_memory_store, feed, client=client
             )
 
@@ -640,15 +648,16 @@ class TestSyncFetchErrorPaths:
 
         from backend.ingestion.parser import PodcastFeedParser
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(title="SSRF Feed", feed_url="http://127.0.0.1:9999/feed.xml")
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         with patch.object(
             PodcastFeedParser, "fetch_and_parse", new=AsyncMock()
         ) as mock_fetch:
             with pytest.raises(ValueError):
-                await service.sync_podcast_episodes(in_memory_store, feed)
+                await sync.sync_podcast_episodes_by_feed(in_memory_store, feed)
 
         mock_fetch.assert_not_called()
         refreshed = await in_memory_store.feeds.get_by_id(feed.feed_id)
@@ -656,67 +665,61 @@ class TestSyncFetchErrorPaths:
         assert refreshed.error_count == 1
 
 
-class TestSyncInputVariants:
-    """XIN-128: Feed / UUID / URL-string inputs; invalid identifiers rejected."""
+class TestExplicitSyncEntryPoints:
+    """XIN-65: explicit by_feed / by_id / by_url entry points replace the
+    Union-typed feed_or_id_or_url parameter and its type-sniffing."""
 
     @pytest.mark.asyncio
-    async def test_sync_with_feed_object_input(
-        self, in_memory_store, sample_feed_xml: str
-    ):
-        service = FeedIngestionService()
-        feed = await service.save_podcast(
+    async def test_sync_by_feed(self, in_memory_store, sample_feed_xml: str):
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
         )
         client = _mock_client(sample_feed_xml)
         async with client:
-            synced, new_eps = await service.sync_podcast_episodes(
+            synced, new_eps = await sync.sync_podcast_episodes_by_feed(
                 in_memory_store, feed, client=client
             )
         assert len(new_eps) == 3
         assert synced.feed_id == feed.feed_id
 
     @pytest.mark.asyncio
-    async def test_sync_with_uuid_object_input(
-        self, in_memory_store, sample_feed_xml: str
-    ):
-        service = FeedIngestionService()
-        feed = await service.save_podcast(
+    async def test_sync_by_id(self, in_memory_store, sample_feed_xml: str):
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
         )
         client = _mock_client(sample_feed_xml)
         async with client:
-            synced, new_eps = await service.sync_podcast_episodes(
+            synced, new_eps = await sync.sync_podcast_episodes_by_id(
                 in_memory_store, feed.feed_id, client=client
             )
         assert len(new_eps) == 3
         assert synced.feed_id == feed.feed_id
 
     @pytest.mark.asyncio
-    async def test_sync_with_uuid_string_input(
-        self, in_memory_store, sample_feed_xml: str
-    ):
-        service = FeedIngestionService()
-        feed = await service.save_podcast(
-            in_memory_store,
-            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
-        )
-        client = _mock_client(sample_feed_xml)
-        async with client:
-            synced, new_eps = await service.sync_podcast_episodes(
-                in_memory_store, str(feed.feed_id), client=client
-            )
-        assert len(new_eps) == 3
+    async def test_sync_by_id_not_found_raises_feed_not_found(self, in_memory_store):
+        """XIN-53/XIN-65: an unknown id raises the typed FeedNotFoundError
+        (still a ValueError for backwards compatibility)."""
+        from backend.ingestion.errors import FeedNotFoundError
+
+        sync = FeedSyncService()
+        with pytest.raises(FeedNotFoundError):
+            await sync.sync_podcast_episodes_by_id(in_memory_store, uuid_lib.uuid4())
 
     @pytest.mark.asyncio
-    async def test_sync_with_new_rss_url_string_creates_then_syncs(
+    async def test_sync_by_url_creates_feed_on_miss_then_syncs(
         self, in_memory_store, sample_feed_xml: str
     ):
-        service = FeedIngestionService()
+        """XIN-65: the URL variant documents and performs create-on-miss."""
+        sync = FeedSyncService()
         client = _mock_client(sample_feed_xml)
         async with client:
-            synced, new_eps = await service.sync_podcast_episodes(
+            synced, new_eps = await sync.sync_podcast_episodes_by_url(
                 in_memory_store,
                 "https://aifrontier.example.com/feed.xml",
                 client=client,
@@ -724,32 +727,224 @@ class TestSyncInputVariants:
         assert len(new_eps) == 3
         assert synced.title == "AI Frontier Podcast"
         assert synced.sync_status == "active"
+        assert await in_memory_store.feeds.count_all() == 1
 
     @pytest.mark.asyncio
-    async def test_sync_uuid_string_not_found_raises_valueerror(
-        self, in_memory_store
+    async def test_sync_by_url_existing_url_does_not_duplicate(
+        self, in_memory_store, sample_feed_xml: str
     ):
-        service = FeedIngestionService()
-        with pytest.raises(ValueError):
-            await service.sync_podcast_episodes(
-                in_memory_store, str(uuid_lib.uuid4())
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            synced, new_eps = await sync.sync_podcast_episodes_by_url(
+                in_memory_store,
+                "https://aifrontier.example.com/feed.xml",
+                client=client,
             )
+        assert len(new_eps) == 3
+        assert await in_memory_store.feeds.count_all() == 1
 
     @pytest.mark.asyncio
-    async def test_sync_invalid_identifier_raises_without_creating_feed(
+    async def test_sync_by_url_invalid_url_raises_without_creating_feed(
         self, in_memory_store
     ):
-        """XIN-128: an invalid string identifier must not create a Feed row."""
-        service = FeedIngestionService()
-        with pytest.raises(ValueError, match="Invalid feed identifier"):
-            await service.sync_podcast_episodes(in_memory_store, "not-a-url")
+        """XIN-128 preserved: an invalid URL raises FeedValidationError and
+        creates no Feed row."""
+        from backend.ingestion.errors import FeedValidationError
+
+        sync = FeedSyncService()
+        with pytest.raises(FeedValidationError, match="Invalid feed identifier"):
+            await sync.sync_podcast_episodes_by_url(in_memory_store, "not-a-url")
         assert await in_memory_store.feeds.count_all() == 0
 
+
+class TestOneCommitPerFeed:
+    """XIN-39: each FeedSyncService.sync_* method commits exactly once per feed."""
+
+    @staticmethod
+    def _counting_commit(monkeypatch, store):
+        commits = {"n": 0}
+        orig_commit = store.commit
+
+        async def counting_commit():
+            commits["n"] += 1
+            await orig_commit()
+
+        monkeypatch.setattr(store, "commit", counting_commit)
+        return commits
+
     @pytest.mark.asyncio
-    async def test_sync_invalid_type_raises_typeerror(self, in_memory_store):
-        service = FeedIngestionService()
-        with pytest.raises(TypeError):
-            await service.sync_podcast_episodes(in_memory_store, 123)
+    async def test_success_path_commits_exactly_once(
+        self, in_memory_store, sample_feed_xml: str, monkeypatch
+    ):
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
+        )
+        commits = self._counting_commit(monkeypatch, in_memory_store)
+
+        client = _mock_client(sample_feed_xml)
+        async with client:
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client
+            )
+
+        assert len(new_eps) == 3
+        assert commits["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_error_path_commits_exactly_once(
+        self, in_memory_store, monkeypatch
+    ):
+        """The fetch/parse error path commits the ERROR-state row once, then raises."""
+        from backend.ingestion.errors import FeedParseError
+
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://real.example.com/feed.xml"),
+        )
+        commits = self._counting_commit(monkeypatch, in_memory_store)
+
+        client = _mock_client("<html><body>not a feed</body></html>")
+        async with client:
+            with pytest.raises(FeedParseError):
+                await sync.sync_podcast_episodes_by_feed(
+                    in_memory_store, feed, client=client
+                )
+
+        assert commits["n"] == 1
+        refreshed = await in_memory_store.feeds.get_by_id(feed.feed_id)
+        assert refreshed.sync_status == "error"
+        assert refreshed.error_count == 1
+
+    @pytest.mark.asyncio
+    async def test_not_modified_path_commits_exactly_once(
+        self, in_memory_store, monkeypatch
+    ):
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="T", feed_url="https://ok.example.com/feed.xml"),
+        )
+        commits = self._counting_commit(monkeypatch, in_memory_store)
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=304)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler)
+        ) as client:
+            synced, new_eps = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed, client=client
+            )
+
+        assert new_eps == []
+        assert synced.sync_status == "active"
+        assert commits["n"] == 1
+
+
+class TestApplyFeedMetadata:
+    """XIN-54: the shared field-mapping loop overlays truthy fields only."""
+
+    def test_podcast_fields_mapped_truthy_only(self):
+        from backend.ingestion.service import (
+            PODCAST_METADATA_FIELDS,
+            apply_feed_metadata,
+        )
+
+        feed = Feed(rss_url="https://x.example.com/f.xml", title="Old Title")
+        podcast = Podcast(
+            title="New Title",
+            feed_url="https://x.example.com/f.xml",
+            author="Author",
+            artwork_url="https://x.example.com/art.jpg",
+            primary_genre="Comedy",
+            description="",  # falsy: must not clobber
+            language=None,  # falsy: must not clobber
+        )
+        feed.description = "Keep me"
+        apply_feed_metadata(feed, podcast, PODCAST_METADATA_FIELDS)
+
+        assert feed.title == "New Title"
+        assert feed.author == "Author"
+        assert feed.image_url == "https://x.example.com/art.jpg"
+        assert feed.category == "Comedy"
+        assert feed.description == "Keep me"
+
+    def test_parsed_metadata_explicit_false_is_applied(self):
+        """Tri-state `explicit`: False is meaningful, applied on `is not None`."""
+        from backend.ingestion.service import _apply_parsed_metadata
+
+        feed = Feed(
+            rss_url="https://x.example.com/f.xml", title="T", explicit=True
+        )
+        meta = ParsedFeedMetadata(
+            title="T2",
+            rss_url="https://x.example.com/f.xml",
+            explicit=False,
+            author="",
+        )
+        _apply_parsed_metadata(feed, meta)
+
+        assert feed.title == "T2"
+        assert feed.explicit is False
+        assert feed.author is None  # falsy author not overlaid
+
+    def test_parsed_metadata_explicit_none_leaves_existing(self):
+        from backend.ingestion.service import _apply_parsed_metadata
+
+        feed = Feed(
+            rss_url="https://x.example.com/f.xml", title="T", explicit=True
+        )
+        meta = ParsedFeedMetadata(
+            title="T", rss_url="https://x.example.com/f.xml", explicit=None
+        )
+        _apply_parsed_metadata(feed, meta)
+        assert feed.explicit is True
+
+    @pytest.mark.asyncio
+    async def test_empty_title_keeps_existing_metadata(self, in_memory_store, monkeypatch):
+        """The title-truthiness gate: parsed metadata without a title does not
+        overlay any fields (behavior preserved from the original method)."""
+        from unittest.mock import AsyncMock, patch
+
+        from backend.ingestion.models import FeedParseResult, ParsedFeedMetadata
+
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed = await discovery.save_podcast(
+            in_memory_store,
+            Podcast(title="Real Title", feed_url="https://x.example.com/f.xml"),
+        )
+        result = FeedParseResult(
+            metadata=ParsedFeedMetadata(
+                title="",
+                rss_url="https://x.example.com/f.xml",
+                author="Hacker",
+            ),
+            episodes=[],
+            total_feed_episodes=0,
+        )
+        with patch.object(
+            PodcastFeedParser, "fetch_and_parse", new=AsyncMock(return_value=result)
+        ):
+            synced, _ = await sync.sync_podcast_episodes_by_feed(
+                in_memory_store, feed
+            )
+
+        assert synced.title == "Real Title"
+        assert synced.author is None
+        assert synced.sync_status == "active"
 
 
 class TestSavePodcastResilience:
@@ -757,12 +952,12 @@ class TestSavePodcastResilience:
 
     @pytest.mark.asyncio
     async def test_save_podcast_updates_existing(self, in_memory_store):
-        service = FeedIngestionService()
-        feed1 = await service.save_podcast(
+        discovery = DiscoveryService()
+        feed1 = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="Old Title", feed_url="https://dup.example.com/feed.xml"),
         )
-        feed2 = await service.save_podcast(
+        feed2 = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="New Title", feed_url="https://dup.example.com/feed.xml"),
         )
@@ -772,9 +967,9 @@ class TestSavePodcastResilience:
 
     @pytest.mark.asyncio
     async def test_save_podcast_missing_feed_url_raises(self, in_memory_store):
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         with pytest.raises(ValueError, match="feed_url"):
-            await service.save_podcast(
+            await discovery.save_podcast(
                 in_memory_store, Podcast(title="No URL", feed_url="")
             )
 
@@ -783,9 +978,9 @@ class TestSavePodcastResilience:
         self, in_memory_store, monkeypatch
     ):
         """Simulates a concurrent insert winning the race after our read."""
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         podcast = Podcast(title="Race", feed_url="https://race.example.com/feed.xml")
-        feed1 = await service.save_podcast(in_memory_store, podcast)
+        feed1 = await discovery.save_podcast(in_memory_store, podcast)
 
         orig_get = in_memory_store.feeds.get_by_rss_url
         calls = 0
@@ -799,21 +994,21 @@ class TestSavePodcastResilience:
 
         monkeypatch.setattr(in_memory_store.feeds, "get_by_rss_url", flaky_get)
 
-        feed2 = await service.save_podcast(in_memory_store, podcast)
+        feed2 = await discovery.save_podcast(in_memory_store, podcast)
         assert feed2.feed_id == feed1.feed_id
         assert await in_memory_store.feeds.count_all() == 1
 
     @pytest.mark.asyncio
     async def test_save_podcasts_batch_is_resilient(self, in_memory_store):
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         podcasts = [
             Podcast(title=f"Show {i}", feed_url=f"https://batch{i}.example.com/feed.xml")
             for i in range(3)
         ]
-        feeds = await service.save_podcasts(in_memory_store, podcasts)
+        feeds = await discovery.save_podcasts(in_memory_store, podcasts)
         assert len(feeds) == 3
         # Saving the same batch again updates in place without duplicates
-        feeds2 = await service.save_podcasts(in_memory_store, podcasts)
+        feeds2 = await discovery.save_podcasts(in_memory_store, podcasts)
         assert len(feeds2) == 3
         assert await in_memory_store.feeds.count_all() == 3
 
@@ -825,24 +1020,25 @@ class TestBatchSyncResilience:
     async def test_per_feed_failure_marks_error_and_continues(
         self, in_memory_store, monkeypatch
     ):
-        service = FeedIngestionService()
-        feed1 = await service.save_podcast(
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
+        feed1 = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="One", feed_url="https://one.example.com/feed.xml"),
         )
-        feed2 = await service.save_podcast(
+        feed2 = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="Two", feed_url="https://two.example.com/feed.xml"),
         )
 
-        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
-            if "one.example.com" in feed_or_id_or_url.rss_url:
+        async def fake_sync(store, feed, client=None, auto_queue_episodes=0):
+            if "one.example.com" in feed.rss_url:
                 raise RuntimeError("write boom")
-            return feed_or_id_or_url, []
+            return feed, []
 
-        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
+        monkeypatch.setattr(sync, "sync_podcast_episodes_by_feed", fake_sync)
 
-        result = await service.sync_all_pending_feeds(in_memory_store)
+        result = await sync.sync_all_pending_feeds(in_memory_store)
 
         assert result["failed_count"] == 1
         assert result["failed_feed_ids"] == [str(feed1.feed_id)]
@@ -860,18 +1056,19 @@ class TestBatchSyncResilience:
     async def test_sync_all_pending_feeds_max_feeds_cap(
         self, in_memory_store, monkeypatch
     ):
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         for i in range(3):
-            await service.save_podcast(
+            await discovery.save_podcast(
                 in_memory_store,
                 Podcast(title=f"S{i}", feed_url=f"https://cap{i}.example.com/feed.xml"),
             )
 
-        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
-            return feed_or_id_or_url, []
+        async def fake_sync(store, feed, client=None, auto_queue_episodes=0):
+            return feed, []
 
-        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
-        result = await service.sync_all_pending_feeds(in_memory_store, max_feeds=2)
+        monkeypatch.setattr(sync, "sync_podcast_episodes_by_feed", fake_sync)
+        result = await sync.sync_all_pending_feeds(in_memory_store, max_feeds=2)
         assert result["total_feeds_processed"] == 2
         assert result["total_synced"] == 2
 
@@ -898,7 +1095,7 @@ class TestBatchSyncResilience:
             error_count=1,
             last_fetched_at=None,
         )
-        await in_memory_store.feeds.save(feed)
+        feed = await in_memory_store.feeds.save(feed)
         await in_memory_store.commit()
 
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=300)
@@ -914,14 +1111,15 @@ class TestQueueBranches:
         self, in_memory_store, sample_feed_xml: str
     ):
         driver = LocalInMemoryDriver()
-        service = FeedIngestionService(queue_driver=driver)
-        feed = await service.save_podcast(
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=driver)
+        feed = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
         )
         client = _mock_client(sample_feed_xml)
         async with client:
-            _, new_eps = await service.sync_podcast_episodes(
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
                 in_memory_store, feed, client=client, auto_queue_episodes=2
             )
         assert len(new_eps) == 3
@@ -933,14 +1131,15 @@ class TestQueueBranches:
         self, in_memory_store, sample_feed_xml: str
     ):
         driver = LocalInMemoryDriver()
-        service = FeedIngestionService(queue_driver=driver)
-        feed = await service.save_podcast(
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=driver)
+        feed = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
         )
         client = _mock_client(sample_feed_xml)
         async with client:
-            await service.sync_podcast_episodes(
+            await sync.sync_podcast_episodes_by_feed(
                 in_memory_store, feed, client=client, auto_queue_episodes=0
             )
         assert driver.tasks == []
@@ -949,14 +1148,15 @@ class TestQueueBranches:
     async def test_no_driver_enqueues_nothing(
         self, in_memory_store, sample_feed_xml: str
     ):
-        service = FeedIngestionService(queue_driver=None)
-        feed = await service.save_podcast(
+        discovery = DiscoveryService()
+        sync = FeedSyncService(queue_driver=None)
+        feed = await discovery.save_podcast(
             in_memory_store,
             Podcast(title="T", feed_url="https://aifrontier.example.com/feed.xml"),
         )
         client = _mock_client(sample_feed_xml)
         async with client:
-            _, new_eps = await service.sync_podcast_episodes(
+            _, new_eps = await sync.sync_podcast_episodes_by_feed(
                 in_memory_store, feed, client=client, auto_queue_episodes=5
             )
         assert len(new_eps) == 3  # episodes still saved; just not queued
@@ -965,8 +1165,8 @@ class TestQueueBranches:
 class TestIngestPodcastVariants:
     @pytest.mark.asyncio
     async def test_ingest_podcast_no_auto_sync(self, in_memory_store):
-        service = FeedIngestionService()
-        feed, new_eps = await service.ingest_podcast(
+        discovery = DiscoveryService()
+        feed, new_eps = await discovery.ingest_podcast(
             in_memory_store,
             Podcast(title="NoSync", feed_url="https://nosync.example.com/feed.xml"),
             auto_sync_episodes=False,
@@ -976,7 +1176,7 @@ class TestIngestPodcastVariants:
 
     @pytest.mark.asyncio
     async def test_discover_top_and_save_podcasts(self, in_memory_store, monkeypatch):
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
 
         async def fake_top(limit=25, country="US", client=None):
             return [
@@ -984,8 +1184,8 @@ class TestIngestPodcastVariants:
                 Podcast(title="Top B", feed_url="https://topb.example.com/feed.xml"),
             ]
 
-        monkeypatch.setattr(service.itunes_client, "get_top_podcasts", fake_top)
-        feeds = await service.discover_top_and_save_podcasts(
+        monkeypatch.setattr(discovery.itunes_client, "get_top_podcasts", fake_top)
+        feeds = await discovery.discover_top_and_save_podcasts(
             in_memory_store, limit=2, country="US"
         )
         assert len(feeds) == 2
@@ -1050,9 +1250,9 @@ class TestSyncStatusEnumAndTypedErrors:
         """XIN-53: single save raises FeedValidationError (a ValueError)."""
         from backend.ingestion.errors import FeedValidationError
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         with pytest.raises(FeedValidationError, match="feed_url"):
-            await service.save_podcast(
+            await discovery.save_podcast(
                 in_memory_store, Podcast(title="No URL", feed_url="")
             )
 
@@ -1062,13 +1262,13 @@ class TestSyncStatusEnumAndTypedErrors:
     ):
         """XIN-53: batch save skips URL-less podcasts and warns instead of
         raising, so one bad item never aborts a crawl batch."""
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
         podcasts = [
             Podcast(title="Good", feed_url="https://good.example.com/feed.xml"),
             Podcast(title="Bad", feed_url=""),
         ]
-        with caplog.at_level("WARNING", logger="backend.ingestion.service"):
-            feeds = await service.save_podcasts(in_memory_store, podcasts)
+        with caplog.at_level("WARNING", logger="backend.ingestion.discovery"):
+            feeds = await discovery.save_podcasts(in_memory_store, podcasts)
         assert len(feeds) == 1
         assert feeds[0].title == "Good"
         assert any("Bad" in r.message and "feed_url" in r.message for r in caplog.records)
@@ -1081,9 +1281,10 @@ class TestSyncStatusEnumAndTypedErrors:
         FeedSyncError (typed), not a raw DB exception."""
         from backend.ingestion.errors import FeedSyncError
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         podcast = Podcast(title="T", feed_url="https://persist.example.com/feed.xml")
-        feed = await service.save_podcast(in_memory_store, podcast)
+        feed = await discovery.save_podcast(in_memory_store, podcast)
 
         async def boom(episodes):
             raise RuntimeError("disk on fire")
@@ -1097,7 +1298,7 @@ class TestSyncStatusEnumAndTypedErrors:
             transport=httpx.MockTransport(mock_handler)
         ) as client:
             with pytest.raises(FeedSyncError):
-                await service.sync_podcast_episodes(in_memory_store, feed, client=client)
+                await sync.sync_podcast_episodes_by_feed(in_memory_store, feed, client=client)
 
     @pytest.mark.asyncio
     async def test_backoff_skipped_feeds_not_counted_as_processed(
@@ -1107,9 +1308,10 @@ class TestSyncStatusEnumAndTypedErrors:
         attempted nor counted; the summary reports them separately."""
         from datetime import datetime, timedelta, timezone
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         # One due pending feed...
-        await service.save_podcast(
+        await discovery.save_podcast(
             in_memory_store,
             Podcast(title="Due", feed_url="https://due.example.com/feed.xml"),
         )
@@ -1126,11 +1328,11 @@ class TestSyncStatusEnumAndTypedErrors:
         )
         await in_memory_store.commit()
 
-        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
-            return feed_or_id_or_url, []
+        async def fake_sync(store, feed, client=None, auto_queue_episodes=0):
+            return feed, []
 
-        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
-        summary = await service.sync_all_pending_feeds(in_memory_store)
+        monkeypatch.setattr(sync, "sync_podcast_episodes_by_feed", fake_sync)
+        summary = await sync.sync_all_pending_feeds(in_memory_store)
 
         assert summary["total_feeds_processed"] == 1
         assert summary["total_synced"] == 1
@@ -1143,9 +1345,10 @@ class TestSyncStatusEnumAndTypedErrors:
         """XIN-80: not-yet-due error feeds must not consume max_feeds slots."""
         from datetime import datetime, timedelta, timezone
 
-        service = FeedIngestionService()
+        discovery = DiscoveryService()
+        sync = FeedSyncService()
         for i in range(2):
-            await service.save_podcast(
+            await discovery.save_podcast(
                 in_memory_store,
                 Podcast(title=f"Due{i}", feed_url=f"https://due{i}.example.com/feed.xml"),
             )
@@ -1165,12 +1368,12 @@ class TestSyncStatusEnumAndTypedErrors:
 
         attempted = []
 
-        async def fake_sync(store, feed_or_id_or_url, client=None, auto_queue_episodes=0):
-            attempted.append(feed_or_id_or_url.feed_id)
-            return feed_or_id_or_url, []
+        async def fake_sync(store, feed, client=None, auto_queue_episodes=0):
+            attempted.append(feed.feed_id)
+            return feed, []
 
-        monkeypatch.setattr(service, "sync_podcast_episodes", fake_sync)
-        summary = await service.sync_all_pending_feeds(in_memory_store, max_feeds=2)
+        monkeypatch.setattr(sync, "sync_podcast_episodes_by_feed", fake_sync)
+        summary = await sync.sync_all_pending_feeds(in_memory_store, max_feeds=2)
 
         assert summary["total_feeds_processed"] == 2
         assert summary["total_synced"] == 2

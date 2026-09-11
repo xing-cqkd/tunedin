@@ -9,7 +9,7 @@ from backend.ingestion.task_queue import (
     get_queue_driver,
 )
 import backend.ingestion.task_queue as task_queue_mod
-from backend.ingestion.service import FeedIngestionService
+from backend.ingestion.service import FeedSyncService
 from backend.ingestion.models import ParsedEpisode, FeedParseResult, ParsedFeedMetadata
 from backend.persistence.models.feed import Feed
 from backend.persistence.sqlalchemy_store import SQLAlchemyStore
@@ -119,7 +119,7 @@ async def in_memory_session():
 @pytest.mark.asyncio
 async def test_service_auto_queues_episodes(in_memory_session):
     queue_driver = LocalInMemoryDriver()
-    service = FeedIngestionService(queue_driver=queue_driver)
+    service = FeedSyncService(queue_driver=queue_driver)
 
     mock_parse_result = FeedParseResult(
         metadata=ParsedFeedMetadata(
@@ -141,9 +141,9 @@ async def test_service_auto_queues_episodes(in_memory_session):
     )
 
     with patch.object(service.parser, "fetch_and_parse", new=AsyncMock(return_value=mock_parse_result)):
-        feed, episodes = await service.sync_podcast_episodes(
+        feed, episodes = await service.sync_podcast_episodes_by_url(
             store=SQLAlchemyStore(lambda: in_memory_session),
-            feed_or_id_or_url="https://example.com/queue_test.rss",
+            rss_url="https://example.com/queue_test.rss",
             auto_queue_episodes=2,
         )
 
