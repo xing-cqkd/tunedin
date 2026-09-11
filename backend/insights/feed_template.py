@@ -159,10 +159,11 @@ def _segments(episodes_sections):
     out = {}
     for eid, (sections, duration) in episodes_sections.items():
         seq = []
-        for s, e, lab, _ in sections:
-            rs, re = s / duration, e / duration
-            if re > rs and duration > 0:
-                seq.append((canonicalize_label(lab), rs, re))
+        if duration > 0:
+            for s, e, lab, _ in sections:
+                rs, re = s / duration, e / duration
+                if re > rs:
+                    seq.append((canonicalize_label(lab), rs, re))
         out[eid] = seq
     return out
 
@@ -302,30 +303,29 @@ def propose_template(feed_id, episodes_sections, episode_type='full',
                 lab = seqs[e][ej][0]
                 gap_groups.setdefault((pos, lab), []).append((e,) + seqs[e][ej])
 
-    order = []  # (sort_key, label, members)
+    order = []  # (label, members), in medoid order
     for k in range(len(ref_seq)):
         members = col_members[k]
         if _nepisodes(members) < need:
             continue
         lab = _majority_label(members, ref_seq[k][0])
-        order.append((k, lab, members))
+        order.append((lab, members))
     for (pos, lab), members in gap_groups.items():
         if _nepisodes(members) < need:
             continue
         # gap groups are label-homogeneous by key construction; pass the key
         # label as the reference (previously passed an episode id — inert but
         # wrong).
-        order.append((pos - 0.5, _majority_label(members, lab), members))
-    # Merge adjacent columns that share the same consensus label: a slot is a
-    # semantically distinct region, and a within-label energy boundary (the
-    # segmenter's doing) is not a semantic boundary. Without this, noisy
-    # over-segmentation would hallucinate structure out of uniform labels.
-    # The merged slot spans the union: it starts where the run's first column
-    # starts and ends where the last column ends (median-of-starts would
-    # collapse a merged run to the middle of the episode).
+        order.append((_majority_label(members, lab), members))
+    # Positional order before merging: gap groups are keyed by medoid-relative
+    # position (pos-0.5), but their members' actual relative positions can
+    # disagree with that — episodes vary in timing, and a surviving gap group
+    # means the data did exactly that. Slots are regions in episode order, so
+    # order the columns by actual span and merge same-label runs there.
     col_slots = []  # [(label, Slot, members)]
-    for _, lab, members in order:
+    for lab, members in order:
         col_slots.append((lab, _make_slot(lab, members, n), members))
+    col_slots.sort(key=lambda item: (item[1].pos_start, item[1].pos_end))
     slots = []
     i = 0
     while i < len(col_slots):
@@ -335,8 +335,12 @@ def propose_template(feed_id, episodes_sections, episode_type='full',
             j += 1
         members = [m for k in range(i, j + 1) for m in col_slots[k][2]]
         s = _make_slot(lab, members, n)
-        s.pos_start = col_slots[i][1].pos_start
-        s.pos_end = col_slots[j][1].pos_end
+        # The merged slot spans the union of the run: it starts where the
+        # run's first column starts and ends where the last column ends
+        # (median-of-starts would collapse a merged run toward the episode
+        # middle). min/max keeps the union exact when spans overlap.
+        s.pos_start = min(col_slots[k][1].pos_start for k in range(i, j + 1))
+        s.pos_end = max(col_slots[k][1].pos_end for k in range(i, j + 1))
         slots.append(s)
         i = j + 1
 
@@ -501,7 +505,11 @@ def plan_samples(template, alignment, duration):
     for st, en, lab, slot_name, q in alignment.segments:
         slot = next((s for s in template.slots if s.name == slot_name), None)
         plan = slot.sample_plan if slot else 'map_30s'
-        if plan == 'skip' or plan == 'anchor':
+        seg_plan = LABEL_POLICY.get(lab, ('unknown', 'map_30s'))[1]
+        # A segment the labeler calls skippable (ad, outro-music, music-bed,
+        # silence) is never deep-sampled, even when it lands inside a
+        # non-skip slot span (e.g. a mid-roll ad inside the content region).
+        if plan == 'skip' or plan == 'anchor' or seg_plan == 'skip':
             continue
         if plan == 'map_30s':
             c = (st + en) / 2

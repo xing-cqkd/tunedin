@@ -308,3 +308,77 @@ def test_align_many_segments_share_one_slot():
     a = align(*held, t)
     assert a.score == 1.0, a
     assert a.unmatched_slots == [], a.unmatched_slots
+
+
+# --- code-review (2026-09-11) regression tests --------------------------------
+
+def test_zero_duration_episodes_do_not_crash():
+    # A zero/negative-duration episode used to raise ZeroDivisionError in
+    # _segments (division ran before the duration guard).
+    t = propose_template('z', {
+        'A': ([(0, 60, 'content', 0.0)], 0),
+        'B': ([(0, 60, 'content', 0.0)], 0),
+        'C': ([(0, 60, 'content', 0.0)], 0),
+    })
+    assert t.slots == [] and t.confidence == 0.0
+
+
+def test_gap_group_slots_stay_positional():
+    # Gap groups (segments the medoid lacks) are keyed by medoid-relative
+    # position, but their members' actual positions can disagree with that.
+    # Slots must still come out in episode order, or align() sees a shuffled
+    # template and the XIN-141 reviewer reads nonsense.
+    def ep(segs, dur):
+        return ([(s, e, lab, 0.0) for s, e, lab in segs], dur)
+    eps = {
+        'E0': ep([(0, 881.3, 'ad'), (881.3, 2288.4, 'content'),
+                  (2288.4, 2749.4, 'intro-music'), (2749.4, 3207.7, 'content'),
+                  (3207.7, 3467.1, 'content')], 3600),
+        'E1': ep([(0, 1382.7, 'intro-music'), (1382.7, 2673.8, 'content'),
+                  (2673.8, 2942.2, 'content')], 3600),
+        'E2': ep([(0, 269.9, 'ad'), (269.9, 1310.1, 'intro-music'),
+                  (1310.1, 1920.6, 'content'), (1920.6, 2202.7, 'content')],
+                 3600),
+        'E3': ep([(0, 33.5, 'content'), (33.5, 219.5, 'intro-music'),
+                  (219.5, 408.2, 'content')], 600),
+        'E4': ep([(0, 687.4, 'ad'), (687.4, 1230.7, 'content'),
+                  (1230.7, 1329.1, 'ad'), (1329.1, 1823.3, 'intro-music'),
+                  (1823.3, 2264.7, 'content')], 1800),
+    }
+    t = propose_template('f', eps)
+    starts = [s.pos_start for s in t.slots]
+    assert starts == sorted(starts), [(s.name, s.pos_start) for s in t.slots]
+
+
+def test_planner_never_deep_samples_skippable_label():
+    # A mid-roll ad inside the content region must not get a deep_90s window
+    # even though the slot it lands in says deep_90s: the segment's own label
+    # policy wins for skip decisions.
+    held = ([(0, 60, 'ad', 0.0), (60, 1800, 'content', 0.0),
+             (1800, 1900, 'ad', 0.0), (1900, 3600, 'content', 0.0)], 3600)
+    t = propose_template('g', {f'E{i}': skeleton(3600) for i in range(3)})
+    a = align(*held, t)
+    plans = plan_samples(t, a, 3600)
+    ad_windows = [p for p in plans if 1790 <= p[0] <= 1910]
+    assert all(not p[2].startswith('deep:') for p in ad_windows), plans
+
+
+def test_save_template_retries_rev_collision(session, monkeypatch):
+    # Two concurrent saves can read the same max rev; the loser's INSERT hits
+    # uq_feed_template_rev and must retry with the next rev, not blow up.
+    from sqlalchemy.exc import IntegrityError
+    feed_id = _feed(session)
+    t = propose_template('x', {f'E{i}': skeleton(3600) for i in range(3)})
+    calls = {'n': 0}
+    real_commit = Session.commit
+
+    def flaky_commit(self):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise IntegrityError("duplicate key", params=None, orig=None)
+        return real_commit(self)
+
+    monkeypatch.setattr(Session, 'commit', flaky_commit)
+    rec = save_template(session, feed_id, t)
+    assert rec.rev == 1
+    assert calls['n'] == 2

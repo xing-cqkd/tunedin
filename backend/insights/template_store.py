@@ -8,6 +8,7 @@ import uuid
 from typing import Optional
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.insights.feed_template import FeedTemplate
@@ -16,27 +17,38 @@ from backend.persistence.models.feed_template import DriftDecision, FeedTemplate
 
 def save_template(session: Session, feed_id: uuid.UUID,
                   template: FeedTemplate) -> FeedTemplateRecord:
-    """Append a new revision of the template for (feed_id, episode_type)."""
-    max_rev = session.scalar(
-        select(func.max(FeedTemplateRecord.rev)).where(
-            FeedTemplateRecord.feed_id == feed_id,
-            FeedTemplateRecord.episode_type == template.episode_type,
+    """Append a new revision of the template for (feed_id, episode_type).
+
+    Retries on revision collision: two concurrent saves can read the same
+    max rev, and the uq_feed_template_rev constraint rejects the loser.
+    """
+    for _ in range(3):
+        max_rev = session.scalar(
+            select(func.max(FeedTemplateRecord.rev)).where(
+                FeedTemplateRecord.feed_id == feed_id,
+                FeedTemplateRecord.episode_type == template.episode_type,
+            )
         )
-    )
-    rec = FeedTemplateRecord(
-        feed_id=feed_id,
-        episode_type=template.episode_type,
-        rev=(max_rev or 0) + 1,
-        labeler_version=template.labeler_version,
-        template_json=template.to_json(),
-        confidence=template.confidence,
-        learned_from=list(template.learned_from),
-        notes=template.notes or None,
-    )
-    session.add(rec)
-    session.commit()
-    session.refresh(rec)
-    return rec
+        rec = FeedTemplateRecord(
+            feed_id=feed_id,
+            episode_type=template.episode_type,
+            rev=(max_rev or 0) + 1,
+            labeler_version=template.labeler_version,
+            template_json=template.to_json(),
+            confidence=template.confidence,
+            learned_from=list(template.learned_from),
+            notes=template.notes or None,
+        )
+        session.add(rec)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            continue
+        session.refresh(rec)
+        return rec
+    raise IntegrityError("save_template: revision collision did not resolve",
+                         params=None, orig=None)
 
 
 def load_template(session: Session, feed_id: uuid.UUID,

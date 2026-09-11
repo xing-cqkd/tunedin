@@ -1,7 +1,7 @@
 """feed templates + drift decisions (XIN-136)
 
 Revision ID: 9f2b7c4e1a83
-Revises: 6243728f33d1
+Revises: 2529fed59a29
 Create Date: 2026-09-11
 
 """
