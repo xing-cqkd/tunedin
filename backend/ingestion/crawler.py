@@ -4,9 +4,10 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, Set
 import httpx
 from backend.persistence.repositories import Store
 
+from backend.ingestion.errors import IngestionError
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import Podcast
-from backend.ingestion.service import FeedIngestionService
+from backend.ingestion.service import FeedIngestionService, FeedSyncStatus
 from backend.ingestion.task_queue import get_queue_driver
 from settings import get_auto_queue_episodes, get_crawler_countries, session_scope
 from backend.persistence.models.feed import Feed
@@ -283,7 +284,8 @@ class PodcastCrawler:
         # 1. Fetch pending feed records
         async with session_scope() as store:
             pending_feeds = await store.feeds.list_by_statuses(
-                ["discovered", "pending"], limit=max_feeds
+                [FeedSyncStatus.DISCOVERED.value, FeedSyncStatus.PENDING.value],
+                limit=max_feeds,
             )
             pending_ids = [f.feed_id for f in pending_feeds]
 
@@ -309,8 +311,23 @@ class PodcastCrawler:
                         total_episodes_saved += len(episodes)
                         if on_feed_synced:
                             on_feed_synced(feed.title, len(episodes))
+                except IngestionError as err:
+                    # XIN-53: the service records the failure on the feed row
+                    # and raises WITHOUT logging; log exactly once here.
+                    logger.warning(
+                        "Failed to sync episodes for feed %s: %s: %s",
+                        str(feed_id),
+                        type(err).__name__,
+                        str(err),
+                    )
+                    failed_feeds += 1
                 except Exception as err:
-                    logger.warning("Failed to sync episodes for feed %s: %s", str(feed_id), str(err))
+                    # Non-ingestion failure (unexpected); still counted, logged once.
+                    logger.warning(
+                        "Unexpected error syncing feed %s: %s",
+                        str(feed_id),
+                        str(err),
+                    )
                     failed_feeds += 1
 
         tasks = [_worker(fid) for fid in pending_ids]

@@ -1,11 +1,19 @@
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 import httpx
 from sqlalchemy.exc import IntegrityError
 
+from backend.ingestion.errors import (
+    FeedFetchError,
+    FeedNotFoundError,
+    FeedParseError,
+    FeedSyncError,
+    FeedValidationError,
+)
 from backend.ingestion.itunes import ITunesSearchClient
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, Podcast
 from backend.ingestion.parser import PodcastFeedParser
@@ -17,7 +25,23 @@ from backend.persistence.repositories import Store
 logger = logging.getLogger(__name__)
 
 
-# Retry policy for feeds stuck in sync_status="error" (XIN-34). A transient
+class FeedSyncStatus(str, Enum):
+    """
+    Lifecycle states of a Feed row's ``sync_status`` column (XIN-51).
+
+    DISCOVERED: seen via discovery/crawl, episodes not yet synced.
+    PENDING:    newly registered, awaiting its first sync.
+    ACTIVE:    last sync succeeded.
+    ERROR:     last sync failed; retried with exponential backoff (XIN-34).
+    """
+
+    DISCOVERED = "discovered"
+    PENDING = "pending"
+    ACTIVE = "active"
+    ERROR = "error"
+
+
+# Retry policy for feeds stuck in sync_status=ERROR (XIN-34). A transient
 # fetch/parse failure must not strand a feed forever: errored feeds become
 # eligible for retry after an exponential backoff based on consecutive
 # error_count, and are abandoned after MAX attempts.
@@ -68,6 +92,21 @@ class FeedIngestionService:
     # -------------------------------------------------------------------------
 
     @staticmethod
+    async def _mark_feed_error(store: Store, feed: Feed, now: datetime) -> Feed:
+        """
+        Records a sync failure on the feed row (status=ERROR, error_count+1,
+        last_fetched_at) and commits. Per the XIN-53 error policy this is the
+        durable record; the caller then raises a typed error WITHOUT logging
+        again (the catching caller logs once, in its own format).
+        """
+        feed.error_count += 1
+        feed.sync_status = FeedSyncStatus.ERROR.value
+        feed.last_fetched_at = now
+        feed = await store.feeds.save(feed)
+        await store.commit()
+        return feed
+
+    @staticmethod
     def _apply_podcast_metadata(feed: Feed, podcast: Podcast) -> Feed:
         """Overlays discovered show metadata onto an existing Feed (no save)."""
         if podcast.title:
@@ -89,10 +128,16 @@ class FeedIngestionService:
     async def _get_or_create_feed(self, store: Store, podcast: Podcast) -> Feed:
         """
         Read-then-write upsert of a discovered Podcast into the feeds table,
-        WITHOUT committing. Marks sync_status as 'discovered' if new.
+        WITHOUT committing. Marks sync_status as DISCOVERED if new.
+
+        Raises FeedValidationError (a ValueError) when the podcast has no
+        feed_url — the batch sibling save_podcasts instead skips-and-warns
+        on such podcasts (see its docstring).
         """
         if not podcast.feed_url:
-            raise ValueError("Cannot save podcast without a valid canonical feed_url")
+            raise FeedValidationError(
+                "Cannot save podcast without a valid canonical feed_url"
+            )
 
         feed = await store.feeds.get_by_rss_url(podcast.feed_url)
 
@@ -106,7 +151,7 @@ class FeedIngestionService:
                 category=podcast.primary_genre,
                 language=podcast.language,
                 website_url=podcast.website_url,
-                sync_status="discovered",
+                sync_status=FeedSyncStatus.DISCOVERED.value,
                 error_count=0,
             )
         else:
@@ -118,7 +163,12 @@ class FeedIngestionService:
     async def save_podcast(self, store: Store, podcast: Podcast) -> Feed:
         """
         Immediately saves/upserts a discovered Podcast show into the `feeds` database table.
-        Marks sync_status as 'discovered' if new, ready for downstream episode syncing.
+        Marks sync_status as DISCOVERED if new, ready for downstream episode syncing.
+
+        Raise-vs-skip contract (XIN-53): the single-podcast method RAISES
+        FeedValidationError on a missing feed_url (a caller bug); the batch
+        sibling save_podcasts instead skips such podcasts with a warning, so a
+        bad item never aborts a whole crawl batch.
 
         Duplicate-feed race (XIN-127): two writers can both see
         ``get_by_rss_url -> None`` and both insert, violating the unique
@@ -143,10 +193,21 @@ class FeedIngestionService:
         """
         Immediately persists a batch of discovered podcasts into the `feeds` table.
 
+        Raise-vs-skip contract (XIN-53): unlike save_podcast (which raises
+        FeedValidationError on a missing feed_url), the batch SKIPS podcasts
+        without a feed_url and logs a warning for each, so one bad item never
+        aborts the batch.
+
         Batches the saves and commits once (XIN-129). On an IntegrityError
         (e.g. a duplicate-feed race mid-batch) rolls back and falls back to
         per-podcast saves, each with its own duplicate handling (XIN-127).
         """
+        skipped = [p for p in podcasts if not p.feed_url]
+        for p in skipped:
+            logger.warning(
+                "Skipping podcast %r: no feed_url (batch save skips, single save_podcast raises)",
+                p.title,
+            )
         candidates = [p for p in podcasts if p.feed_url]
         try:
             saved_feeds = [await self._get_or_create_feed(store, p) for p in candidates]
@@ -207,6 +268,14 @@ class FeedIngestionService:
         Given a Feed entity, feed_id, or rss_url:
         Fetches and parses the RSS/XML or JSON feed, and immediately inserts all new
         episodes into the database with `processed=False` (ready for LLM reading/tagging).
+
+        Raises (XIN-53, typed errors in backend/ingestion/errors.py):
+          FeedValidationError - bad identifier / missing feed_url (a ValueError)
+          FeedNotFoundError   - feed ID/URL resolved to no row (a ValueError)
+          FeedFetchError      - transport-level fetch failure; original chained
+          FeedParseError      - fetched bytes were not a parseable feed (a ValueError)
+        A failed fetch/parse marks the feed ERROR and commits before raising;
+        the catching caller logs once — the service never logs at the raise site.
         """
         # 1. Resolve Feed record
         if isinstance(feed_or_id_or_url, Feed):
@@ -214,7 +283,7 @@ class FeedIngestionService:
         elif isinstance(feed_or_id_or_url, uuid.UUID):
             feed = await store.feeds.get_by_id(feed_or_id_or_url)
             if not feed:
-                raise ValueError(f"Feed with ID {feed_or_id_or_url} not found.")
+                raise FeedNotFoundError(f"Feed with ID {feed_or_id_or_url} not found.")
         elif isinstance(feed_or_id_or_url, str):
             # Check if UUID string or URL
             try:
@@ -226,7 +295,7 @@ class FeedIngestionService:
                 # An invalid identifier (non-UUID, non-URL) must not create a
                 # placeholder Feed row — validate before saving (XIN-128).
                 if not _looks_like_url(feed_or_id_or_url):
-                    raise ValueError(
+                    raise FeedValidationError(
                         f"Invalid feed identifier {feed_or_id_or_url!r}: "
                         "expected a Feed, UUID, or http(s) URL"
                     )
@@ -234,7 +303,7 @@ class FeedIngestionService:
                 feed = Feed(
                     rss_url=feed_or_id_or_url,
                     title="Fetching Podcast...",
-                    sync_status="pending",
+                    sync_status=FeedSyncStatus.PENDING.value,
                 )
                 feed = await store.feeds.save(feed)
                 await store.commit()
@@ -244,7 +313,9 @@ class FeedIngestionService:
         # 2. Query known GUIDs for this feed to perform incremental deduplication
         known_guids: Set[str] = await store.episodes.list_guids_by_feed(feed.feed_id)
 
-        # 3. Fetch and parse feed with error recovery
+        # 3. Fetch and parse feed with error recovery: record the failure on the
+        # feed row (the durable record) and raise a TYPED error (XIN-53).
+        # No logging here — the catching caller logs exactly once.
         now_utc = datetime.now(timezone.utc)
         try:
             parse_result: FeedParseResult = await self.parser.fetch_and_parse(
@@ -254,14 +325,16 @@ class FeedIngestionService:
                 last_modified=feed.last_modified,
                 client=client,
             )
+        except httpx.HTTPError as err:
+            feed = await self._mark_feed_error(store, feed, now_utc)
+            raise FeedFetchError(
+                f"Failed to fetch feed '{feed.rss_url}': {err}"
+            ) from err
         except Exception as err:
-            logger.error("Failed to fetch/parse feed '%s': %s", feed.rss_url, str(err))
-            feed.error_count += 1
-            feed.sync_status = "error"
-            feed.last_fetched_at = now_utc
-            feed = await store.feeds.save(feed)
-            await store.commit()
-            raise
+            feed = await self._mark_feed_error(store, feed, now_utc)
+            raise FeedParseError(
+                f"Failed to parse feed '{feed.rss_url}': {err}"
+            ) from err
 
         # 4. Update Feed metadata
         if not parse_result.is_not_modified and parse_result.metadata.title:
@@ -288,7 +361,7 @@ class FeedIngestionService:
         feed.etag = parse_result.metadata.etag or feed.etag
         feed.last_modified = parse_result.metadata.last_modified or feed.last_modified
         feed.last_fetched_at = now_utc
-        feed.sync_status = "active"
+        feed.sync_status = FeedSyncStatus.ACTIVE.value
         feed.error_count = 0
 
         if parse_result.is_not_modified:
@@ -337,9 +410,17 @@ class FeedIngestionService:
             )
             new_episodes.append(ep)
 
-        new_episodes = await store.episodes.save_many(new_episodes)
-        feed = await store.feeds.save(feed)
-        await store.commit()
+        try:
+            new_episodes = await store.episodes.save_many(new_episodes)
+            feed = await store.feeds.save(feed)
+            await store.commit()
+        except Exception as err:
+            # A persistence-step failure after a successful parse: raise typed
+            # so the batch caller can mark the feed ERROR and continue (XIN-53).
+            # The session may be in a failed state; the caller rolls back.
+            raise FeedSyncError(
+                f"Failed to persist episodes for feed '{feed.rss_url}': {err}"
+            ) from err
 
         # 6. Optionally enqueue background tasks for downstream AI insight extraction
         if self.queue_driver and auto_queue_episodes > 0 and new_episodes:
@@ -417,23 +498,42 @@ class FeedIngestionService:
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
         """
-        Finds all feeds with sync_status in ('discovered', 'pending'), plus errored
+        Finds all feeds with sync_status in (DISCOVERED, PENDING), plus errored
         feeds whose retry backoff has elapsed, and downloads all new episodes
         into the database for each feed.
+
+        Returns a summary dict; ``total_feeds_processed`` counts only feeds
+        actually attempted (XIN-79), and ``max_feeds`` applies after the
+        backoff/due filter so not-yet-due feeds never consume limit slots
+        (XIN-80). ``skipped_backoff`` reports how many error feeds were
+        filtered as not yet due.
         """
         now = datetime.now(timezone.utc)
         min_backoff_cutoff = now - timedelta(seconds=ERROR_RETRY_BASE_BACKOFF_SECONDS)
-        pending = await store.feeds.list_by_statuses(["discovered", "pending"])
+        pending = await store.feeds.list_by_statuses(
+            [FeedSyncStatus.DISCOVERED.value, FeedSyncStatus.PENDING.value]
+        )
         due_retry = await store.feeds.list_error_due_retry(
             min_backoff_cutoff, ERROR_RETRY_MAX_ATTEMPTS
         )
         # Reproduce the original single-query OR semantics: merge the two
         # created_at-ordered result sets (the stable sort keeps
-        # discovered/pending feeds first on created_at ties), then apply the
-        # max_feeds cap to the merged list.
-        pending_feeds = sorted(pending + due_retry, key=lambda f: f.created_at)
+        # discovered/pending feeds first on created_at ties).
+        merged = sorted(pending + due_retry, key=lambda f: f.created_at)
+        # XIN-79/XIN-80: apply the per-row backoff/due filter FIRST, then the
+        # max_feeds slice — counting and limiting only feeds actually attempted.
+        due_feeds = [
+            f
+            for f in merged
+            if not (
+                f.sync_status == FeedSyncStatus.ERROR.value
+                and not _error_retry_due(f, now)
+            )
+        ]
+        skipped_backoff = len(merged) - len(due_feeds)
         if max_feeds:
-            pending_feeds = pending_feeds[:max_feeds]
+            due_feeds = due_feeds[:max_feeds]
+        pending_feeds = due_feeds
 
         total_synced = 0
         total_episodes_saved = 0
@@ -452,9 +552,11 @@ class FeedIngestionService:
             # Capture display fields now: sync_podcast_episodes may commit or
             # leave the session in a failed state, expiring this instance.
             rss_url = feed.rss_url
-            # Per-feed exponential backoff: the SQL pre-filter uses the minimum
-            # backoff window, so re-check the exact window for this feed here.
-            if feed.sync_status == "error" and not _error_retry_due(feed, now):
+            # Defensive re-check of the exact per-feed backoff window (the
+            # list above was already due-filtered; this only fires on races).
+            if feed.sync_status == FeedSyncStatus.ERROR.value and not _error_retry_due(
+                feed, now
+            ):
                 continue
             pre_error_count = feed.error_count
             try:
@@ -469,12 +571,12 @@ class FeedIngestionService:
                 await store.rollback()
                 feed = await store.feeds.get_by_id(feed_id)
                 if feed is not None and feed.error_count == pre_error_count:
-                    # The fetch-error path inside sync_podcast_episodes marks
+                    # The fetch/parse path inside sync_podcast_episodes marks
                     # and commits the error state itself (bumping error_count);
                     # only mark here when it didn't (e.g. a persistence-step
-                    # failure after a successful fetch).
+                    # failure after a successful fetch, raised as FeedSyncError).
                     feed.error_count = pre_error_count + 1
-                    feed.sync_status = "error"
+                    feed.sync_status = FeedSyncStatus.ERROR.value
                     feed.last_fetched_at = now
                     feed = await store.feeds.save(feed)
                     await store.commit()
@@ -486,6 +588,7 @@ class FeedIngestionService:
             "total_episodes_saved": total_episodes_saved,
             "failed_count": len(failed_feeds),
             "failed_feed_ids": failed_feeds,
+            "skipped_backoff": skipped_backoff,
         }
 
     # -------------------------------------------------------------------------
