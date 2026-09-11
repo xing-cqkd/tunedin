@@ -211,3 +211,64 @@ def test_main_configures_logging(monkeypatch):
     assert logging.root.handlers, "main() should configure root logging"
     for h in list(logging.root.handlers):
         logging.root.removeHandler(h)
+
+
+def _http_status_error(status):
+    req = httpx.Request("GET", "https://one.example.com/feed.xml")
+    return httpx.HTTPStatusError(
+        str(status), request=req, response=httpx.Response(status, request=req)
+    )
+
+
+def test_fetch_status_code_reads_httpx_response():
+    assert br._fetch_status_code(_http_status_error(503)) == 503
+
+
+def test_fetch_status_code_prefers_status_code_property():
+    """PR #32 shape: FeedFetchError carries status_code (no .response)."""
+
+    class _FeedFetchError(Exception):
+        @property
+        def status_code(self):
+            return 429
+
+    assert br._fetch_status_code(_FeedFetchError()) == 429
+
+
+def test_fetch_status_code_none_for_plain_errors():
+    assert br._fetch_status_code(RuntimeError("boom")) is None
+
+
+@pytest.mark.asyncio
+async def test_run_batch_ingest_typed_fetch_error_429_backoff(tmp_path, monkeypatch):
+    """PR #32 shape: a FeedFetchError-like error with status_code=429
+    triggers the 5s throttle backoff through the unified handler."""
+    feed = SimpleNamespace(
+        feed_id="f1", title="Show One", rss_url="https://one.example.com/feed.xml"
+    )
+    _patch_common(monkeypatch, tmp_path, pending=[feed])
+
+    class _FeedFetchError(Exception):
+        @property
+        def status_code(self):
+            return 429
+
+    class FakeService:
+        def __init__(self, queue_driver=None):
+            pass
+
+        async def sync_podcast_episodes(
+            self, store, feed_or_id_or_url, client=None, auto_queue_episodes=0
+        ):
+            raise _FeedFetchError("throttled")
+
+    monkeypatch.setattr(br, "FeedIngestionService", FakeService)
+    monkeypatch.setattr(br, "_FETCH_ERROR_TYPES", (_FeedFetchError,))
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(br.asyncio, "sleep", sleep_mock)
+
+    await br.run_batch_ingest(batch_size=5, max_batches=1, delay_between_feeds=0)
+    sleep_mock.assert_any_call(5.0)
+    content = (tmp_path / "progress.md").read_text(encoding="utf-8")
+    assert "Recent Error / Throttle detected" in content
+    assert "429" in content

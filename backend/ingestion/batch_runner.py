@@ -10,7 +10,33 @@ from backend.ingestion.service import FeedIngestionService
 from backend.ingestion.task_queue import get_queue_driver
 from settings import describe_database, get_auto_queue_episodes, init_db, session_scope
 
+try:
+    # Typed fetch errors (PR #32, service batch). Not yet merged at the time
+    # this was written; until it lands the service layer raises raw httpx
+    # errors, so fall back to catching those directly.
+    from backend.ingestion.errors import FeedFetchError
+except ImportError:  # pragma: no cover - disappears once PR #32 merges
+    FeedFetchError = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("batch_ingest")
+
+# Fetch-failure types that carry an HTTP status for the 429 special-case.
+# Once PR #32 is merged this collapses to just (FeedFetchError,).
+_FETCH_ERROR_TYPES = tuple(
+    t for t in (FeedFetchError, httpx.HTTPStatusError) if t is not None
+)
+
+
+def _fetch_status_code(err: Exception) -> Optional[int]:
+    """Best-effort HTTP status for a fetch failure.
+
+    ``FeedFetchError.status_code`` (PR #32) is preferred; raw
+    ``httpx.HTTPStatusError`` exposes it via ``err.response``.
+    """
+    status = getattr(err, "status_code", None)
+    if status is None and isinstance(err, httpx.HTTPStatusError):
+        status = err.response.status_code
+    return status
 
 
 def _progress_file() -> Path:
@@ -168,17 +194,20 @@ async def run_batch_ingest(
                     # Politeness throttle
                     await asyncio.sleep(delay_between_feeds)
 
-                except httpx.HTTPStatusError as e:
-                    status_code = e.response.status_code
+                except _FETCH_ERROR_TYPES as e:
+                    # PR #32: fetch failures arrive as FeedFetchError carrying
+                    # status_code; pre-merge they are raw httpx.HTTPStatusError.
+                    status_code = _fetch_status_code(e)
                     if status_code == 429:
                         last_error_msg = f"HTTP 429 Throttled on {show_label}. Backing off 5s..."
                         logger.warning(last_error_msg)
                         logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] THROTTLE (429): {show_label} - Backing off 5s")
                         await asyncio.sleep(5.0)
                     else:
-                        last_error_msg = f"HTTP {status_code} on {show_label}"
+                        status_label = f"HTTP {status_code}" if status_code else type(e).__name__
+                        last_error_msg = f"{status_label} on {show_label}"
                         logger.warning(last_error_msg)
-                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_code}): {show_label}")
+                        logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_label}): {show_label}")
                 except Exception as err:
                     last_error_msg = f"Error on {show_label}: {str(err)[:60]}"
                     logger.warning(last_error_msg)
