@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from backend.config import configure_logging, get_settings
+from backend.ingestion.http_util import REDIRECT_SSRF_HOOKS
 from backend.ingestion.orchestration import (
     FeedSyncOrchestrator,
     SyncPolicy,
@@ -144,12 +145,15 @@ async def run_batch_ingest(
             logger.warning(last_error_msg)
             logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] FAIL ({status_label}): {label}")
 
-    # Persistent HTTP client with browser User-Agent
+    # Persistent HTTP client with browser User-Agent. Redirects are
+    # validated against the SSRF gate on every hop (XIN-62), same as the
+    # shared maybe_client() default.
     transport = httpx.AsyncHTTPTransport(retries=2)
     async with httpx.AsyncClient(
         transport=transport,
         timeout=25.0,
         follow_redirects=True,
+        event_hooks=REDIRECT_SSRF_HOOKS,
         headers={"User-Agent": "TunedIn/1.0 (+https://github.com/tunedin; podcast crawler)"},
     ) as client:
 

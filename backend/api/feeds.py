@@ -42,7 +42,7 @@ import hashlib
 import hmac
 import html
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import format_datetime
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -246,7 +246,7 @@ def playlist_last_modified(
     created = ensure_aware(playlist.created_at)
     if created is not None:
         instants.append(created)
-    return max(instants) if instants else datetime.now().astimezone()
+    return max(instants) if instants else datetime.now(timezone.utc)
 
 
 @router.get("/f/{slug}/feed.xml")

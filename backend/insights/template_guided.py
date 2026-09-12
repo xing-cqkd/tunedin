@@ -101,8 +101,10 @@ def extract_template_guided(episode_id: str, episode_meta: dict,
     windows = plan_samples(template, alignment, duration)
     result.windows = windows
     audio_url = episode_meta.get("audio_url")
-    if not audio_url and windows:
-        result.notes += " no audio_url: windows planned but not transcribed."
+    if not audio_url:
+        if windows:
+            result.notes += " no audio_url: windows planned but not transcribed."
+        return result
     for start, end, purpose in windows:
         text, words = fetch_transcribe_fn(audio_url, start, end - start)
         result.transcripts.append(text)

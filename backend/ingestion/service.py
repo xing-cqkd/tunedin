@@ -35,8 +35,9 @@ from backend.ingestion.errors import (
     FeedNotFoundError,
     FeedParseError,
     FeedSyncError,
+    FeedValidationError,
 )
-from backend.ingestion.http_util import validate_feed_url
+from backend.ingestion.http_util import RedirectBlockedError, validate_feed_url
 from backend.ingestion.models import FeedParseResult, ParsedEpisode, ParsedFeedMetadata
 from backend.ingestion.parser import PodcastFeedParser
 from backend.ingestion.task_queue.base import TaskQueueDriver
@@ -231,8 +232,15 @@ class FeedSyncService:
         try:
             # XIN-62: SSRF gate at the service boundary, before any fetch.
             # DNS resolution blocks, so run it off the event loop. A rejected
-            # URL marks the feed errored like any other terminal fetch failure.
+            # URL is a validation failure (not a parse failure) and marks
+            # the feed errored like any other terminal fetch failure.
             rss_url = await asyncio.to_thread(validate_feed_url, feed.rss_url)
+        except ValueError as err:
+            await self._mark_feed_error(store, feed, now_utc)
+            raise FeedValidationError(
+                f"Invalid feed URL '{feed.rss_url}': {err}"
+            ) from err
+        try:
             return await self.parser.fetch_and_parse(
                 rss_url=rss_url,
                 known_guids=known_guids if known_guids else None,
@@ -240,6 +248,13 @@ class FeedSyncService:
                 last_modified=feed.last_modified,
                 client=client,
             )
+        except RedirectBlockedError as err:
+            # The SSRF gate rejected a redirect hop mid-fetch: validation
+            # failure, not a parse failure.
+            await self._mark_feed_error(store, feed, now_utc)
+            raise FeedValidationError(
+                f"Invalid redirect for feed '{feed.rss_url}': {err}"
+            ) from err
         except httpx.HTTPError as err:
             await self._mark_feed_error(store, feed, now_utc)
             raise FeedFetchError(

@@ -87,6 +87,27 @@ class RateLimiter:
         self.limit = limit
         self.window_seconds = window_seconds
         self._hits: dict[str, deque[float]] = {}
+        # Global eviction runs at most once per window: an IP that never
+        # calls again is swept away on a later call instead of leaking a
+        # dict entry forever. Stored as an attribute so tests can drive it.
+        self._sweep_interval = window_seconds
+        self._last_sweep = time.monotonic()
+
+    def _sweep(self, now: float) -> None:
+        """Drop buckets whose hits have all expired (empty or stale)."""
+        if now - self._last_sweep < self._sweep_interval:
+            return
+        self._last_sweep = now
+        cutoff = now - self.window_seconds
+        # Deques are time-ordered: the newest hit expiring means the whole
+        # bucket did.
+        stale = [
+            ip
+            for ip, hits in self._hits.items()
+            if not hits or hits[-1] <= cutoff
+        ]
+        for ip in stale:
+            del self._hits[ip]
 
     def check(self, ip: str) -> float | None:
         """Record a hit; return seconds until retry when over the limit.
@@ -95,16 +116,18 @@ class RateLimiter:
         event loop: no locking is needed.
         """
         now = time.monotonic()
+        self._sweep(now)
         cutoff = now - self.window_seconds
         hits = self._hits.setdefault(ip, deque())
         while hits and hits[0] <= cutoff:
             hits.popleft()
         if not hits:
-            # Reuse the (now empty) deque instead of dropping and
-            # re-creating it: fully-expired buckets don't accumulate one
-            # stale key per distinct IP ever seen (eviction is lazy: other
-            # IPs' entries are dropped when they next call check()).
-            hits.clear()
+            # Evict the key itself: clear() on an empty deque does NOT
+            # remove it from the dict, so every distinct IP ever seen
+            # would otherwise accumulate as a stale empty entry forever.
+            # The deque is recreated here; the new hit is appended below.
+            del self._hits[ip]
+            hits = self._hits[ip] = deque()
         if len(hits) >= self.limit:
             return max(0.0, hits[0] + self.window_seconds - now)
         hits.append(now)

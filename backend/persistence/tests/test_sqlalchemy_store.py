@@ -349,6 +349,26 @@ async def test_tag_get_or_create_and_links(store):
     assert [t.name for t in tags] == ["news", "tech"]  # name asc
 
 
+@pytest.mark.asyncio
+async def test_add_episode_tag_missing_parents(store):
+    """FK parity with DynamoDB (XIN-124): linking a tag to a nonexistent
+    episode (or a nonexistent tag) raises MissingParentError."""
+    from backend.persistence.repositories import MissingParentError
+
+    feed = await make_feed(store)
+    ep = await make_episode(store, feed)
+    tag = await store.tags.get_or_create("tech", "topic")
+    await store.commit()
+
+    with pytest.raises(MissingParentError):
+        await store.tags.add_episode_tag(uuid.uuid4(), tag.tag_id)
+    with pytest.raises(MissingParentError):
+        await store.tags.add_episode_tag(ep.episode_id, uuid.uuid4())
+    # Happy path still works.
+    await store.tags.add_episode_tag(ep.episode_id, tag.tag_id)
+    await store.commit()
+
+
 # ---------------------------------------------------------------------------
 # User repository
 # ---------------------------------------------------------------------------

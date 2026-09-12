@@ -616,7 +616,7 @@ class TestSaveManyOpChunks:
         candidates, old_guids = self._candidates(
             feed_id, [(f"new-{i}", f"old-{i}") for i in range(40)]
         )
-        chunks = list(_save_many_op_chunks(candidates, old_guids))
+        chunks = list(_save_many_op_chunks(candidates, old_guids, {}))
         assert len(chunks) == 2
         assert [len(c) for c in chunks] == [33, 7]
         assert sum(len(c) for c in chunks) == 40
@@ -630,7 +630,7 @@ class TestSaveManyOpChunks:
         candidates, old_guids = self._candidates(
             feed_id, [(f"g-{i}", None) for i in range(50)]
         )
-        chunks = list(_save_many_op_chunks(candidates, old_guids))
+        chunks = list(_save_many_op_chunks(candidates, old_guids, {}))
         assert len(chunks) == 1
         assert len(chunks[0]) == 50
 
@@ -640,7 +640,7 @@ class TestSaveManyOpChunks:
         candidates, old_guids = self._candidates(
             feed_id, [(None, None) for _ in range(60)]
         )
-        chunks = list(_save_many_op_chunks(candidates, old_guids))
+        chunks = list(_save_many_op_chunks(candidates, old_guids, {}))
         assert len(chunks) == 1
         assert len(chunks[0]) == 60
 
@@ -651,7 +651,7 @@ class TestSaveManyOpChunks:
         specs = [(f"new-{i}", f"old-{i}") for i in range(30)]
         specs += [(None, None) for _ in range(30)]
         candidates, old_guids = self._candidates(feed_id, specs)
-        chunks = list(_save_many_op_chunks(candidates, old_guids))
+        chunks = list(_save_many_op_chunks(candidates, old_guids, {}))
         assert len(chunks) == 2
         # First chunk: 30 changing (90 ops) + 10 guid-less (10 ops) = 100.
         assert [len(c) for c in chunks] == [40, 20]
@@ -659,4 +659,77 @@ class TestSaveManyOpChunks:
         assert order == list(range(60))
 
     def test_empty_candidates(self):
-        assert list(_save_many_op_chunks([], {})) == []
+        assert list(_save_many_op_chunks([], {}, {})) == []
+
+
+async def test_save_deletes_stale_episode_key_on_published_at_change(store):
+    """published_at is part of the episode sk: re-saving with a new date
+    must delete the old item, not orphan it."""
+    feed = await store.feeds.save(_feed())
+    ep = _episode(feed.feed_id, "Dated", guid="dated-1")
+    ep.published_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    ep = await store.episodes.save(ep)
+
+    ep.published_at = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    await store.episodes.save(ep)
+
+    eps = await store.episodes.list_episodes_by_feed(feed.feed_id)
+    assert len(eps) == 1
+    assert eps[0].published_at == datetime(2024, 6, 1, tzinfo=timezone.utc)
+
+
+async def test_save_many_deletes_stale_episode_keys(store):
+    """The batch path cleans stale keys too (transactional delete)."""
+    feed = await store.feeds.save(_feed())
+    ep = _episode(feed.feed_id, "Batch Dated", guid="batch-dated-1")
+    ep.published_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    (ep,) = await store.episodes.save_many([ep])
+
+    ep.published_at = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    await store.episodes.save_many([ep])
+
+    eps = await store.episodes.list_episodes_by_feed(feed.feed_id)
+    assert len(eps) == 1
+    assert eps[0].published_at == datetime(2024, 6, 1, tzinfo=timezone.utc)
+
+
+async def test_get_by_type_and_episode_finds_terminal_rows(store):
+    """Terminal statuses are part of the idempotency lookup: a 'done' or
+    'failed' row is returned so the service resets it in place instead of
+    creating a duplicate TaskLog."""
+    from backend.persistence.models import TaskLog
+
+    feed = await store.feeds.save(_feed())
+    ep = await store.episodes.save(_episode(feed.feed_id, "T"))
+
+    for status in ("done", "failed"):
+        row = await store.task_logs.save(
+            TaskLog(
+                task_type=f"probe-{status}",
+                episode_id=ep.episode_id,
+                status=status,
+            )
+        )
+        found = await store.task_logs.get_by_type_and_episode(
+            f"probe-{status}", ep.episode_id
+        )
+        assert found is not None
+        assert found.task_log_id == row.task_log_id
+        assert found.status == status
+
+
+async def test_add_episode_tag_rejects_missing_parents(store):
+    """Linking a tag to a nonexistent episode (or a nonexistent tag)
+    raises MissingParentError instead of writing an orphaned link."""
+    feed = await store.feeds.save(_feed())
+    ep = await store.episodes.save(_episode(feed.feed_id, "T"))
+    tag = await store.tags.get_or_create("news", None)
+
+    # Happy path still works and is idempotent.
+    await store.tags.add_episode_tag(ep.episode_id, tag.tag_id)
+    await store.tags.add_episode_tag(ep.episode_id, tag.tag_id)
+
+    with pytest.raises(MissingParentError):
+        await store.tags.add_episode_tag(uuid4(), tag.tag_id)
+    with pytest.raises(MissingParentError):
+        await store.tags.add_episode_tag(ep.episode_id, uuid4())

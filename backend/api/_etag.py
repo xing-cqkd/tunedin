@@ -58,7 +58,12 @@ def check_conditional(
     ims = request.headers.get("if-modified-since")
     if ims:
         try:
-            if ensure_aware(last_modified) <= parsedate_to_datetime(ims):
+            # HTTP dates carry only whole seconds: truncate the stored
+            # timestamp before comparing, or a last_modified with nonzero
+            # microseconds can never be <= the echoed-back date and the
+            # 304 is never served.
+            last = ensure_aware(last_modified)
+            if last is not None and last.replace(microsecond=0) <= parsedate_to_datetime(ims):
                 return Response(status_code=304, headers=headers)
         except (TypeError, ValueError):
             pass  # malformed date: ignore and serve the body

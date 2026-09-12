@@ -73,6 +73,18 @@ class SlugConflictError(ValueError):
     """
 
 
+class DuplicateFeedError(ValueError):
+    """Raised by ``FeedRepository.save`` when ``rss_url`` is taken.
+
+    The DynamoDB backend raises this from ``save()`` (failed
+    rss_url-claim conditional write). The SQLAlchemy backend surfaces
+    the unique-constraint ``IntegrityError`` at commit time instead, so
+    callers that must handle the duplicate-feed race on both backends
+    (e.g. ``DiscoveryService.save_podcast``) catch
+    ``(IntegrityError, DuplicateFeedError)``.
+    """
+
+
 class MissingParentError(ValueError):
     """Raised by ``PlaylistRepository.add_episode`` when the playlist or
     episode does not exist.
@@ -325,7 +337,11 @@ class TagRepository(ABC):
     @abstractmethod
     async def add_episode_tag(self, episode_id: UUID, tag_id: UUID) -> None:
         """Link a tag to an episode. Idempotent: adding the same link twice
-        is a no-op."""
+        is a no-op.
+
+        Raises :class:`MissingParentError` when the episode or the tag
+        does not exist (FK parity on all backends, XIN-124).
+        """
 
     @abstractmethod
     async def list_tags_for_episode(self, episode_id: UUID) -> list[Tag]:
