@@ -62,7 +62,8 @@ def check_conditional(
             # timestamp before comparing, or a last_modified with nonzero
             # microseconds can never be <= the echoed-back date and the
             # 304 is never served.
-            if ensure_aware(last_modified).replace(microsecond=0) <= parsedate_to_datetime(ims):
+            last = ensure_aware(last_modified)
+            if last is not None and last.replace(microsecond=0) <= parsedate_to_datetime(ims):
                 return Response(status_code=304, headers=headers)
         except (TypeError, ValueError):
             pass  # malformed date: ignore and serve the body

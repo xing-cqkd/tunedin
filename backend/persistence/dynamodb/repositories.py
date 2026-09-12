@@ -336,8 +336,8 @@ class _FeedRepository(FeedRepository):
         one ``TransactWriteItems`` call, with
         ``attribute_not_exists(pk) OR feed_id = :fid`` on the claim. An
         rss_url taken by a *different* feed cancels the whole write and
-        raises :class:`ValueError` (SQL raises ``IntegrityError`` on the
-        unique constraint instead — the error types differ but both
+        raises :class:`DuplicateFeedError` (SQL raises ``IntegrityError``
+        on the unique constraint instead — the error types differ but both
         reject the duplicate). Re-saving the same feed (idempotent
         re-write) passes the condition. When the rss_url itself changed,
         the stale claim is deleted in the SAME transaction, so a crash
@@ -1227,6 +1227,11 @@ class _TagRepository(TagRepository):
         :class:`MissingParentError` is raised instead of silently creating
         an orphaned link. Two point reads gate the write; the link write
         itself stays a single atomic ``PutItem``.
+
+        Consistency: the episode read goes through gsi1 (eventually
+        consistent on real AWS), so an episode saved a moment ago can be
+        missed and the link spuriously rejected — the caller should retry.
+        The SQL backend has no such window (same-transaction FK check).
         """
         if await _get_episode_by_id(self._c, self._t, episode_id) is None:
             raise MissingParentError(
