@@ -199,13 +199,17 @@ def build_rss(
                 episode.guid
             )
         # Redirect to the publisher's audio — never proxy (v1 decision).
-        ET.SubElement(
-            item,
-            "enclosure",
-            url=episode.audio_url,
-            length="0",
-            type=_enclosure_type(episode.audio_url),
-        )
+        # An episode with no audio URL gets no <enclosure>: passing None
+        # as the url attribute crashes ElementTree serialization, and an
+        # enclosure with an empty/bogus URL is invalid RSS anyway.
+        if episode.audio_url:
+            ET.SubElement(
+                item,
+                "enclosure",
+                url=episode.audio_url,
+                length="0",
+                type=_enclosure_type(episode.audio_url),
+            )
         # iTunes item tags (fallbacks documented in the module docstring).
         _sub(
             item,

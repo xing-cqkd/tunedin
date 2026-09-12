@@ -579,3 +579,34 @@ def test_rate_limit_retry_after_agrees_with_body(api_client):
     assert limited.headers["retry-after"] == str(
         limited.json()["detail"]["retry_after"]
     )
+
+
+def test_rate_limiter_evicts_stale_ip_keys(monkeypatch):
+    """Unit: IPs that never call again have their buckets evicted on a
+    later sweep instead of accumulating forever (memory leak)."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    limiter = RateLimiter(limit=2, window_seconds=60)
+    assert limiter.check("10.0.0.1") is None
+    assert limiter.check("10.0.0.2") is None
+    assert len(limiter._hits) == 2
+
+    now[0] += 2 * limiter._sweep_interval + 1  # force a sweep
+    assert limiter.check("10.0.0.3") is None
+    # Both stale IPs are gone; only the new caller remains.
+    assert list(limiter._hits.keys()) == ["10.0.0.3"]
+
+
+def test_rate_limiter_sweep_keeps_active_ip(monkeypatch):
+    """Unit: a sweep only evicts expired buckets — an IP with recent hits
+    keeps its state (and its count)."""
+    now = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    limiter = RateLimiter(limit=2, window_seconds=60)
+    assert limiter.check("10.0.0.1") is None
+    now[0] += 2 * limiter._sweep_interval + 1  # force a sweep via 10.0.0.2
+    assert limiter.check("10.0.0.2") is None
+    assert list(limiter._hits.keys()) == ["10.0.0.2"]
+    # 10.0.0.1's first hit expired, so it starts fresh rather than being
+    # limited by a pre-sweep hit.
+    assert limiter.check("10.0.0.1") is None

@@ -459,3 +459,60 @@ async def test_same_database_relative_vs_absolute_spelling_refused(
             SqlAlchemyBackend.from_url("s", relative_url),
             SqlAlchemyBackend.from_url("t", absolute_url),
         )
+
+
+@pytest.mark.asyncio
+async def test_read_table_chunks_streams_in_bounded_chunks(tmp_path):
+    """read_table_chunks yields chunk_size-bounded chunks covering every
+    row — the read-side OOM fix for hundred-thousand-row tables."""
+    url = _url(tmp_path / "src.db")
+    await _seed_source(url)
+    backend = SqlAlchemyBackend.from_url("seed", url)
+    try:
+        chunks = [
+            c
+            async for c in backend.read_table_chunks("episodes", chunk_size=1)
+        ]
+        assert len(chunks) == 2
+        assert all(len(c) == 1 for c in chunks)
+        titles = {r["title"] for c in chunks for r in c}
+        assert titles == {"Episode One", "Episode Two"}
+
+        # A single chunk covers a small table; rows match read_table.
+        single = [
+            c async for c in backend.read_table_chunks("feeds", chunk_size=5000)
+        ]
+        assert len(single) == 1
+        assert single[0] == await backend.read_table("feeds")
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_writes_in_chunks(tmp_path):
+    """migrate streams the source: write_rows is called per chunk and the
+    report counts still reconcile."""
+    src, dst = _url(tmp_path / "src.db"), _url(tmp_path / "dst.db")
+    await _seed_source(src)
+    source = SqlAlchemyBackend.from_url("simple", src)
+    target = SqlAlchemyBackend.from_url("app", dst)
+    calls: list[tuple[str, int]] = []
+    real_write = target.write_rows
+
+    async def counting_write(table_name, rows):
+        calls.append((table_name, len(rows)))
+        return await real_write(table_name, rows)
+
+    target.write_rows = counting_write
+    try:
+        report = await migrate(source, target)
+    finally:
+        await source.close()
+        await target.close()
+
+    by_table = {r.table: r for r in report}
+    assert by_table["episodes"].copied_rows == 2
+    assert by_table["episodes"].source_rows == 2
+    ep_calls = [n for t, n in calls if t == "episodes"]
+    assert sum(ep_calls) == 2
+    assert all(n <= 5000 for n in ep_calls)

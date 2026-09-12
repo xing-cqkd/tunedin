@@ -33,7 +33,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from sqlalchemy import Table, func, make_url, select
 from sqlalchemy.ext.asyncio import (
@@ -107,6 +107,11 @@ def _normalize_url(url: str) -> str:
 # Rows written per session.merge() batch before the session is flushed and
 # its identity map evicted (XIN-132: bounds write-side memory).
 _WRITE_FLUSH_EVERY = 1000
+
+#: Rows per chunk when streaming a table during migration. Bounds memory
+#: on both the read side (source) and the write side (target's row list)
+#: for hundred-thousand-row tables like episodes.
+_READ_CHUNK_SIZE = 5000
 
 
 class SameBackendError(RuntimeError):
@@ -197,6 +202,20 @@ class Backend(abc.ABC):
         """
         return len(await self.read_table(table_name))
 
+    async def read_table_chunks(
+        self, table_name: str, chunk_size: int = _READ_CHUNK_SIZE
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        """Yield a table's rows in ``chunk_size``-bounded chunks.
+
+        The streaming counterpart of :meth:`read_table`: :func:`migrate`
+        copies chunk-by-chunk so a 500k-row table never sits in memory
+        whole (read-side OOM). The default implementation yields the full
+        :meth:`read_table` result as a single chunk; backends with large
+        tables override this with a genuinely streaming read (SQL
+        ``yield_per`` / DynamoDB scan pagination).
+        """
+        yield await self.read_table(table_name)
+
     @abc.abstractmethod
     async def write_rows(self, table_name: str, rows: list[dict[str, Any]]) -> int:
         """Idempotently write rows (upsert by primary key). Returns rows written."""
@@ -280,6 +299,20 @@ class SqlAlchemyBackend(Backend):
         async with self._session_factory() as session:
             result = await session.execute(select(table))
             return [dict(row._mapping) for row in result]
+
+    async def read_table_chunks(
+        self, table_name: str, chunk_size: int = _READ_CHUNK_SIZE
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        # Server-side streaming: rows are fetched in chunk_size batches and
+        # the session never materializes the whole table, so migrating the
+        # episodes table (hundreds of thousands of rows) stays
+        # constant-memory on the read side. A plain Core select (no ORM
+        # relationships) streams safely with yield_per.
+        table = await self._table(table_name)
+        async with self._session_factory() as session:
+            result = await session.stream(select(table))
+            async for partition in result.partitions(chunk_size):
+                yield [dict(row._mapping) for row in partition]
 
     async def count_rows(self, table_name: str) -> int:
         # Count-only read: skipped tables and target-only detection only
@@ -395,14 +428,23 @@ async def migrate(
                     )
                 )
                 continue
-            rows = await source.read_table(table_name)
+            rows = 0
             copied = 0
-            if not dry_run:
-                copied = await target.write_rows(table_name, rows)
+            if dry_run:
+                # Count-only read: a dry run reports what would be copied
+                # without materializing any rows.
+                rows = await source.count_rows(table_name)
+            else:
+                # Stream chunk-by-chunk: a 500k-row table never sits in
+                # memory whole (read-side OOM fix). write_rows is already
+                # chunk-oriented (idempotent merge upserts).
+                async for chunk in source.read_table_chunks(table_name):
+                    rows += len(chunk)
+                    copied += await target.write_rows(table_name, chunk)
             report.append(
                 TableReport(
                     table=table_name,
-                    source_rows=len(rows),
+                    source_rows=rows,
                     copied_rows=copied,
                 )
             )

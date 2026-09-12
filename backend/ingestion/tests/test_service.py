@@ -1510,3 +1510,24 @@ class TestSyncStatusEnumAndTypedErrors:
         assert summary["total_synced"] == 2
         assert summary["skipped_backoff"] == 3
         assert len(attempted) == 2
+
+
+@pytest.mark.asyncio
+async def test_ssrf_blocked_url_raises_validation_error_not_parse(in_memory_store):
+    """A feed URL rejected by SSRF validation raises FeedValidationError
+    (not FeedParseError) and marks the feed errored like any terminal
+    fetch failure."""
+    from backend.ingestion.errors import FeedParseError, FeedValidationError
+    from backend.persistence.models import Feed
+
+    sync = FeedSyncService()
+    feed = await in_memory_store.feeds.save(
+        Feed(rss_url="http://127.0.0.1:9999/feed.xml", title="Loopback")
+    )
+    with pytest.raises(FeedValidationError) as exc_info:
+        await sync.sync_podcast_episodes_by_feed(in_memory_store, feed)
+    assert not isinstance(exc_info.value, FeedParseError)
+
+    refreshed = await in_memory_store.feeds.get_by_id(feed.feed_id)
+    assert refreshed.sync_status == "error"
+    assert refreshed.error_count == 1

@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from uuid import UUID
 
 from backend.migrate_data import Backend
@@ -107,21 +107,6 @@ async def _batch_write_chunk(
         f"had {leftover} unprocessed item(s) after {_BATCH_WRITE_MAX_ATTEMPTS} "
         "attempts; aborting instead of retrying forever"
     )
-
-
-async def _scan_all(client: Any, table_name: str, **kwargs: Any) -> List[dict]:
-    """Scan to exhaustion (follows LastEvaluatedKey)."""
-    items: List[dict] = []
-    start_key: Optional[dict] = None
-    while True:
-        kw = dict(kwargs)
-        if start_key is not None:
-            kw["ExclusiveStartKey"] = start_key
-        resp = await client.scan(TableName=table_name, **kw)
-        items.extend(resp.get("Items", []))
-        start_key = resp.get("LastEvaluatedKey")
-        if not start_key:
-            return items
 
 
 async def _scan_count(client: Any, table_name: str, **kwargs: Any) -> int:
@@ -484,18 +469,44 @@ class DynamoDBBackend(Backend):
         await ensure_table(client, table_name=self._table_name)
 
     async def read_table(self, table_name: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        async for chunk in self.read_table_chunks(table_name):
+            rows.extend(chunk)
+        return rows
+
+    async def read_table_chunks(
+        self, table_name: str, chunk_size: int = 5000
+    ) -> AsyncIterator[List[Dict[str, Any]]]:
+        # Scan pagination: each scan page is bounded (~1MB pre-filter), so
+        # rows are converted and yielded in chunk_size batches without ever
+        # materializing the whole table — the read-side OOM counterpart of
+        # the batched BatchWriteItem write path.
         client = await self._ensure_client()
         model_cls, type_name, row_reader = _READ_SPECS[table_name]
-        items = await _scan_all(
-            client,
-            self._table_name,
-            FilterExpression=_TYPE_FILTER,
-            ExpressionAttributeNames=_TYPE_NAMES,
-            ExpressionAttributeValues={":t": _s(type_name)},
-        )
-        if row_reader is _model_row:
-            return [row_reader(model_cls, item) for item in items]
-        return [row_reader(item) for item in items]
+        start_key: Optional[dict] = None
+        buf: List[Dict[str, Any]] = []
+        while True:
+            kw: Dict[str, Any] = {
+                "FilterExpression": _TYPE_FILTER,
+                "ExpressionAttributeNames": _TYPE_NAMES,
+                "ExpressionAttributeValues": {":t": _s(type_name)},
+            }
+            if start_key is not None:
+                kw["ExclusiveStartKey"] = start_key
+            resp = await client.scan(TableName=self._table_name, **kw)
+            for item in resp.get("Items", []):
+                if row_reader is _model_row:
+                    buf.append(row_reader(model_cls, item))
+                else:
+                    buf.append(row_reader(item))
+                if len(buf) >= chunk_size:
+                    yield buf
+                    buf = []
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+        if buf:
+            yield buf
 
     async def count_rows(self, table_name: str) -> int:
         # Count-only scan: no items are returned, so target-only-table

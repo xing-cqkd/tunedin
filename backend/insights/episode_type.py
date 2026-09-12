@@ -115,6 +115,18 @@ def classify_episode_type(
     if _matches(title, _PREVIEW_RES):
         if duration_seconds is None or _promo_context(title, notes, duration_seconds):
             return PREVIEW
+    # Docstring rule: under 5 minutes + promotional language always means
+    # trailer, even with a generic title ("Welcome to the show") that
+    # matches no title pattern above. Under 5 minutes alone does NOT
+    # (daily news briefs are full episodes) — promotional language is
+    # required here, unlike the title-pattern branches where short
+    # duration alone confirms the trailer label.
+    if (
+        duration_seconds is not None
+        and duration_seconds < _SHORT_SECONDS
+        and _matches(notes, _PROMO_RES)
+    ):
+        return TRAILER
     return FULL
 
 

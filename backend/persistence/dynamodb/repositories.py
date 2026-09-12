@@ -25,6 +25,7 @@ from backend.persistence import models
 from backend.persistence.dynamodb import codec, keys
 from backend.persistence.repositories import (
     VISIBILITY_UNLISTED,
+    DuplicateFeedError,
     EpisodeRepository,
     FeedRepository,
     InsightRepository,
@@ -71,12 +72,15 @@ _TRANSACT_ITEM_LIMIT = 100
 def _save_many_op_chunks(
     candidates: list[tuple[int, models.Episode]],
     old_guids: dict[tuple[str, str], str],
+    old_sks: dict[tuple[str, str], str],
 ) -> Iterable[list[tuple[int, models.Episode]]]:
     """Split candidates into chunks bounded by the transact-item limit.
 
     A candidate costs one transact item for the episode put, plus one
     for the guid-marker put (guid episodes only), plus one more for the
-    stale-marker delete when the episode's guid changed. Fixed
+    stale-marker delete when the episode's guid changed, plus one more
+    for the stale-item delete when the episode's sk moved
+    (``published_at`` change). Fixed
     episode-count chunking is unsafe here: 50 guid-changing episodes
     would need 150 items. Greedy packing keeps every chunk at or under
     the 100-item limit; the retry loop inside ``save_many`` only ever
@@ -94,6 +98,9 @@ def _save_many_op_chunks(
             )
             if prev is not None and prev != episode.guid:
                 item_cost += 1
+        prev_sk = old_sks.get((str(episode.feed_id), str(episode.episode_id)))
+        if prev_sk is not None and prev_sk != _episode_key(episode)["sk"]["S"]:
+            item_cost += 1
         if chunk and cost + item_cost > _TRANSACT_ITEM_LIMIT:
             yield chunk
             chunk = []
@@ -375,7 +382,7 @@ class _FeedRepository(FeedRepository):
             await self._c.transact_write_items(TransactItems=transact_items)
         except self._c.exceptions.TransactionCanceledException as exc:
             if _conditional_check_failed_indices(exc):
-                raise ValueError(
+                raise DuplicateFeedError(
                     f"feed rss_url {feed.rss_url!r} is already taken"
                 ) from exc
             raise
@@ -425,6 +432,22 @@ class _FeedRepository(FeedRepository):
 # ---------------------------------------------------------------------------
 # Episode repository
 # ---------------------------------------------------------------------------
+
+
+def _episode_key(episode: models.Episode) -> dict:
+    """Main-table ``Key`` (pk/sk) for an episode item.
+
+    The sk embeds ``published_at``, so a re-save with a changed
+    ``published_at`` lands on a different key — callers use this to
+    delete the stale item under the old key in the same transaction.
+    """
+    key_attrs = keys.episode_keys(
+        episode.episode_id,
+        feed_id=episode.feed_id,
+        published_at=episode.published_at,
+        processed=episode.processed,
+    )
+    return _key(key_attrs["pk"], key_attrs["sk"])
 
 
 def _episode_item(episode: models.Episode) -> dict:
@@ -583,9 +606,12 @@ class _EpisodeRepository(EpisodeRepository):
         """Upsert by primary key; maintains the guid-dedup marker.
 
         Atomicity: one ``TransactWriteItems`` call holding the episode
-        put, the guid-marker put (when the episode has a guid), and the
-        stale-marker delete (when the guid changed) — a crash can never
-        leave a stale marker claimed forever (Linear: XIN-123). The
+        put, the guid-marker put (when the episode has a guid), the
+        stale-marker delete (when the guid changed), and the stale-item
+        delete (when the episode key moved — e.g. a ``published_at``
+        change moves the sk) — a crash can never leave a stale marker
+        claimed forever (Linear: XIN-123) or a duplicate episode item
+        under the old sk. The
         transactional cross-episode dedup guarantee lives in
         :meth:`save_many`, which is what the sync pipeline uses;
         concurrent ``save()`` calls racing on the same guid are
@@ -626,6 +652,14 @@ class _EpisodeRepository(EpisodeRepository):
                     }
                 }
             )
+        if old is not None and _episode_key(old) != _episode_key(episode):
+            # published_at (or feed/processed) changed: the new item lands
+            # under a new sk, so delete the stale item under the old key
+            # in the same transaction — otherwise list_episodes_by_feed
+            # returns both copies of the episode.
+            transact_items.append(
+                {"Delete": {"TableName": self._t, "Key": _episode_key(old)}}
+            )
         await self._c.transact_write_items(TransactItems=transact_items)
         return episode
 
@@ -664,6 +698,39 @@ class _EpisodeRepository(EpisodeRepository):
                         guid
                     )
         return old_guids
+
+    async def _old_sks_for_chunk(
+        self, candidates: list[tuple[int, models.Episode]]
+    ) -> dict[tuple[str, str], str]:
+        """Map (feed_id, episode_id) -> current episode sk.
+
+        One ``begins_with(EP#)`` keys-only query per feed, so
+        :meth:`save_many` can delete the stale episode item when a
+        re-saved episode's key moved (a ``published_at`` change moves
+        the sk) — in the same transaction that writes the new item.
+        Without this the old item survives under the old sk and
+        ``list_episodes_by_feed`` returns duplicate copies of the
+        episode. Keys-only projection keeps the pre-read cheap.
+        """
+        feed_ids = {str(episode.feed_id) for _, episode in candidates}
+        old_sks: dict[tuple[str, str], str] = {}
+        for feed_id in feed_ids:
+            items = await _query_all(
+                self._c,
+                self._t,
+                KeyConditionExpression="pk = :p AND begins_with(sk, :e)",
+                ExpressionAttributeValues={
+                    ":p": _s(f"FEED#{feed_id}"),
+                    ":e": _s("EP#"),
+                },
+                ProjectionExpression="sk",
+            )
+            for item in items:
+                sk = item["sk"]["S"]
+                parts = sk.split("#", 2)
+                if len(parts) == 3:
+                    old_sks[(feed_id, parts[2])] = sk
+        return old_sks
 
     async def save_many(
         self, episodes: list[models.Episode]
@@ -723,7 +790,11 @@ class _EpisodeRepository(EpisodeRepository):
             old_guids = await self._old_guids_for_chunk(candidates)
         else:
             old_guids = {}
-        for chunk in _save_many_op_chunks(candidates, old_guids):
+        # Stale-sk pre-read: one keys-only query per feed, so a re-saved
+        # episode whose published_at changed gets its old item deleted in
+        # the same transaction that writes the new one.
+        old_sks = await self._old_sks_for_chunk(candidates)
+        for chunk in _save_many_op_chunks(candidates, old_guids, old_sks):
             remaining = list(chunk)
             while remaining:
                 transact_items: list[dict] = []
@@ -762,6 +833,25 @@ class _EpisodeRepository(EpisodeRepository):
                         {"Put": {"TableName": self._t, "Item": _episode_item(episode)}}
                     )
                     owners.append(index)
+                    new_sk = _episode_key(episode)["sk"]["S"]
+                    old_sk = old_sks.get(
+                        (str(episode.feed_id), str(episode.episode_id))
+                    )
+                    if old_sk is not None and old_sk != new_sk:
+                        # published_at changed: the put above lands under a
+                        # new sk — delete the stale item under the old sk in
+                        # the same transaction.
+                        transact_items.append(
+                            {
+                                "Delete": {
+                                    "TableName": self._t,
+                                    "Key": _key(
+                                        f"FEED#{episode.feed_id}", old_sk
+                                    ),
+                                }
+                            }
+                        )
+                        owners.append(index)
                 try:
                     await self._c.transact_write_items(TransactItems=transact_items)
                 except self._c.exceptions.TransactionCanceledException as exc:
@@ -832,6 +922,22 @@ class _EpisodeRepository(EpisodeRepository):
                     }
                 }
             )
+        if old is not None:
+            old_sk = _episode_key(old)["sk"]["S"]
+            new_sk = _episode_key(episode)["sk"]["S"]
+            if old_sk != new_sk:
+                # published_at changed: the put above lands under a new sk
+                # — delete the stale item under the old sk in the same
+                # transaction (the normal save_many path does this via
+                # _old_sks_for_chunk; the conflict-rewrite path must too).
+                transact_items.append(
+                    {
+                        "Delete": {
+                            "TableName": self._t,
+                            "Key": _key(f"FEED#{old.feed_id}", old_sk),
+                        }
+                    }
+                )
         await self._c.transact_write_items(TransactItems=transact_items)
         return True
 
@@ -1115,7 +1221,22 @@ class _TagRepository(TagRepository):
         Atomicity: single-item ``PutItem`` keyed by (episode_id, tag_id) —
         re-adding overwrites the identical item, so the operation is
         naturally idempotent with no read-before-write.
+
+        FK parity with the SQL backend (Linear: XIN-124 — Chester's call):
+        the episode and the tag must both exist, otherwise
+        :class:`MissingParentError` is raised instead of silently creating
+        an orphaned link. Two point reads gate the write; the link write
+        itself stays a single atomic ``PutItem``.
         """
+        if await _get_episode_by_id(self._c, self._t, episode_id) is None:
+            raise MissingParentError(
+                f"episode {episode_id} does not exist"
+            )
+        tag_resp = await self._c.get_item(
+            TableName=self._t, Key=_key(f"TAG#{tag_id}", keys.META)
+        )
+        if tag_resp.get("Item") is None:
+            raise MissingParentError(f"tag {tag_id} does not exist")
         key_attrs = keys.episode_tag_link_keys(episode_id, tag_id)
         item = {name: _s(value) for name, value in key_attrs.items()}
         item["type"] = _s(codec.TYPE_EPISODE_TAG_LINK)
@@ -1725,10 +1846,15 @@ class _TaskLogRepository(TaskLogRepository):
 
         gsi2 is keyed ``TASKTYPE#{type}#{status}``, so one query per
         status is needed; the episode_id match is a FilterExpression.
-        Only non-terminal statuses are consulted — a 'done'/'failed' row
-        does not block re-enqueue (the service resets it to 'queued').
+        ALL statuses are consulted — including terminal 'done'/'failed'
+        rows — because the service resets a terminal-state task to
+        'queued' in place (preserving the (task_type, episode_id)
+        idempotency key). Returning None for terminal rows would make
+        the service create a second TaskLog for the same episode,
+        duplicating the outbox record. Active statuses are checked
+        first so the common path stays cheap.
         """
-        for status in ("queued", "processing", "pending"):
+        for status in ("queued", "processing", "pending", "failed", "done"):
             items = await _query_all(
                 self._c,
                 self._t,

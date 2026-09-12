@@ -169,3 +169,48 @@ def test_validate_rejects_loopback_literal():
     # No DNS needed: literal IPs are checked without resolution.
     with pytest.raises(ValueError):
         validate_feed_url("http://127.0.0.1:9999/feed")
+
+
+# --- Redirect SSRF hook ------------------------------------------------------
+
+
+async def test_redirect_hook_blocks_loopback_target():
+    """A 302 to a loopback/private target is blocked at the hook — this is
+    the SSRF gap: initial-URL validation never saw the redirect target."""
+    from backend.ingestion.http_util import (
+        _validate_redirect_target,
+        RedirectBlockedError,
+    )
+
+    response = httpx.Response(
+        302,
+        headers={"location": "http://127.0.0.1:9999/feed"},
+        request=httpx.Request("GET", "https://example.com/feed"),
+    )
+    with pytest.raises(RedirectBlockedError):
+        await _validate_redirect_target(response)
+
+
+async def test_redirect_hook_passes_public_target(monkeypatch):
+    """A redirect to a public address passes the hook (no false positives)."""
+    _public_dns(monkeypatch)
+    from backend.ingestion.http_util import _validate_redirect_target
+
+    response = httpx.Response(
+        302,
+        headers={"location": "https://feeds.example.com/new.xml"},
+        request=httpx.Request("GET", "https://example.com/feed"),
+    )
+    await _validate_redirect_target(response)  # must not raise
+
+
+async def test_redirect_hook_ignores_non_redirects():
+    """Non-redirect responses are untouched by the hook."""
+    from backend.ingestion.http_util import _validate_redirect_target
+
+    response = httpx.Response(
+        200,
+        content=b"<rss/>",
+        request=httpx.Request("GET", "https://example.com/feed"),
+    )
+    await _validate_redirect_target(response)  # must not raise

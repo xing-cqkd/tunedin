@@ -575,3 +575,23 @@ async def test_playlist_episode_link_added_at_round_trip(ddb_backend, tmp_path):
         assert _norm(back[0]["added_at"]) == _norm(added)
     finally:
         await sql.close()
+
+
+@pytest.mark.asyncio
+async def test_read_table_chunks_covers_all_rows(ddb_backend):
+    """DynamoDBBackend streams scan pages in chunk_size batches: chunked
+    reads return exactly the rows read_table returns."""
+    backend, _sync = ddb_backend
+    await backend.init()
+    rows = _seed_rows()
+    for table in ("feeds", "episodes"):
+        await backend.write_rows(table, rows[table])
+
+    for table in ("feeds", "episodes"):
+        chunks = [c async for c in backend.read_table_chunks(table, chunk_size=1)]
+        assert all(len(c) == 1 for c in chunks)
+        chunked = [r for c in chunks for r in c]
+        whole = await backend.read_table(table)
+        key = "rss_url" if table == "feeds" else "guid"
+        assert {r[key] for r in chunked} == {r[key] for r in whole}
+        assert len(chunked) == len(whole) == len(rows[table])

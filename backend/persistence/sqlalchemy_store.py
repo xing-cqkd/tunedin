@@ -447,7 +447,7 @@ class _TagRepository(TagRepository):
                         EpisodeTag(episode_id=episode_id, tag_id=tag_id)
                     )
                     await self._session.flush()
-            except IntegrityError:
+            except IntegrityError as exc:
                 # Check-then-insert race: re-check after the savepoint
                 # rollback. If the link exists now, the duplicate add is
                 # the protocol-promised no-op; otherwise this was a
@@ -459,6 +459,15 @@ class _TagRepository(TagRepository):
                     )
                 )
                 if res.scalar_one_or_none() is None:
+                    # FK parity with DynamoDB (Linear: XIN-124 — Chester's
+                    # call): surface the backend-agnostic MissingParentError
+                    # when a parent is missing. Only foreign-key violations
+                    # map — any other integrity error re-raises untouched.
+                    if "foreign key" in str(exc.orig).lower():
+                        raise MissingParentError(
+                            f"episode {episode_id} or tag {tag_id} "
+                            "does not exist"
+                        ) from exc
                     raise
 
     async def list_tags_for_episode(self, episode_id: UUID) -> list[Tag]:

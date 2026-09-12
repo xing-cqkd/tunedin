@@ -83,3 +83,22 @@ def test_is_trailer_like():
     assert is_trailer_like("Preview: next week", 120)
     assert not is_trailer_like("Why do empires collapse?", 3200)
     assert not is_trailer_like("Morning news briefing", 150)
+
+
+def test_generic_title_short_promo_is_trailer():
+    """Documented fallback: under 5 minutes + promotional notes classifies
+    as trailer even when the title matches no trailer pattern."""
+    assert (
+        classify_episode_type(
+            "Welcome to the show",
+            120,
+            notes="Subscribe now and never miss an episode!",
+        )
+        == TRAILER
+    )
+
+
+def test_generic_title_short_without_promo_is_full():
+    """Short duration ALONE does not confirm trailer for a generic title —
+    daily news briefs are full episodes."""
+    assert classify_episode_type("Morning Update", 120) == FULL

@@ -237,3 +237,24 @@ def test_extract_notes_missing_audio_url():
                                   lambda *a: [{"title": "T",
                                                "timestamp_rel": None}])
     assert "no audio_url" in res.notes
+
+
+def test_no_audio_url_skips_transcription_entirely():
+    """With no audio URL, transcription is never attempted: the planned
+    windows are returned with the note, and the fetch callback is not
+    invoked (previously the extractor call ran anyway)."""
+    calls = []
+
+    def _spy(url, start, dur):
+        calls.append((url, start, dur))
+        return ("t", [])
+
+    res = extract_template_guided("ep1", {}, _template(), _sections(),
+                                  2000.0, _spy, _extract)
+    assert calls == []
+    assert res.transcripts == []
+    assert res.insights == []
+    assert "no audio_url" in res.notes
+    # The plan itself survives: windows still tell the caller what WOULD
+    # have been sampled.
+    assert len(res.windows) == 1

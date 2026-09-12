@@ -13,7 +13,7 @@ import random
 import socket
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -36,6 +36,44 @@ class FeedTooLargeError(ValueError):
     """Raised when a feed exceeds the max download size (XIN-59). Terminal."""
 
 
+class RedirectBlockedError(ValueError):
+    """A redirect target failed SSRF validation.
+
+    Raised by the redirect-validation response hook before httpx follows
+    the redirect. Callers that classify fetch failures should treat this
+    as a URL-validation failure, not a parse failure.
+    """
+
+
+async def _validate_redirect_target(response: httpx.Response) -> None:
+    """httpx response hook: validate redirect targets against the SSRF gate.
+
+    ``validate_feed_url`` only checks the initial URL; with
+    ``follow_redirects=True`` httpx would otherwise follow a 301/302 to
+    an internal address (169.254.169.254, 127.0.0.1, ...) unchecked.
+    The hook runs before httpx follows each redirect, so raising here
+    aborts the request with :class:`RedirectBlockedError`.
+    """
+    if not response.is_redirect:
+        return
+    location = response.headers.get("location")
+    if not location:
+        return
+    target = urljoin(str(response.url), location)
+    try:
+        await asyncio.to_thread(validate_feed_url, target)
+    except ValueError as exc:
+        raise RedirectBlockedError(
+            f"blocked redirect {str(response.url)!r} -> {target!r}: {exc}"
+        ) from exc
+
+
+#: Event hooks enforcing the SSRF gate on every redirect hop. Attach to
+#: any httpx.AsyncClient used for feed fetching (XIN-62):
+#: ``httpx.AsyncClient(..., follow_redirects=True, event_hooks=REDIRECT_SSRF_HOOKS)``.
+REDIRECT_SSRF_HOOKS: Dict[str, list] = {"response": [_validate_redirect_target]}
+
+
 @asynccontextmanager
 async def maybe_client(
     client: Optional[httpx.AsyncClient] = None,
@@ -49,12 +87,19 @@ async def maybe_client(
 
         async with maybe_client(client, timeout=timeout) as c:
             ...
+
+    A caller-supplied client is used as-is — including its own redirect
+    policy and hooks. The fresh default client follows redirects with the
+    SSRF redirect-validation hook attached (XIN-62).
     """
     if client is not None:
         yield client
         return
     async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True, max_redirects=MAX_REDIRECTS
+        timeout=timeout,
+        follow_redirects=True,
+        max_redirects=MAX_REDIRECTS,
+        event_hooks=REDIRECT_SSRF_HOOKS,
     ) as c:
         yield c
 

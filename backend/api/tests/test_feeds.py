@@ -702,3 +702,70 @@ def test_source_guid_omitted_when_episode_guid_absent():
     ns = {"tunedin": TUNEDIN_NS}
     item = _parse(body).find("channel").find("item")
     assert item.find("tunedin:sourceGuid", ns) is None
+
+
+def test_rss_omits_enclosure_when_audio_url_missing():
+    """An episode with no audio URL renders no <enclosure> — passing None
+    as the url attribute crashes ElementTree serialization (HTTP 500)."""
+    episode = Episode(
+        feed_id=uuid4(),
+        title="Silent Ep",
+        audio_url=None,
+        guid="silent-guid",
+    )
+    playlist = CuratedPlaylist(user_id=uuid4(), title="T")
+    entry = PlaylistEpisodeEntry(
+        episode=episode,
+        position=0,
+        added_at=datetime(2021, 1, 1, tzinfo=timezone.utc),
+    )
+    # Must render without raising.
+    body = build_rss(
+        playlist,
+        [entry],
+        page_url="http://testserver/f/s",
+        feed_url="http://testserver/f/s/feed.xml",
+    )
+    item = _parse(body).find("channel").find("item")
+    assert item.find("enclosure") is None
+
+
+def test_if_modified_since_matches_despite_microseconds():
+    """HTTP dates carry whole seconds only: a last_modified with nonzero
+    microseconds must still 304 when the client echoes back the
+    Last-Modified header value."""
+    from starlette.requests import Request
+
+    from backend.api._etag import check_conditional
+
+    last_modified = datetime(2026, 9, 11, 12, 0, 0, 123456, tzinfo=timezone.utc)
+    ims = format_datetime(last_modified)  # truncated to whole seconds
+
+    def _req(value):
+        return Request(
+            {"type": "http", "headers": [(b"if-modified-since", value.encode())]}
+        )
+
+    resp = check_conditional(
+        _req(ims), etag='"abc"', last_modified=last_modified
+    )
+    assert resp is not None and resp.status_code == 304
+
+    # A genuinely stale timestamp still serves the body.
+    stale = check_conditional(
+        _req("Wed, 01 Jan 2020 00:00:00 GMT"),
+        etag='"abc"',
+        last_modified=last_modified,
+    )
+    assert stale is None
+
+
+def test_playlist_last_modified_fallback_is_utc():
+    """With no entries and no created_at, the fallback instant is UTC —
+    not the server-local timezone."""
+    from backend.api.feeds import playlist_last_modified
+
+    playlist = CuratedPlaylist(user_id=uuid4(), title="T", created_at=None)
+    got = playlist_last_modified(playlist, [])
+    assert got.tzinfo is not None
+    assert got.utcoffset().total_seconds() == 0

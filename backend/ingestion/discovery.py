@@ -33,7 +33,7 @@ from backend.ingestion.service import (
 )
 from backend.persistence.models.episode import Episode
 from backend.persistence.models.feed import Feed
-from backend.persistence.repositories import Store
+from backend.persistence.repositories import DuplicateFeedError, Store
 
 logger = logging.getLogger(__name__)
 
@@ -102,14 +102,16 @@ class DiscoveryService:
 
         Commits once. Duplicate-feed race (XIN-127): two writers can both see
         ``get_by_rss_url -> None`` and both insert, violating the unique
-        ``rss_url`` constraint. On IntegrityError the session is rolled back
-        and the now-existing feed is re-fetched and updated instead of
-        propagating (which would poison the session for the rest of a crawl).
+        ``rss_url`` constraint. On IntegrityError (SQLAlchemy, raised at
+        commit) or DuplicateFeedError (DynamoDB, raised at save) the
+        session is rolled back and the now-existing feed is re-fetched
+        and updated instead of propagating (which would poison the
+        session for the rest of a crawl).
         """
         try:
             feed = await self._get_or_create_feed(store, podcast)
             await store.commit()
-        except IntegrityError:
+        except (IntegrityError, DuplicateFeedError):
             logger.warning(
                 "Duplicate rss_url race for %s; adopting the existing feed",
                 podcast.feed_url,
@@ -129,7 +131,8 @@ class DiscoveryService:
         aborts the batch.
 
         Batches the saves and commits once (XIN-129). On an IntegrityError
-        (e.g. a duplicate-feed race mid-batch) rolls back and falls back to
+        (SQLAlchemy) or DuplicateFeedError (DynamoDB) — e.g. a
+        duplicate-feed race mid-batch — rolls back and falls back to
         per-podcast saves, each with its own duplicate handling (XIN-127).
         """
         skipped = [p for p in podcasts if not p.feed_url]
@@ -142,7 +145,7 @@ class DiscoveryService:
         try:
             saved_feeds = [await self._get_or_create_feed(store, p) for p in candidates]
             await store.commit()
-        except IntegrityError:
+        except (IntegrityError, DuplicateFeedError):
             await store.rollback()
             saved_feeds = [await self.save_podcast(store, p) for p in candidates]
         return saved_feeds

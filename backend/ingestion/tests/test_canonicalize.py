@@ -140,3 +140,41 @@ class TestFeedIdentityCanonicalization:
             Podcast(title="B", feed_url="https://example.com/b.xml"),
         )
         assert a.feed_id != b.feed_id
+
+
+@pytest.mark.asyncio
+async def test_duplicate_feed_error_recovers_existing_feed(in_memory_store):
+    """XIN-127: a DuplicateFeedError (the DynamoDB duplicate-feed race)
+    is recovered exactly like a SQL IntegrityError — roll back, re-fetch
+    the now-existing feed, and adopt it instead of propagating."""
+    from backend.persistence.repositories import DuplicateFeedError
+
+    discovery = DiscoveryService()
+    podcast = Podcast(title="Racy", feed_url="https://example.com/racy.xml")
+    existing = await discovery.save_podcast(in_memory_store, podcast)
+
+    calls = {"n": 0}
+    real_get = in_memory_store.feeds.get_by_rss_url
+    real_save = in_memory_store.feeds.save
+
+    async def flaky_get(rss_url):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # race: the winner's row isn't visible to us yet
+        return await real_get(rss_url)
+
+    async def racy_save(feed):
+        if feed.feed_id is None:
+            # Simulate the loser of the race: the winner's row now exists.
+            raise DuplicateFeedError(f"duplicate rss_url {feed.rss_url}")
+        return await real_save(feed)
+
+    in_memory_store.feeds.get_by_rss_url = flaky_get
+    in_memory_store.feeds.save = racy_save
+    try:
+        got = await discovery.save_podcast(in_memory_store, podcast)
+    finally:
+        in_memory_store.feeds.get_by_rss_url = real_get
+        in_memory_store.feeds.save = real_save
+
+    assert got.feed_id == existing.feed_id
